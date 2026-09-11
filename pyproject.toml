@@ -1,0 +1,58 @@
+[project]
+name = "llmgw"
+version = "0.1.0"
+description = "A streaming LLM gateway: library core plus OpenAI/Anthropic-compatible proxy"
+requires-python = ">=3.11"
+dependencies = [
+    # HTTP/1.1 + HTTP/2 upstream client with real connection pooling and
+    # streaming response bodies. The pooling is the reason for the choice:
+    # a gateway that opens a fresh TCP+TLS connection per request adds a
+    # round trip to every call and exhausts fds at a fraction of the load.
+    "httpx[http2]>=0.27",
+    # Raw Starlette, deliberately NOT FastAPI. FastAPI's value is pydantic
+    # request validation, and validating a request body we intend to forward
+    # byte-for-byte would mean parsing and re-serialising it -- which is
+    # exactly the thing passthrough exists to avoid.
+    "starlette>=0.37",
+    "uvicorn>=0.30",
+    "prometheus-client>=0.20",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "pytest-timeout>=2.3",
+    "psutil>=6.0",   # RSS and fd sampling; portable where /proc is not
+    "ruff>=0.6",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/llmgw"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+# Any unit test that takes a second is a unit test that is secretly sleeping.
+timeout = 60
+markers = [
+    "contract: runs against real sockets and a real fake upstream",
+    "chaos: randomized fault injection; asserts invariants, not cases",
+    "scale: minutes-long load scenarios; excluded from the default run",
+]
+addopts = "-m 'not scale and not chaos' --strict-markers"
+# Do NOT add `-n auto` (pytest-xdist). The fake upstreams keep process-global
+# request counters, and contract assertions like "the incumbent was never
+# opened" read them -- across workers those counters describe a fleet, not a
+# test, and the assertions become nondeterministic rather than failing.
+
+[tool.ruff]
+line-length = 95
+src = ["src", "tests", "fakes", "bench"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]

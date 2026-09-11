@@ -1,0 +1,100 @@
+# llmgw tenants -- a worked example.
+#
+# Loaded with:
+#
+#     LLMGW_TENANTS_FILE=config/tenants.toml make run
+#
+# and parsed by `llmgw.server.config.TenantTable.from_toml`. Everything in
+# here is validated at startup: a limit that would make a denial unactionable
+# (a zero rate, a burst below one), a token assigned to two tenants, a key
+# the schema does not know -- all of them are a process that refuses to start.
+# Nothing in this file can fail on the request path.
+#
+# ----------------------------------------------------------------------------
+# What a tenant is
+# ----------------------------------------------------------------------------
+#
+# A tenant is the unit of ISOLATION. Every request is admitted against one
+# tenant's token bucket and one tenant's concurrency permit, and neither is
+# shared with any other tenant. The
+# tenant is identified by `Authorization: Bearer <token>`, looked up in the
+# `tokens` lists below. The token is a credential: the gateway compares it and
+# drops it, reports the tenant ID (`X-Gw-Tenant`) and never the token, and
+# refuses at startup to forward `authorization` upstream.
+#
+# ----------------------------------------------------------------------------
+# What happens with NO tenants file
+# ----------------------------------------------------------------------------
+#
+# Every request is the one tenant `anonymous`, under the limits in
+# `LLMGW_TENANT_RATE_PER_SECOND` / `_BURST` / `_MAX_CONCURRENCY` (defaults:
+# 100/s, 200, 256). A bearer token, if sent, is ignored -- there is nothing to
+# check it against. That is the zero-config path, and it is LOUD about itself:
+# a warning at startup and `"tenant_mode": "anonymous"` in every `/probe`.
+# One bucket for everyone is FAILURE-MODES row 6 exactly, so a deployment with
+# more than one caller wants this file.
+#
+# ----------------------------------------------------------------------------
+# The two limits, and why both
+# ----------------------------------------------------------------------------
+#
+#   rate_per_second   token-bucket refill. Sustained requests per second.
+#   burst             bucket capacity. How far ahead of the sustained rate a
+#                     tenant may run -- an agent loop firing ten calls in
+#                     parallel is a burst, not a flood.
+#   max_concurrency   in-flight permits. The one that protects memory and
+#                     upstream sockets, because what fills them is arrivals
+#                     TIMES duration and the duration is the model's choice.
+#
+# A rate denial is a 429 with an exact `Retry-After`; a concurrency denial is a
+# 429 with none, because backing off does nothing until one of the tenant's
+# own requests finishes. A concurrency denial charges no rate token (C6).
+
+
+# An interactive product. Modest sustained rate, a burst sized for a page that
+# fires several calls on load, and enough concurrency for long streams.
+[tenants.acme]
+tokens = ["tok-acme-prod-7f3a", "tok-acme-staging-19c2"]
+rate_per_second = 20.0
+burst = 40
+max_concurrency = 16
+
+# A batch pipeline. Low rate, no meaningful burst, and a concurrency cap that
+# is the real limit: ninety-second summaries at 2/s is 180 streams in flight
+# with no cap, and 8 with this one.
+[tenants.batch-summaries]
+tokens = ["tok-batch-a91e"]
+rate_per_second = 2.0
+burst = 4
+max_concurrency = 8
+
+# Unauthenticated traffic. OPTIONAL -- delete this table and a request with no
+# bearer token is a 401. Keeping it means guest access is a budget decided
+# here, in the same table as everyone else, rather than "unlimited" or
+# "impossible". A request with an UNKNOWN token is a 401 regardless: a
+# rotated-out key must not fall through to guest access.
+[tenants.anonymous]
+rate_per_second = 1.0
+burst = 5
+max_concurrency = 2
+
+
+# ----------------------------------------------------------------------------
+# What this file deliberately cannot express
+# ----------------------------------------------------------------------------
+#
+# * A per-tenant model allowlist or catalog. Routing is the policy file's
+#   (`workloads.example.toml`) and a request names its workload; which
+#   workloads a tenant may name is an authorisation question with no
+#   mechanism yet.
+#
+# * A token-per-minute budget. `metrics.DENIAL_REASONS` reserves
+#   `tpm_reservation` for the reserve-then-settle version that admits on
+#   `prompt + max_tokens`; the bucket here meters REQUESTS.
+#
+# * Anything fleet-wide. Every number here is per gateway process. N
+#   instances give a tenant N times its cap (FAILURE-MODES rows 6 and 7).
+#
+# * Token rotation without a restart. The table is read once at startup, like
+#   the policy file was before reload landed; `Gateway.tenants` is the single
+#   object a later `replace()` would swap.

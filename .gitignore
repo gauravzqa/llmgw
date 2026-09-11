@@ -1,0 +1,25 @@
+# Secrets never live in this repository. Credentials are read at runtime from
+# a path outside it (see live/env.py).
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.DS_Store
+
+# Bench traces. The 1 Hz monitor writes 4 to 40 MB of JSONL per campaign;
+# the markdown reports next to them are the evidence and are tracked.
+bench/results/*.json
+bench/results/*.jsonl

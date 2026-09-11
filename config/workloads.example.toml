@@ -1,0 +1,202 @@
+# llmgw policy -- a worked example.
+#
+# Loaded with:
+#
+#     PolicySnapshot.from_toml(path.read_text(), catalog=DEFAULT_CATALOG)
+#
+# Everything in here is validated at load time against the catalog. A model id
+# that does not resolve, a budget that can never fire, a candidate that is the
+# same target as its incumbent: all of them raise `errors.PolicyError` here,
+# while the previous snapshot keeps serving traffic. Nothing in this file can
+# fail on the request path.
+#
+# Unknown keys are an error, not a warning. `candidat = "..."` must not be a
+# silently disabled A/B test that reports 100% incumbent traffic and looks
+# exactly like a candidate nobody sends traffic to.
+#
+# This file is ROUTING. Who may send traffic, and how much, is the other
+# half of the configuration and lives in `tenants.example.toml`
+# (`LLMGW_TENANTS_FILE`); the two are separate files because they change for
+# different reasons and are edited by different people. Per-provider
+# in-flight caps are neither: they are `max_concurrency` on the catalog's
+# `ProviderConn`, because the cap belongs to the credential.
+
+
+# Which workload serves a request that names none. Required, and deliberately
+# not inferred: "the first workload in the file" would make routing depend on
+# key order, and key order is the one thing a config file should never mean.
+default_workload = "chat"
+
+
+# --------------------------------------------------------------------------
+# [defaults] -- inherited by every workload below.
+#
+# Inheritance rather than replacement. A workload that tightens ONE budget
+# keeps the four it never mentioned. The alternative makes every workload
+# restate five numbers, and five numbers copied five times is five numbers
+# that disagree within a quarter.
+# --------------------------------------------------------------------------
+
+[defaults.budgets]
+total = 600.0
+# The one absolute deadline. Every other budget is a phase inside it, clamped
+# by `Deadline.slice()`, which is why three attempts of a 20 s phase inside a
+# 600 s total take 600 s and not 1800.
+
+connect = 2.0
+# TCP + TLS. A breach here is the safest retry in the system: nothing was
+# accepted upstream, so no side effect can exist.
+
+first_event = 20.0
+# Headers arrived, waiting on the first body byte. Sized for a reasoning
+# model's p99, not a fast model's p50 -- too tight here is the most common
+# self-inflicted gateway outage.
+#
+# Under the C1 decision the client's status is held until this fires, so
+# this number must stay BELOW whatever header timeout your callers and any
+# intermediary in front of you use. Raising it is a decision about someone
+# else's timeout, not just yours.
+
+progress = 15.0
+# Max gap between CONTENT events. Heartbeats do not reset this (C7): a
+# provider stuck in a bad state can ping politely forever.
+
+client_stall = 30.0
+# How long the pump tolerates a client that has stopped reading. Not a
+# provider fault, and never counted as one.
+
+# `liveness` is unset, which disables the looser any-byte check. Set it only
+# if you have a provider whose legitimate thinking gaps exceed `progress`;
+# it must be >= progress or `Budgets.validate()` rejects it.
+
+
+[defaults.retry]
+# Passed through as a plain (frozen) mapping that a caller expands into a
+# `retry.RetryPolicy`. The keys here are that dataclass's field names; policy
+# does not validate them, so they are checked by whoever constructs the
+# policy. Exactly one layer retries -- see CONTRACTS.md C5 -- and
+# `X-Gw-No-Retry: 1` is how a caller claims that layer for itself.
+max_attempts = 2
+# TOTAL upstream attempts for the whole request, across EVERY target -- not
+# per target. Two targets with "two retries each" is four requests to a
+# provider that is failing because it is overloaded.
+
+base_delay = 0.25
+max_delay = 4.0
+# The jitter window and its cap. Full jitter, not exponential-with-noise:
+# synchronised retries from many clients are the amplification.
+
+respect_retry_after = true
+# Honour a 429's `Retry-After` as a FLOOR. Turn this off only for a provider
+# you have measured to be lying, and record that you measured it.
+
+
+# --------------------------------------------------------------------------
+# Workloads.
+#
+# `incumbent` is required, `candidate` is not. That asymmetry is the point:
+# the incumbent is what you would ship today and the candidate is what you
+# are evaluating, so a workload can never be configured into a state with no
+# safety net. Attempt order is candidate first, then incumbent, and never
+# more than those two.
+# --------------------------------------------------------------------------
+
+# 1. The default. Incumbent only -- no A/B running, so one target, and a
+#    failure is a failure rather than a fallback.
+[workloads.chat]
+incumbent = "anthropic.sonnet-4-6"
+
+
+# 2. An A/B. Candidate takes the traffic; the incumbent catches what it drops.
+#
+#    Note what this buys and what it does not. A pre-commitment failure at the
+#    candidate (5xx, 429, connect reset, a 400 its schema rejects) falls back
+#    and the client never learns anything happened. A POST-commitment failure
+#    cannot: C1 forbids splicing a second answer onto a stream the client is
+#    already reading, so the candidate's truncation is the client's truncation.
+#    An A/B is a cheap way to find out whether the candidate is fast; it is a
+#    dishonest way to find out whether it is reliable, because the incumbent
+#    is silently covering half the evidence.
+[workloads.summarize]
+# A CANDIDATE AND ITS INCUMBENT MUST SPEAK THE SAME WIRE DIALECT.
+#
+# One attempt reuses one request: the client's original bytes, one path, one
+# response parser, one terminal marker. Those are chosen per execution; the
+# target is chosen per attempt. So pairing an `anthropic`-kind target with an
+# `openai`-kind one does not fall back -- it POSTs an OpenAI body to
+# `/v1/messages` and parses the answer with the wrong surface.
+#
+# This file shipped exactly that pairing (an Anthropic incumbent behind a
+# DeepSeek candidate) and every test passed, because the fake upstreams answer
+# whatever they are asked. `Workload._reject_cross_dialect` now refuses it at
+# load time, while the previous snapshot keeps serving.
+#
+# The pair below is the shape that works and is worth copying: the same model
+# family reached through two DIFFERENT providers. Same dialect, different
+# credentials, different hosts, genuinely uncorrelated failures -- which is
+# the whole point of having an incumbent.
+incumbent = "deepseek.deepseek-v4-pro"
+candidate = "openrouter.deepseek-v4-flash"
+
+  [workloads.summarize.retry]
+  # Overrides the whole [defaults.retry] table -- retry config is replaced,
+  # not merged, because a partially-merged backoff policy is one whose
+  # behaviour you cannot read off either file.
+  #
+  # max_attempts = 1 means "no retries". With a candidate in the plan that is
+  # the right shape: the budget is shared between retrying the candidate and
+  # falling back to the incumbent, and spending it on the target that just
+  # failed rather than on the one that has not been tried is usually the
+  # worse of the two bets.
+  max_attempts = 1
+  base_delay = 0.1
+  max_delay = 1.0
+  respect_retry_after = true
+
+
+# 3. Tightened budgets. An interactive path where a slow answer is worse than
+#    no answer -- a user is watching a cursor blink.
+#
+#    Only the three that differ are listed. `connect` and `client_stall` still
+#    come from [defaults.budgets], which is the inheritance rule doing its job.
+[workloads.autocomplete]
+incumbent = "openrouter.gemini-3.1-flash-lite"
+candidate = "deepseek.deepseek-v4-flash"
+
+  [workloads.autocomplete.budgets]
+  total = 20.0
+  first_event = 4.0
+  progress = 3.0
+  # Every one of these must stay <= total or the snapshot is rejected at load:
+  # a phase budget larger than the total can never fire, and a decorative
+  # timeout is one nobody realises is not protecting them.
+
+
+# 4. Local development against `make fakes`. Present in the shipped example on
+#    purpose -- a config that only works with real credentials is a config
+#    nobody validates before pushing it.
+[workloads.local]
+incumbent = "fake.echo"
+
+  [workloads.local.budgets]
+  total = 30.0
+  first_event = 5.0
+
+
+# --------------------------------------------------------------------------
+# What this file deliberately cannot express
+# --------------------------------------------------------------------------
+#
+# * A third target. Each extra entry multiplies the worst-case latency and
+#   spend of a failing request; two is "the one you are testing and the one
+#   you trust".
+#
+# * A percentage split. `candidate = "x", weight = 0.1` is the obvious next
+#   feature and it is not here, because a weighted split needs a stable
+#   bucketing key (tenant? session? request?) and an answer for what a
+#   fallback does to the split's accounting. Both are decisions, not
+#   parameters, and neither belongs in a config schema before it is made.
+#
+# * Two catalog ids for the same upstream endpoint as candidate/incumbent.
+#   Rejected at load: it is a retry wearing a costume, doubling load while
+#   looking like redundancy on the dashboard.

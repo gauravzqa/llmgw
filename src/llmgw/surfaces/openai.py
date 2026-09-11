@@ -1,0 +1,263 @@
+"""The OpenAI chat-completions dialect.
+
+Three things about this format cost more time than the rest of it combined,
+and all three are handled here rather than in any caller:
+
+1. `data: [DONE]` is not JSON.
+2. `choices` is routinely **empty** -- on keepalive chunks and on the final
+   usage chunk -- so `payload["choices"][0]` is an IndexError waiting for a
+   real provider.
+3. Usage arrives only if the request asked for it. Without
+   `stream_options.include_usage` there is no usage frame at all, ever, and
+   `Usage.exact` therefore stays False for the entire life of the request.
+   That is not a bug to work around; it is why `cost_basis` exists.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
+from llmgw import errors
+from llmgw.surfaces.base import (
+    EventKind,
+    RequestFacts,
+    Usage,
+    as_int,
+    event_payload,
+    is_blank,
+    is_done_marker,
+    parse_json_object,
+    read_max_tokens,
+    read_stream,
+    require_model,
+)
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from llmgw.sse import SSEEvent
+
+
+# Delta keys that count as the model doing work. `content` is the obvious
+# one; the others matter because a tool-calling stream can legitimately emit
+# nothing but `tool_calls` for seconds at a time, and treating that as
+# non-progress would kill exactly the requests that take longest.
+_PROGRESS_KEYS = ("content", "tool_calls", "function_call", "refusal", "reasoning_content")
+
+
+class OpenAIChatSurface:
+    """`POST /v1/chat/completions`, streaming or not."""
+
+    name = "openai_chat"
+    path = "/v1/chat/completions"
+
+    # ------------------------------------------------------------- request
+
+    def parse_request(self, body: bytes) -> RequestFacts:
+        """Read routing metadata out of the body. **Never** to re-serialise it.
+
+        The bytes that go upstream are the bytes the client sent, unchanged.
+        This method exists to answer "which model, streaming or not, how big"
+        and nothing else, and the returned object is intentionally incapable
+        of reconstructing a request.
+
+        That constraint is why this project depends on Starlette and not
+        FastAPI, and on no pydantic model of a chat request. Validating a body
+        we intend to forward verbatim means parsing and re-emitting it, and a
+        re-emitted body is a *different* body: it drops the fields our schema
+        has not learned about yet (every provider ships new sampling params
+        between our releases), it reorders keys, and it silently changes what
+        the customer is billed for. Passthrough exists precisely to avoid
+        that, so the parser is read-only by construction.
+
+        Raises `errors.InvalidRequest` -- never a bare ValueError/KeyError --
+        for anything unusable, because the executor switches on the taxonomy
+        and an unclassified exception is a 500 blamed on a provider that was
+        never contacted.
+        """
+        raw = parse_json_object(body)
+        options = raw.get("stream_options")
+        include_usage = isinstance(options, dict) and options.get("include_usage") is True
+        return RequestFacts(
+            model=require_model(raw),
+            stream=read_stream(raw),
+            # `max_completion_tokens` is the current spelling; `max_tokens` is
+            # the deprecated one that most traffic still uses. Prefer the new
+            # one so a body carrying both is read the way the provider reads it.
+            max_tokens=read_max_tokens(raw, "max_completion_tokens", "max_tokens"),
+            include_usage=include_usage,
+        )
+
+    # ------------------------------------------------------------- frames
+
+    def classify(self, ev: SSEEvent) -> EventKind:
+        """Which clock this frame may reset (CONTRACTS.md C7).
+
+        The order matters. `[DONE]` is checked before any JSON parse; the
+        empty-`choices` case is checked before any indexing; and a chunk that
+        carries `usage` with no choices is META rather than HEARTBEAT because
+        it is the accounting frame, not a keepalive -- the symmetric call to
+        Anthropic's usage-bearing `message_delta`. Neither resets progress, so
+        the distinction is a metrics label, not a timeout decision.
+        """
+        if ev.is_comment:
+            # OpenRouter really sends `: OPENROUTER PROCESSING` to stop
+            # intermediaries idling the connection out. Proof of a live
+            # socket, proof of nothing else.
+            return EventKind.HEARTBEAT
+        if is_done_marker(ev):
+            return EventKind.TERMINAL
+        if is_blank(ev):
+            return EventKind.HEARTBEAT
+        payload = event_payload(ev)
+        if payload is None:
+            # Well-formed SSE carrying something we do not understand. META,
+            # not CONTENT: an unreadable frame is never evidence of progress,
+            # which is what stops a proxy's noise from holding a dead stream
+            # open until the total deadline.
+            return EventKind.META
+        if isinstance(payload.get("error"), dict):
+            return EventKind.ERROR
+        choices = payload.get("choices")
+        if not isinstance(choices, list) or not choices:
+            if isinstance(payload.get("usage"), dict):
+                return EventKind.META
+            return EventKind.HEARTBEAT
+        if any(self._delta_is_progress(choice) for choice in choices):
+            return EventKind.CONTENT
+        # A role-only opener or a bare `finish_reason` chunk. Structure, not
+        # output.
+        return EventKind.META
+
+    @staticmethod
+    def _delta_is_progress(choice: Any) -> bool:
+        if not isinstance(choice, dict):
+            return False
+        delta = choice.get("delta")
+        if not isinstance(delta, dict):
+            return False
+        return any(delta.get(key) for key in _PROGRESS_KEYS)
+
+    def text_delta(self, ev: SSEEvent) -> str | None:
+        """The assistant text this frame added, or None.
+
+        None for tool-call and refusal deltas even though `classify` calls
+        those progress: they are output, but they are not text, and the caller
+        of this method is reassembling a transcript. Returning `""` for them
+        would make an empty string mean two different things.
+        """
+        payload = event_payload(ev)
+        if payload is None:
+            return None
+        choices = payload.get("choices")
+        if not isinstance(choices, list):
+            return None
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            delta = choice.get("delta")
+            if not isinstance(delta, dict):
+                continue
+            text = delta.get("content")
+            if isinstance(text, str) and text:
+                # First choice with text wins. `n > 1` is demultiplexed by the
+                # client using `index`; concatenating the alternatives here
+                # would produce a transcript nobody ever received.
+                return text
+        return None
+
+    def apply_usage(self, ev: SSEEvent, usage: Usage) -> None:
+        """Fold a usage chunk into the accumulator. Never raises, ever.
+
+        Usage capture is observability. If a provider ships a malformed usage
+        object during an incident, the request must still complete -- an
+        exception raised here would convert "we cannot bill this accurately"
+        into "we cannot serve this at all", which is the worst possible trade.
+        So: every field is computed into locals first and the accumulator is
+        touched only once everything parsed, and the whole thing sits under a
+        blanket guard as a second line of defence.
+
+        Normalisation: OpenAI's `prompt_tokens` INCLUDES the cached subset in
+        `prompt_tokens_details.cached_tokens`, and this project's convention
+        is disjoint buckets (see `base.py`), so the cached count is
+        *subtracted* out. Getting this backwards double-counts every cache hit
+        -- the error is invisible in tests with no caching and enormous in
+        production, where the cached prefix is most of the prompt.
+
+        `cache_write_tokens` is left alone: the chat API's caching is
+        automatic and reports no creation count, so writing a 0 here would be
+        us asserting a fact the provider never stated.
+        """
+        try:
+            payload = event_payload(ev)
+            if payload is None:
+                return
+            block = payload.get("usage")
+            if not isinstance(block, dict):
+                return
+            prompt = as_int(block.get("prompt_tokens"))
+            completion = as_int(block.get("completion_tokens"))
+            if prompt is None and completion is None:
+                return  # A `usage` key with nothing usable in it is not a report.
+            details = block.get("prompt_tokens_details")
+            cached = None
+            if isinstance(details, dict):
+                cached = as_int(details.get("cached_tokens"))
+            cache_read = max(cached or 0, 0)
+
+            if prompt is not None:
+                # max(..., 0) guards the case where a provider reports more
+                # cached tokens than prompt tokens. That is nonsense, but
+                # nonsense that must not produce a negative bill.
+                usage.input_tokens = max(prompt - cache_read, 0)
+                usage.cache_read_tokens = cache_read
+            if completion is not None:
+                usage.output_tokens = completion
+            # One frame, everything final. Unlike Anthropic there is no
+            # halfway state to represent -- both halves flip together.
+            usage.input_exact = True
+            usage.output_exact = True
+        except Exception:  # noqa: BLE001 - see docstring: billing never breaks serving
+            # Counted, not just swallowed. A provider that quietly changes its
+            # usage shape would otherwise turn every request into an estimate
+            # with nothing to alert on.
+            usage.parse_failures += 1
+            return
+
+    def error_from_event(self, ev: SSEEvent) -> errors.GatewayError | None:
+        """An error delivered inside a 200 body, mapped onto the taxonomy.
+
+        The chat API itself rarely does this, but the OpenAI-compatible
+        proxies in front of it do it constantly: headers are already sent, so
+        a mid-stream failure has nowhere to go except into a data frame.
+        Returns None for every other frame.
+        """
+        payload = event_payload(ev)
+        if payload is None:
+            return None
+        block = payload.get("error")
+        if not isinstance(block, dict):
+            return None
+        etype = str(block.get("type") or "").lower()
+        code = str(block.get("code") or "").lower()
+        message = str(block.get("message") or "upstream error inside a 200 body")
+        if "overloaded" in etype or "overloaded" in code:
+            return errors.UpstreamOverloaded(message, upstream_body=ev.data)
+        return errors.InStreamError(message, upstream_body=ev.data)
+
+    def native_ending(self, last_event: SSEEvent | None = None) -> bytes:
+        """Empty, and that is the contract rather than a stub (CONTRACTS.md C2).
+
+        A chat-completions stream that fails after commitment ends by the body
+        simply closing, with no `data: [DONE]`. We do not synthesise a
+        terminal marker (that would report a truncated answer as complete) and
+        we do not synthesise an error frame the provider never sent. Every
+        OpenAI SDK already detects a stream that stopped without `[DONE]`; a
+        helpfully invented error frame is a shape their error handling has
+        never seen, so being helpful here is what breaks them.
+
+        The method exists at all because the *Responses* surface will need it:
+        that dialect has a real `response.failed` event, and when upstream
+        sends one it must be forwarded rather than swallowed. Returning bytes
+        from the OpenAI-compatible surfaces is therefore a live possibility --
+        just not this one.
+        """
+        return b""
