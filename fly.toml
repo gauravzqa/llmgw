@@ -35,7 +35,13 @@ kill_timeout = "140s"
   # (`make deploy` does this). It lands in $LLMGW_BUILD_SHA inside the machine.
 
 [env]
-  LLMGW_HOST = "0.0.0.0"
+  # "::" not "0.0.0.0": Fly's private network (6PN -- `layrs-llmgw.internal`
+  # and the per-machine `<id>.vm.layrs-llmgw.internal` names) is IPv6-only.
+  # An IPv4-only listener passes the proxy's health check and is unreachable
+  # by every sibling app. Found 16 Sep 2026 when the second machine could
+  # not connect to the first. uvicorn on "::" binds dual-stack on Linux, so
+  # the proxy's IPv4 path keeps working.
+  LLMGW_HOST = "::"
   LLMGW_PORT = "8080"
 
   # Deploy arithmetic. ServerConfig.validated() enforces the first inequality
@@ -87,7 +93,12 @@ kill_timeout = "140s"
 
 [http_service]
   internal_port = 8080
-  force_https = true
+  # Off: this app has no public IP, and on the private flycast path
+  # `force_https` turns every `http://layrs-llmgw.flycast` call into a 301
+  # to a TLS endpoint the callers were never meant to use. The private
+  # network is the trust boundary here; if a public IP is ever allocated,
+  # flip this back on first.
+  force_https = false
   # Never stop on idle: stop-on-idle plus a drain contract don't mix (an idle
   # stop is a SIGTERM nobody planned for), and a cold start on the first
   # request is exactly the slow hop a gateway must not be. Siblings

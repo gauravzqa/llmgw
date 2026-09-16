@@ -41,7 +41,7 @@ Callers now have two addresses:
 
 | address | path | when |
 |---|---|---|
-| `http://layrs-llmgw.flycast:8080` | Fly proxy → machine | default for services: honours `[http_service.concurrency]` and health checks, routes around a draining machine |
+| `http://layrs-llmgw.flycast` | Fly proxy → machine | default for services: honours `[http_service.concurrency]` and health checks, routes around a draining machine |
 | `http://layrs-llmgw.internal:8080` | direct to a machine | debugging, or a caller that wants the process's own `503 overloaded` rather than the proxy's queueing |
 
 ## 2. Secrets, by variable reference
@@ -110,7 +110,7 @@ fly ssh console -C "curl -s localhost:8080/workloads/default/probe"
 #   -> tenant_mode, max_streams, inflight, credential_present per target
 
 # From a sibling app, the way a caller will see it
-fly ssh console -a layrs-tcg -C "curl -s http://layrs-llmgw.flycast:8080/healthz"
+fly ssh console -a layrs-tcg -C "curl -s http://layrs-llmgw.flycast/healthz"
 fly ssh console -a layrs-tcg -C "curl -s http://layrs-llmgw.internal:8080/healthz"
 ```
 
@@ -118,7 +118,7 @@ A first real request, with the tenant token read back from the caller's own
 environment rather than typed:
 
 ```sh
-fly ssh console -a layrs-tcg -C 'sh -c "curl -sN http://layrs-llmgw.flycast:8080/v1/chat/completions \
+fly ssh console -a layrs-tcg -C 'sh -c "curl -sN http://layrs-llmgw.flycast/v1/chat/completions \
   -H \"Authorization: Bearer \$LLMGW_TOKEN\" -H \"content-type: application/json\" \
   -d {\"model\":\"anthropic.haiku-4-5\",\"stream\":true,\"max_tokens\":16,\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}]}"'
 ```
