@@ -20,7 +20,7 @@ Author: Gaurav Pal.
 ## What is built
 
 - Error taxonomy, clocks and deadlines, the catalog, the metric contract
-- Hostile fake upstreams (14 modes), the SSE parser, surface adapters
+- Hostile fake upstreams (15 modes), the SSE parser, surface adapters
 - Upstream client, bounded pump, byte-for-byte passthrough, the server
 - Policy snapshots, retry budget, the attempt loop, pre-commit fallback
 - Circuit breaker, admission control, provider-key caps, tenant isolation
@@ -37,8 +37,8 @@ See [bench/results/live_smoke.md](bench/results/live_smoke.md).
 
 ```bash
 make venv      # uv venv + editable install
-make test      # tier 1: 893 tests, no sockets, no sleeps.  ~1.9s
-make contract  # tier 2: 148 tests, real sockets + real uvicorn. ~49s
+make test      # tier 1: 917 tests, no sockets, no sleeps.  ~1.9s
+make contract  # tier 2: 150 tests, real sockets + real uvicorn. ~50s
 make chaos     # tier 3:  22 tests, randomized faults + invariants. ~60s
 make live      # tier 4:  10 tests, REAL providers, real money (~$0.0002)
 make trace     # walk one real stream through every layer
@@ -46,7 +46,17 @@ make run       # the gateway, against the local fakes
 make serve     # the gateway, against real providers (needs $LLMGW_ENV_FILE)
 make scale     # tier 5: S1-S8 load scenarios, four workers each. ~1 hour
 make lint
+make lock      # re-resolve uv.lock after editing pyproject.toml
+make image     # build the container image locally (needs Docker)
+make deploy    # fly deploy with the git SHA baked in; first-time setup in DEPLOY.md
 ```
+
+The venv, the image and the contract tests all install from `uv.lock`, so
+they see one dependency set. That is deliberate: the drain leans on uvicorn
+0.52 internals, and an image that resolved a different uvicorn would break
+the drain only in production. Deployment is Fly.io, private network only;
+[DEPLOY.md](DEPLOY.md) has the three commands and the arithmetic behind
+`kill_timeout`.
 
 One scenario at a time, with the knobs the campaign used:
 

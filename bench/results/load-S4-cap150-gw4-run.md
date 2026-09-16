@@ -1,6 +1,23 @@
 # Scenario S4: 10k open streams
 _WHAT BREAKS FIRST at 10,000 open streams._
 
+> **Reading this report** (annotation added 16 Sep 2026; the generated numbers
+> below are untouched). This run had the per-process cap at 150, and the
+> bench of 15 Sep put every response into one histogram. 34,907 of Arm G's
+> 36,107 answers (96.7%) were `503 overloaded` refusals that return in about
+> 2 ms, so the all-requests Arm G `ttfe` p50 and p90 are the rejection
+> latency, not streams, and the `CALIBRATION ... INVALID (client is the
+> bottleneck)` line below is an artifact of comparing a mostly-refused
+> histogram against a fully-admitted one. Read the p99 and inter-event rows
+> for the 1,200 admitted streams: first-event p99 1,059 ms through the
+> gateway against 1,121 ms direct, inter-event p50/p99 1,039/1,120 against
+> 1,047/1,121 ms direct -- the fake's own 1 s drip, identical in both arms.
+> Arm D's 13,671 `ReadError`s are the load generator failing at ~20,000 open
+> streams on this laptop, not the gateway. The bench now records
+> admitted-only histograms, prints them as a second table, and calibrates on
+> them; reports generated after 16 Sep carry the note "(N% refused by the
+> cap; compared admitted only)" instead of this annotation.
+
 produces: the first limit hit (predict ulimit -n, then per-stream asyncio task/buffer overhead); RSS at 10k; marginal bytes/stream (slope).
 
 env: {"python": "3.11.15", "machine": "arm64", "cores": 16, "ulimit_nofile": 1048576, "loadavg": [4.1572265625, 3.501953125, 3.8671875], "ts": "2026-09-15 19:29:26Z", "gw_workers": 4, "fake_workers": 4, "gw_budget_total_s": 600.0, "gw_drain_grace_s": 600.0, "gw_drain_allow_short": false, "gw_max_streams": 150, "gw_drain_arm": "A (grace >= total: zero cuts expected)"}

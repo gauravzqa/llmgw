@@ -1058,6 +1058,14 @@ class Gateway:
         else:
             for tenant, limits in self.tenants.limits.items():
                 self.admission.configure(tenant, limits)
+            # Ids and counts only; the table's own repr never carries a token.
+            log.info(
+                "tenants: %d configured, %d authenticated by bearer token, "
+                "anonymous %s (required=%s)",
+                len(self.tenants.limits), self.tenants.authenticated_tenants,
+                "allowed" if ANONYMOUS_TENANT in self.tenants else "refused",
+                config.require_tenants,
+            )
 
         self.breakers = BreakerRegistry(
             config.breaker, clock=self.clock,
@@ -2139,10 +2147,31 @@ async def send_error(
     providers today and is an assumption rather than an observation.
     """
     body = err.upstream_body if (err.passthrough and err.upstream_status) else None
+    if isinstance(err, errors.AuthenticationFailed):
+        # THE ONE EXCEPTION TO C4 (CONTRACTS.md C11). A 401/403 from the
+        # provider means the provider rejected OUR credential -- the client
+        # never supplied one, so nothing in that body is the client's to
+        # read. At least one provider's 401 message quotes the tail of the
+        # key it rejected (findings log #30: DeepSeek, "…api key: ****abcd"),
+        # and under a shared key that is four characters of a shared secret
+        # handed to whoever sent the request. The status still passes
+        # through -- a 401 is the honest shape and the client's SDK expects
+        # it -- but the body is ours. The taxonomy, the breaker (credential
+        # scope) and the capture record are untouched: this changes what the
+        # client sees, not what we learned. Upstream headers never reach the
+        # client from here in the first place (see the docstring above), so
+        # a `www-authenticate` echo is not a risk.
+        body = None
     if not body:
-        body = json.dumps(
-            {"error": {"type": err.code, "message": err.message}}
-        ).encode("utf-8")
+        message = err.message
+        code = err.code
+        if isinstance(err, errors.AuthenticationFailed):
+            code = "upstream_auth"
+            message = (
+                f"provider rejected the gateway's credential for "
+                f"{err.provider or 'upstream'}"
+            )
+        body = json.dumps({"error": {"type": code, "message": message}}).encode("utf-8")
     headers = exchange.gw_headers()
     headers.append((b"content-type", b"application/json"))
     headers.append((b"content-length", str(len(body)).encode("ascii")))

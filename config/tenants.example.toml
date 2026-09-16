@@ -18,9 +18,33 @@
 # tenant's token bucket and one tenant's concurrency permit, and neither is
 # shared with any other tenant. The
 # tenant is identified by `Authorization: Bearer <token>`, looked up in the
-# `tokens` lists below. The token is a credential: the gateway compares it and
-# drops it, reports the tenant ID (`X-Gw-Tenant`) and never the token, and
+# tokens configured below. The token is a credential: the gateway compares it
+# and drops it, reports the tenant ID (`X-Gw-Tenant`) and never the token, and
 # refuses at startup to forward `authorization` upstream.
+#
+# ----------------------------------------------------------------------------
+# Where the tokens live: `token_env`, not `tokens`
+# ----------------------------------------------------------------------------
+#
+# A tenant's tokens come from one or both of:
+#
+#   token_env  = "LLMGW_TENANT_LAYRS_TOKEN"     the NAME of an environment
+#   token_envs = ["NAME_A", "NAME_B"]           variable whose VALUE is the token
+#   tokens     = ["tok-literal"]                a literal, in this file
+#
+# Use `token_env` for anything deployed. It keeps this file free of secrets --
+# ids and limits only -- so it is committed and shipped in the image, and the
+# token values travel the same road as the provider keys (`fly secrets set`,
+# a Kubernetes Secret, an env file outside the repository). Resolution is at
+# startup: a `token_env` that is unset or empty is a process that REFUSES TO
+# START, naming the variable, never a tenant with fewer tokens than promised.
+# `tokens` literals remain for local development, where the file is not
+# committed anyway. Every tenant except `anonymous` must end up with at least
+# one token from somewhere; a named tenant nobody can be is a config error.
+#
+# With `LLMGW_REQUIRE_TENANTS=1` (the production scaffold sets it) the
+# process also refuses to start with no tenants file, or with a file whose
+# only tenant is `anonymous`.
 #
 # ----------------------------------------------------------------------------
 # What happens with NO tenants file
@@ -51,8 +75,19 @@
 # own requests finishes. A concurrency denial charges no rate token (C6).
 
 
-# An interactive product. Modest sustained rate, a burst sized for a page that
-# fires several calls on load, and enough concurrency for long streams.
+# The production shape. One service calling the gateway; its token is the
+# value of $LLMGW_TENANT_LAYRS_TOKEN, set out of band. Rate and burst sized
+# for an interactive product whose pages fire a few calls on load; the
+# concurrency cap is the real limit and sits under the per-process
+# `LLMGW_MAX_STREAMS` so this tenant alone cannot fill the process.
+[tenants.layrs]
+token_env = "LLMGW_TENANT_LAYRS_TOKEN"
+rate_per_second = 50.0
+burst = 100
+max_concurrency = 96
+
+# A local-development tenant with literal tokens. Fine here because this is
+# an EXAMPLE file; a real deployment's file has no `tokens` key at all.
 [tenants.acme]
 tokens = ["tok-acme-prod-7f3a", "tok-acme-staging-19c2"]
 rate_per_second = 20.0

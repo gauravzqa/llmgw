@@ -160,14 +160,32 @@ class TenantTable:
     _tokens: Mapping[str, str]
 
     @classmethod
-    def from_toml(cls, text: str) -> TenantTable:
+    def from_toml(cls, text: str, *, env: Mapping[str, str] | None = None) -> TenantTable:
         """Parse `config/tenants.example.toml`'s shape. Raises `ValueError`.
 
             [tenants.acme]
-            tokens = ["tok-acme-1", "tok-acme-2"]
+            token_env = "LLMGW_TENANT_ACME_TOKEN"   # the committable spelling
+            tokens = ["tok-acme-local"]             # literal; local dev only
             rate_per_second = 20.0
             burst = 40
             max_concurrency = 16
+
+        A tenant's tokens come from two places, and the split is the point.
+        `tokens` are literals in the file, which makes the file a secret and
+        keeps it out of git. `token_env` (one name) or `token_envs` (a list)
+        name environment variables whose VALUES are the tokens, so the file
+        carries ids and limits only and the secrets ride in the same channel
+        as the provider keys (`fly secrets`, a k8s Secret, an env file
+        outside the repo). A named variable that is unset or empty is an
+        error at load, never a tenant with fewer tokens than the file
+        promised: fail closed, at startup, where a missing secret is a
+        deploy that refuses rather than a tenant that quietly cannot
+        authenticate. `env` defaults to the process environment and is a
+        parameter so a test can supply one.
+
+        Every tenant except `anonymous` must end up with at least one token;
+        a named tenant nobody can authenticate as is a config error, not a
+        budget.
 
         Unknown keys are an error for the reason `PolicySnapshot.from_toml`
         gives: `max_concurency = 4` must not be a tenant silently running at
@@ -175,6 +193,8 @@ class TenantTable:
         the lookup would pick one, and "which tenant did this request bill"
         would depend on dictionary order.
         """
+        if env is None:
+            env = os.environ
         try:
             doc = tomllib.loads(text)
         except tomllib.TOMLDecodeError as exc:
@@ -188,7 +208,8 @@ class TenantTable:
 
         limits: dict[str, TenantLimits] = {}
         tokens: dict[str, str] = {}
-        allowed = {"tokens", "rate_per_second", "burst", "max_concurrency"}
+        allowed = {"tokens", "token_env", "token_envs",
+                   "rate_per_second", "burst", "max_concurrency"}
         for tenant, entry in table.items():
             if not isinstance(entry, dict):
                 raise ValueError(f"[tenants.{tenant}] must be a table")
@@ -206,7 +227,35 @@ class TenantTable:
                 ).validate()
             except (TypeError, ValueError) as exc:
                 raise ValueError(f"[tenants.{tenant}]: {exc}") from exc
-            for token in entry.get("tokens", ()):
+
+            names: list[str] = []
+            if "token_env" in entry:
+                names.append(entry["token_env"])
+            if "token_envs" in entry:
+                envs = entry["token_envs"]
+                if not isinstance(envs, list):
+                    raise ValueError(f"[tenants.{tenant}]: token_envs must be a list")
+                names.extend(envs)
+            resolved: list[str] = []
+            for name in names:
+                if not isinstance(name, str) or not name.strip():
+                    raise ValueError(
+                        f"[tenants.{tenant}]: token_env names must be non-empty strings"
+                    )
+                value = env.get(name)
+                if value is None or not value.strip():
+                    # The variable NAME is safe to print; it is what the
+                    # operator has to go and set.
+                    raise ValueError(
+                        f"[tenants.{tenant}]: token_env {name!r} is unset or empty; "
+                        f"set it in the environment or drop it from the file"
+                    )
+                resolved.append(value)
+
+            literal = entry.get("tokens", [])
+            if not isinstance(literal, list):
+                raise ValueError(f"[tenants.{tenant}]: tokens must be a list")
+            for token in [*literal, *resolved]:
                 if not isinstance(token, str) or not token.strip():
                     raise ValueError(f"[tenants.{tenant}]: tokens must be non-empty strings")
                 if token in tokens:
@@ -217,7 +266,19 @@ class TenantTable:
                         f"tenant {tokens[token]!r}"
                     )
                 tokens[token] = tenant
+            if tenant != ANONYMOUS_TENANT and not literal and not resolved:
+                raise ValueError(
+                    f"[tenants.{tenant}]: no tokens; give it `tokens` or `token_env` "
+                    f"(only [tenants.{ANONYMOUS_TENANT}] may have none)"
+                )
         return cls(limits=limits, _tokens=tokens)
+
+    @property
+    def authenticated_tenants(self) -> int:
+        """How many tenants a bearer token can name. What `require_tenants`
+        checks: a table of only `[tenants.anonymous]` is a table in which
+        every request is still one tenant."""
+        return len(set(self._tokens.values()))
 
     def resolve(self, token: str | None) -> str | None:
         """The tenant id a bearer token names, or None.
@@ -423,6 +484,19 @@ class ServerConfig:
     the outside rather than deduced from the absence of 401s.
     """
 
+    require_tenants: bool = False
+    """Refuse to start on the zero-config tenant path (`LLMGW_REQUIRE_TENANTS`).
+
+    The zero-config path exists so `make run` + `curl` works on a clean
+    checkout; it is the wrong default for anything with a second caller, and
+    `/probe` saying `"tenant_mode": "anonymous"` is a fact nobody reads
+    during an incident. Set, the process refuses to start unless
+    `tenants_file` is set AND the table it loads has at least one tenant a
+    bearer token can name -- a file of only `[tenants.anonymous]` is the
+    zero-config path with extra steps. Default False so the adoption path
+    stays; the production scaffold sets it.
+    """
+
     tenant_limits: TenantLimits = DEFAULT_TENANT_LIMITS
     """The anonymous tenant's budget when there is no tenants file. Unused
     when there is one: a file that wants an anonymous tenant configures it
@@ -586,6 +660,12 @@ class ServerConfig:
                 f"forward_request_headers may not contain {sorted(banned)}: "
                 "credential and connection headers are ours, not the client's"
             )
+        if self.require_tenants and self.tenants_file is None:
+            raise ValueError(
+                "LLMGW_REQUIRE_TENANTS is set but LLMGW_TENANTS_FILE is not: refusing "
+                "to start on the anonymous-tenant path. Point LLMGW_TENANTS_FILE at a "
+                "tenants.toml with at least one tenant, or unset LLMGW_REQUIRE_TENANTS"
+            )
         self.tenant_limits.validate()
         self.breaker.validate()
         return self
@@ -598,13 +678,16 @@ class ServerConfig:
         a bearer token means anything -- see `app.Gateway.resolve_tenant`."""
         return self.tenants_file is not None
 
-    def tenant_table(self) -> TenantTable | None:
+    def tenant_table(self, *, env: Mapping[str, str] | None = None) -> TenantTable | None:
         """The table this process starts with, or None on the zero-config path.
 
         Read once, at startup, by `app.Gateway`; a malformed file is a process
         that refuses to start. `OSError` is converted so the two ways a file
         can be wrong -- missing and nonsense -- are one `ValueError` with the
-        path in it, which is what a startup log needs.
+        path in it, which is what a startup log needs. `env` is where
+        `token_env` names resolve (the process environment unless a test says
+        otherwise). With `require_tenants`, a table nobody can authenticate
+        against is refused here too.
         """
         if self.tenants_file is None:
             return None
@@ -615,9 +698,16 @@ class ServerConfig:
                 f"tenants file {self.tenants_file!r} could not be read: {exc}"
             ) from exc
         try:
-            return TenantTable.from_toml(text)
+            table = TenantTable.from_toml(text, env=env)
         except ValueError as exc:
             raise ValueError(f"tenants file {self.tenants_file!r}: {exc}") from exc
+        if self.require_tenants and table.authenticated_tenants == 0:
+            raise ValueError(
+                f"LLMGW_REQUIRE_TENANTS is set but tenants file {self.tenants_file!r} "
+                f"defines no tenant a bearer token can name (only "
+                f"[tenants.{ANONYMOUS_TENANT}]): add a tenant with `token_env`"
+            )
+        return table
 
     # --------------------------------------------------------------- policy
 
@@ -727,6 +817,7 @@ class ServerConfig:
             workload_id=env.get("LLMGW_WORKLOAD_ID", "default"),
             http2=_env_bool(env, "LLMGW_HTTP2", True),
             tenants_file=env.get("LLMGW_TENANTS_FILE") or None,
+            require_tenants=_env_bool(env, "LLMGW_REQUIRE_TENANTS", default=False),
             tenant_limits=TenantLimits(
                 rate_per_second=_env_float(
                     env, "LLMGW_TENANT_RATE_PER_SECOND",

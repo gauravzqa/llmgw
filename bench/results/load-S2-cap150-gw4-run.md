@@ -1,6 +1,21 @@
 # Scenario S2: Typical streaming
 _Overhead at ~2,500 concurrent streams (100 rps x 25 s)._
 
+> **Reading this report** (annotation added 16 Sep 2026; the generated numbers
+> below are untouched). This run had the per-process cap at 150, and the
+> bench of 15 Sep put every response into one histogram. 27,707 of Arm G's
+> 36,107 answers were `503 overloaded` refusals that return in about 2 ms, so
+> the all-requests Arm G `ttfe` p50 (4.2 ms) is the rejection latency, not a
+> stream, and the `CALIBRATION ... INVALID (client is the bottleneck)` line
+> below is an artifact of comparing a mostly-refused histogram against a
+> fully-admitted one. Read the p90/p99 and inter-event rows for the admitted
+> streams: first-event p90 30.95 ms through the gateway against 31.59 ms
+> direct, p99 39.5 against 46.5, inter-event p99 37 against 36 ms. The bench
+> now records admitted-only histograms, prints them as a second table, and
+> calibrates on them; reports generated after 16 Sep carry the note
+> "(N% refused by the cap; compared admitted only)" instead of this
+> annotation.
+
 produces: added inter-event jitter p99; CPU per core at steady state; streams_open ~2,500; tasks at load.
 
 env: {"python": "3.11.15", "machine": "arm64", "cores": 16, "ulimit_nofile": 1048576, "loadavg": [3.48974609375, 4.42578125, 6.23583984375], "ts": "2026-09-15 18:03:57Z", "gw_workers": 4, "fake_workers": 4, "gw_budget_total_s": 600.0, "gw_drain_grace_s": 600.0, "gw_drain_allow_short": false, "gw_max_streams": 150, "gw_drain_arm": "A (grace >= total: zero cuts expected)"}

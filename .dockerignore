@@ -1,0 +1,36 @@
+# Secrets -- MUST never enter the build context, let alone the image.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Virtualenvs / caches / VCS
+.venv/
+venv/
+.git
+.gitignore
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+dist/
+build/
+.DS_Store
+
+# Not runtime inputs. The image needs pyproject.toml + uv.lock (builder),
+# src/ (builder) and config/ (runtime) -- nothing else.
+tests/
+bench/
+live/
+fakes/
+docs/
+*.md
+
+# Deploy scaffolding itself doesn't belong in the build context.
+Dockerfile
+.dockerignore
+fly.toml
+Makefile

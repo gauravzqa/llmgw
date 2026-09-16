@@ -1,4 +1,4 @@
-"""Hostile upstreams. One process, two ports, fourteen ways to break a proxy.
+"""Hostile upstreams. One process, two ports, fifteen ways to break a proxy.
 
 You cannot test a proxy without an upstream you control. A proxy's entire job
 is what it does when the thing behind it misbehaves, and the one thing a real
@@ -23,7 +23,7 @@ Choosing a behaviour
 Per request via `X-Fake-Mode`, falling back to the port's default mode. Never
 via a restart -- a load scenario has to be able to flip a target from `ok` to
 `5xx` at t=120 s without dropping the listener, and a unit-ish contract test
-has to be able to run fourteen behaviours against one session-scoped server.
+has to be able to run fifteen behaviours against one session-scoped server.
 
 Parameters ride along as headers, all optional:
 
@@ -137,6 +137,7 @@ MODES: tuple[str, ...] = (
     "5xx",
     "429",
     "529",
+    "401",
     "die-mid-stream",
     "error-in-stream",
     "schema-400",
@@ -777,6 +778,16 @@ def _handler(surface: Surface, default_mode: str) -> Callable[[Request], Awaitab
             # gateway classifies on the integer, and a classifier that only
             # ever met 529 on one surface has an untested branch.
             return _raw(surface, 529, "overloaded_error", "Overloaded", hdr)
+        if p.mode == "401":
+            # A provider rejecting the GATEWAY's credential, in the shape
+            # that made findings-log #30: the body quotes the tail of the
+            # key it refused. Served so the contract tier can prove the
+            # gateway does not relay that body (CONTRACTS.md C11). The
+            # `****abcd` is fixed text, never derived from a real header.
+            return _raw(
+                surface, 401, "authentication_error",
+                "Authentication Fails, Your api key: ****abcd is invalid", hdr,
+            )
         if p.mode == "429":
             retry_after = max(1, int(p.delay))
             return _raw(

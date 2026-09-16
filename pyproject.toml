@@ -14,7 +14,16 @@ dependencies = [
     # byte-for-byte would mean parsing and re-serialising it -- which is
     # exactly the thing passthrough exists to avoid.
     "starlette>=0.37",
-    "uvicorn>=0.30",
+    # Pinned to the 0.52 series on purpose. `server/lifecycle.py` reaches
+    # into uvicorn: it disables `capture_signals` so its own loop-level
+    # handlers run the drain, it relies on `timeout_graceful_shutdown`
+    # being the bound uvicorn waits after `should_exit`, and it relies on
+    # `Server.shutdown()` CANCELLING the leftover request tasks without
+    # awaiting them (which is why serve() settles them itself before it
+    # logs the cut count). Any of those can change in a minor release, so a
+    # bump is a deliberate act: raise the ceiling here, `make lock`, and
+    # re-run `tests/contract/test_lifecycle.py` before trusting a deploy.
+    "uvicorn>=0.52,<0.53",
     "prometheus-client>=0.20",
 ]
 

@@ -279,6 +279,16 @@ class WorkerResult:
     # was REFUSED, which is what a closed listener is supposed to do.
     cut_midstream: int = 0
     refused_before_byte: int = 0
+    # The same three histograms restricted to ADMITTED requests (status 200).
+    # With a per-process cap a refused request answers in ~2 ms with a 503,
+    # and those samples land in `ttfe`/`total` like any other response: at a
+    # 97% shed rate the all-requests p50 IS the rejection latency and the
+    # calibration rule reads the gateway as faster than the direct arm. The
+    # all-requests histograms are kept so old reports stay comparable; these
+    # are what overhead and calibration are read from.
+    ttfe_adm: dict = field(default_factory=lambda: LogHistogram().to_dict())
+    total_adm: dict = field(default_factory=lambda: LogHistogram().to_dict())
+    gaps_adm: dict = field(default_factory=lambda: LogHistogram().to_dict())
 
 
 def _classify_error(exc: BaseException) -> str:
@@ -317,6 +327,10 @@ async def _worker_main(spec: WorkerSpec) -> WorkerResult:
     ttfe = LogHistogram()
     total = LogHistogram()
     gaps = LogHistogram()
+    # Admitted-only twins (status 200). Recorded alongside, never instead.
+    ttfe_adm = LogHistogram()
+    total_adm = LogHistogram()
+    gaps_adm = LogHistogram()
     counters = dict(started=0, ok=0, error=0, late=0, bytes=0, cut=0, refused=0)
     errors_by_kind: dict[str, int] = {}
     status_counts: dict[str, int] = {}
@@ -370,6 +384,10 @@ async def _worker_main(spec: WorkerSpec) -> WorkerResult:
                                          headers=hdrs) as r:
                     status_counts[str(r.status_code)] = \
                         status_counts.get(str(r.status_code), 0) + 1
+                    # Known at the headers, before any body byte: a non-200
+                    # here is a refusal (cap, drain, limiter, upstream error
+                    # body), and its bytes are not the stream.
+                    admitted = r.status_code == 200
                     if spec.assert_gw and gw_headers_holder["seen"] is None \
                             and r.status_code == 200:
                         gw_headers_holder["seen"] = dict(r.headers)
@@ -389,9 +407,13 @@ async def _worker_main(spec: WorkerSpec) -> WorkerResult:
                             first = now
                             if measuring:
                                 ttfe.record(first - t0)
+                                if admitted:
+                                    ttfe_adm.record(first - t0)
                         else:
                             if measuring:
                                 gaps.record(now - last)
+                                if admitted:
+                                    gaps_adm.record(now - last)
                         last = now
                         # S5: a genuinely slow reader. Pace the read loop to
                         # read_bps so backpressure propagates to the gateway
@@ -415,7 +437,10 @@ async def _worker_main(spec: WorkerSpec) -> WorkerResult:
                     counters["refused"] += 1
                 counters["bytes"] += nbytes
                 if measuring:
-                    total.record(time.perf_counter() - t0)
+                    elapsed = time.perf_counter() - t0
+                    total.record(elapsed)
+                    if admitted:
+                        total_adm.record(elapsed)
             else:
                 r = await client.post(url, json=spec.body, headers=hdrs)
                 _ = r.content
@@ -431,8 +456,12 @@ async def _worker_main(spec: WorkerSpec) -> WorkerResult:
                 if r.status_code == 200:
                     counters["ok"] += 1
                     if measuring:
+                        # Buffered responses were already 200-only here, so
+                        # admitted == all for this path.
                         ttfe.record(dt)
                         total.record(dt)
+                        ttfe_adm.record(dt)
+                        total_adm.record(dt)
                 else:
                     counters["error"] += 1
                     counters["refused"] += 1
@@ -496,6 +525,8 @@ async def _worker_main(spec: WorkerSpec) -> WorkerResult:
         gw_headers=gw_headers_holder["seen"], d_has_x_gw=gw_headers_holder["d_has_x_gw"],
         ttfe=ttfe.to_dict(), total=total.to_dict(), gaps=gaps.to_dict(),
         cut_midstream=counters["cut"], refused_before_byte=counters["refused"],
+        ttfe_adm=ttfe_adm.to_dict(), total_adm=total_adm.to_dict(),
+        gaps_adm=gaps_adm.to_dict(),
     )
 
 
@@ -1056,6 +1087,30 @@ class ArmResult:
     fake_requests: int
     cut_midstream: int = 0
     refused_before_byte: int = 0
+    # Admitted-only (status 200) twins of ttfe/total/gaps; see WorkerResult.
+    ttfe_adm: LogHistogram = field(default_factory=LogHistogram)
+    total_adm: LogHistogram = field(default_factory=LogHistogram)
+    gaps_adm: LogHistogram = field(default_factory=LogHistogram)
+
+    @property
+    def answered(self) -> int:
+        """Requests that reached a terminal outcome (ok + error)."""
+        return self.ok + self.error
+
+    @property
+    def refused_share(self) -> float:
+        """Fraction of answered requests refused before a byte. 0.0 when
+        nothing was answered."""
+        return self.refused_before_byte / self.answered if self.answered else 0.0
+
+    def admitted_hists(self) -> tuple[LogHistogram, LogHistogram, LogHistogram]:
+        """(ttfe, total, gaps) over ADMITTED requests only. Falls back to the
+        all-requests histograms when nothing was refused and the admitted twins
+        are empty (a result built without them), where the two are identical
+        by construction."""
+        if self.ttfe_adm.total == 0 and self.refused_before_byte == 0:
+            return self.ttfe, self.total, self.gaps
+        return self.ttfe_adm, self.total_adm, self.gaps_adm
 
 
 def run_arm(*, arm: str, url: str, scenario: Scenario, rate: float, workers: int,
@@ -1136,6 +1191,9 @@ def run_arm(*, arm: str, url: str, scenario: Scenario, rate: float, workers: int
     ttfe = merge_all([LogHistogram.from_dict(r.ttfe) for r in results])
     total = merge_all([LogHistogram.from_dict(r.total) for r in results])
     gaps = merge_all([LogHistogram.from_dict(r.gaps) for r in results])
+    ttfe_adm = merge_all([LogHistogram.from_dict(r.ttfe_adm) for r in results])
+    total_adm = merge_all([LogHistogram.from_dict(r.total_adm) for r in results])
+    gaps_adm = merge_all([LogHistogram.from_dict(r.gaps_adm) for r in results])
     errs: dict = {}
     stats: dict = {}
     for r in results:
@@ -1161,6 +1219,7 @@ def run_arm(*, arm: str, url: str, scenario: Scenario, rate: float, workers: int
         wall_s=wall, fake_requests=fake_after - fake_before,
         cut_midstream=sum(r.cut_midstream for r in results),
         refused_before_byte=sum(r.refused_before_byte for r in results),
+        ttfe_adm=ttfe_adm, total_adm=total_adm, gaps_adm=gaps_adm,
     )
 
 
@@ -1199,18 +1258,43 @@ def assert_instrument(scenario: Scenario, d: ArmResult, g: ArmResult) -> list[st
     return verdicts
 
 
+REFUSED_SHARE_NOTE_THRESHOLD = 0.05
+"""Above this refused share the calibration line and the overhead table say
+so out loud. Below it the admitted and all-requests histograms are the same
+population to within the noise and the report reads as it always did."""
+
+
+def _refused_note(d: ArmResult, g: ArmResult) -> str:
+    """'(N% refused by the cap; compared admitted only)' for whichever arms
+    shed more than the threshold, or '' when neither did."""
+    parts = [f"Arm {a.arm} {a.refused_share:.1%}" for a in (d, g)
+             if a.refused_share > REFUSED_SHARE_NOTE_THRESHOLD]
+    if not parts:
+        return ""
+    return f" ({', '.join(parts)} refused by the cap; compared admitted only)"
+
+
 def calibration_verdict(d: ArmResult, g: ArmResult) -> tuple[bool, str]:
     """Arm D is the client's own ceiling. If D's p99 first-event is NOT below
-    G's at this offered load, the number is the client's, not the gateway's."""
-    dp = d.ttfe.percentile(99) * 1e3
-    gp = g.ttfe.percentile(99) * 1e3
+    G's at this offered load, the number is the client's, not the gateway's.
+
+    Compared over ADMITTED requests only. A refused request is answered in a
+    couple of milliseconds with a 503, so on a capped run the all-requests
+    Arm G histogram is mostly rejections and its p99 drops BELOW Arm D's --
+    which this rule would read as "the client is the bottleneck" when the
+    truth is "the gateway shed 97% of the offer". The 15 Sep S2/S4 cap-150
+    reports carry exactly that false INVALID."""
+    d_ttfe, _, _ = d.admitted_hists()
+    g_ttfe, _, _ = g.admitted_hists()
+    dp = d_ttfe.percentile(99) * 1e3
+    gp = g_ttfe.percentile(99) * 1e3
     if math.isnan(dp) or math.isnan(gp):
         return False, "insufficient samples to calibrate"
     ok = dp < gp
     tail = ("CALIBRATED (client faster than gateway path, number is honest)"
             if ok else "INVALID (client is the bottleneck, not the gateway)")
     msg = (f"Arm D p99 TTFE={dp:.2f} ms {'<' if ok else '>='} "
-           f"Arm G p99 TTFE={gp:.2f} ms -> {tail}")
+           f"Arm G p99 TTFE={gp:.2f} ms -> {tail}{_refused_note(d, g)}")
     return ok, msg
 
 
@@ -1252,6 +1336,23 @@ def arm_tables(r: ArmResult) -> str:
          _hrow("ttfe", r.ttfe), _hrow("total", r.total)]
     if r.gaps.total:
         p.append(_hrow("inter-event", r.gaps))
+    if r.refused_before_byte:
+        # The table above mixes 2 ms rejections with real streams; this one is
+        # the population overhead and calibration are read from.
+        ttfe_a, total_a, gaps_a = r.admitted_hists()
+        p.append("")
+        p.append("admitted only (status 200; refused requests excluded):")
+        p.append("")
+        p.append("| metric (ms)    |       n |     p50 |     p90 |     p99 |"
+                 "    p99.9 |    mean |")
+        p.append("|----------------|---------|---------|---------|---------|"
+                 "----------|---------|")
+        p.append(_hrow("ttfe", ttfe_a))
+        p.append(_hrow("total", total_a))
+        if gaps_a.total:
+            p.append(_hrow("inter-event", gaps_a))
+        p.append("")
+        p.append(_refused_line(r))
     if r.status_counts:
         p.append("")
         p.append(f"status: {r.status_counts}")
@@ -1265,21 +1366,52 @@ def arm_tables(r: ArmResult) -> str:
     return "\n".join(p)
 
 
-def paired_delta(d: ArmResult, g: ArmResult) -> str:
-    """Paired per-quantile DIFFERENCE (NOT an average of percentiles). We report
-    the added latency at matched quantiles -- the honest framing: both arms'
-    absolute numbers plus the difference."""
+def _refused_line(r: ArmResult) -> str:
+    """`refused before a byte: N (x%)` with what refused them: the non-200
+    status mix, plus however many were transport errors with nothing read."""
+    non200 = {k: v for k, v in sorted(r.status_counts.items()) if k != "200"}
+    by_status = sum(non200.values())
+    transport = r.refused_before_byte - by_status
+    tail = f" + {transport} transport errors before a byte" if transport > 0 else ""
+    return (f"refused before a byte: {r.refused_before_byte} "
+            f"({r.refused_share:.1%} of {r.answered} answered): {non200}{tail}")
+
+
+def _delta_rows(d_h: LogHistogram, g_h: LogHistogram) -> list[str]:
     rows = []
     for q in (50, 90, 99, 99.9):
-        dv = d.ttfe.percentile(q) * 1e3
-        gv = g.ttfe.percentile(q) * 1e3
+        dv = d_h.percentile(q) * 1e3
+        gv = g_h.percentile(q) * 1e3
         if math.isnan(dv) or math.isnan(gv):
             rows.append(f"| p{q} | n/a | n/a | n/a |")
         else:
             rows.append(f"| p{q} | {dv:7.2f} | {gv:7.2f} | {gv-dv:+7.2f} |")
-    return ("added first-event latency (gateway path), matched-quantile:\n"
-            "| q | Arm D ms | Arm G ms | added ms |\n"
-            "|---|----------|----------|----------|\n" + "\n".join(rows))
+    return rows
+
+
+_DELTA_HEADER = ("| q | Arm D ms | Arm G ms | added ms |\n"
+                 "|---|----------|----------|----------|\n")
+
+
+def paired_delta(d: ArmResult, g: ArmResult) -> str:
+    """Paired per-quantile DIFFERENCE (NOT an average of percentiles). We report
+    the added latency at matched quantiles -- the honest framing: both arms'
+    absolute numbers plus the difference.
+
+    When either arm refused traffic, a second table over ADMITTED requests
+    follows: that is the gateway's overhead on the traffic it accepted. The
+    refused share is a shed rate, not a latency, and is printed as one."""
+    out = ("added first-event latency (gateway path), matched-quantile:\n"
+           + _DELTA_HEADER + "\n".join(_delta_rows(d.ttfe, g.ttfe)))
+    if d.refused_before_byte or g.refused_before_byte:
+        d_ttfe, _, _ = d.admitted_hists()
+        g_ttfe, _, _ = g.admitted_hists()
+        out += ("\n\nadded first-event latency (gateway path), matched-quantile, "
+                "admitted only:\n" + _DELTA_HEADER
+                + "\n".join(_delta_rows(d_ttfe, g_ttfe))
+                + f"\nshed (refused before a byte): Arm D {d.refused_share:.1%}, "
+                  f"Arm G {g.refused_share:.1%}")
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -1358,9 +1490,11 @@ def run_scenario(scenario: Scenario, *, warm_s: float, measure_s: float,
     finally:
         fleet.stop()
 
-    # pick the median run by Arm G p99 ttfe (never average percentiles across runs)
+    # pick the median run by Arm G p99 ttfe (never average percentiles across
+    # runs), over admitted requests -- on a capped run the all-requests p99
+    # would rank runs by how fast they said no.
     def g_key(i: int) -> float:
-        v = g_runs[i].ttfe.percentile(99)
+        v = g_runs[i].admitted_hists()[0].percentile(99)
         return v if not math.isnan(v) else math.inf
     order = sorted(range(len(g_runs)), key=g_key)
     med = order[len(order) // 2]

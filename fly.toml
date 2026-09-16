@@ -1,0 +1,122 @@
+# Fly.io config for llmgw, the streaming LLM gateway.
+#
+# ── PRIVATE-ONLY ───────────────────────────────────────────────────────────
+# This app has NO public IPs. Create it with `fly launch --no-public-ips`
+# and give it a flycast address (`fly ips allocate-v6 --private`); see
+# DEPLOY.md. Its callers are the sibling apps on the same Fly organisation
+# (layrs-tcg, the voice agent), which reach it over the 6PN private network
+# as http://layrs-llmgw.internal:8080 (direct to a machine, no proxy) or
+# http://layrs-llmgw.flycast (through Fly's proxy, so the concurrency
+# limits and health checks below apply). Nothing on the public internet can
+# reach /metrics, /workloads/<w>/probe or the serving paths, which is why
+# this app can ship without TLS termination or an auth layer in front of
+# the operational endpoints. `force_https` below is irrelevant on the
+# private path and kept only so that IF someone allocates a public IP later
+# the plaintext port is not silently open.
+
+app = "layrs-llmgw"
+primary_region = "sin"   # co-located with layrs-tcg / layrs-partner-gateway
+
+# ── Graceful-drain pairing (CRITICAL) ──────────────────────────────────────
+# On a rolling deploy Fly sends SIGTERM, then SIGKILLs after kill_timeout.
+# `python -m llmgw.server` drains for LLMGW_DRAIN_GRACE (130s) on SIGTERM,
+# then uvicorn gets a further 3 s bound to close whatever is left. The full
+# inequality is  total (120) <= grace (130) < grace + 3 (133) < kill_timeout.
+# If kill_timeout were <= grace + 3, Fly would SIGKILL mid-drain and cut
+# live streams. 140s leaves 7 s of headroom for a clean exit. The process
+# checks the first inequality at startup; only this file can hold the last
+# one, so keep them in step when changing either value.
+kill_signal = "SIGTERM"
+kill_timeout = "140s"
+
+[build]
+  dockerfile = "Dockerfile"
+  # Pass the commit: `fly deploy --build-arg GIT_SHA=$(git rev-parse --short HEAD)`
+  # (`make deploy` does this). It lands in $LLMGW_BUILD_SHA inside the machine.
+
+[env]
+  LLMGW_HOST = "0.0.0.0"
+  LLMGW_PORT = "8080"
+
+  # Deploy arithmetic. ServerConfig.validated() enforces the first inequality
+  # at startup; only kill_timeout (top of this file) can hold the last one:
+  #   LLMGW_BUDGET_TOTAL <= LLMGW_DRAIN_GRACE < grace + 3s (uvicorn's own
+  #   post-drain bound) < kill_timeout
+  # A stream may run for up to 120 s; a deploy waits up to 130 s for it.
+  LLMGW_BUDGET_TOTAL = "120"
+  LLMGW_DRAIN_GRACE = "130"
+
+  # Per-process shed: the 151st concurrent stream is a 503 `overloaded`
+  # before its body is read. 150 was the largest cap at which the S2 load
+  # run shed BEFORE it degraded on a 16-core laptop (300 still pinned the
+  # CPU); S4 at 150 held admitted streams within 2 ms of the direct arm at
+  # 57 MB / 18% CPU per process. A shared-cpu-1x is a fraction of one of
+  # those cores, so RE-DERIVE this from an S2-style run against this VM size
+  # before trusting it (DEPLOY.md, "Re-deriving the cap").
+  LLMGW_MAX_STREAMS = "150"
+
+  # Multi-tenant is mandatory in production: without a tenants file the
+  # gateway would serve every bearer token as one anonymous tenant. The
+  # file ships in the image (Dockerfile copies config/); the tokens it names
+  # are env-var NAMES resolved at startup from `fly secrets`, so the file is
+  # committable and rotating a token is `fly secrets set` + restart.
+  LLMGW_REQUIRE_TENANTS = "1"
+  LLMGW_TENANTS_FILE = "/app/config/tenants.toml"
+  # Routing policy (workloads, candidate -> incumbent chains, per-workload
+  # budgets). Same convention: ships in the image under /app/config/.
+  # Unset = the single-target default route from LLMGW_DEFAULT_MODEL.
+  # LLMGW_POLICY_FILE = "/app/config/workloads.toml"
+
+  # LLMGW_FAKE_UPSTREAMS is intentionally unset -> false. NEVER set it true here.
+  # Provider keys (ANTHROPIC_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY,
+  # DEEPSEEK_API_KEY) and tenant tokens (LLMGW_TENANT_*_TOKEN) come from
+  # `fly secrets set`, NOT from this file. See DEPLOY.md.
+
+# Fly's built-in Prometheus scrapes this and the graphs show up at
+# fly-metrics.net with no exporter to run. /metrics is reachable only on the
+# private network, and Fly's scraper is inside it.
+[metrics]
+  port = 8080
+  path = "/metrics"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # Never stop on idle: stop-on-idle plus a drain contract don't mix (an idle
+  # stop is a SIGTERM nobody planned for), and a cold start on the first
+  # request is exactly the slow hop a gateway must not be. Siblings
+  # (layrs-tcg, layrs-partner-gateway) run "off" for the same reason.
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  # Streams are long-lived; count connections, not requests. The in-process
+  # LLMGW_MAX_STREAMS cap is the real bound; these limits are the edge's
+  # early signal so the proxy stops routing new connections to a machine
+  # before the process has to refuse them. soft_limit == the cap; hard_limit
+  # leaves headroom for /healthz and the arrivals that race the transition.
+  # These only apply to traffic that goes through Fly's proxy (the .flycast
+  # address); .internal callers talk to the machine directly and see the
+  # process's own 503 `overloaded` instead.
+  [http_service.concurrency]
+    type = "connections"
+    soft_limit = 150
+    hard_limit = 180
+
+  # /healthz is the readiness endpoint: 200 when serving, 503 while draining.
+  # The proxy seeing 503 during a rolling deploy stops sending new traffic
+  # to the draining machine while its in-flight streams finish.
+  [[http_service.checks]]
+    method = "GET"
+    path = "/healthz"
+    interval = "10s"
+    timeout = "2s"
+    grace_period = "5s"
+
+# S4 (15 Sep 2026) measured 57 MB RSS per process at the 150-stream cap and
+# ~35 KiB marginal per stream; 512 MB is generous headroom, not a fit. The
+# CPU is the constraint on this size, which is why the cap must be
+# re-derived on it.
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"

@@ -1,0 +1,11 @@
+# Production tenants. Committed on purpose: it names env VARIABLES, never
+# tokens. Set the token with
+#   fly secrets set LLMGW_TENANT_LAYRS_TOKEN=$(openssl rand -hex 32)
+# and hand the same value to the caller. No [tenants.anonymous] section, so a
+# request without a bearer token is a 401. max_concurrency stays below
+# LLMGW_MAX_STREAMS (150) so one tenant cannot fill the process.
+[tenants.layrs]
+token_env = "LLMGW_TENANT_LAYRS_TOKEN"
+rate_per_second = 50.0
+burst = 100
+max_concurrency = 96

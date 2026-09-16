@@ -1,18 +1,27 @@
 # llmgw. Every target is runnable on a clean checkout with `make <target>`.
-.PHONY: help venv test unit contract chaos live probe smoke scale trace fakes run lint clean
+.PHONY: help venv lock test unit contract chaos live probe smoke scale trace fakes run serve image deploy lint clean
 
 VENV := .venv
 PY   := $(VENV)/bin/python
 PYTEST := $(VENV)/bin/pytest
+GIT_SHA := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 
 help:
 	@grep -E '^[a-z-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
 	  awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-12s\033[0m %s\n",$$1,$$2}'
 
-$(VENV): pyproject.toml            ## Create the venv (uv, falls back to pip)
-	uv venv $(VENV) --python 3.11 2>/dev/null || python3 -m venv $(VENV)
-	uv pip install --python $(PY) -e '.[dev]' 2>/dev/null || $(PY) -m pip install -e '.[dev]'
+# The venv is built FROM THE LOCK, not resolved afresh: `--frozen` refuses to
+# run if uv.lock and pyproject.toml disagree, so a developer's venv, the
+# Docker image and the contract tests all see the same dependency set. The
+# pip fallback (no uv installed) resolves live and is therefore weaker; it
+# exists so a clean machine can still run the tests.
+$(VENV): pyproject.toml uv.lock    ## Create the venv from uv.lock (uv, falls back to pip)
+	uv sync --frozen --extra dev --python 3.11 2>/dev/null || \
+	  (python3 -m venv $(VENV) && $(PY) -m pip install -e '.[dev]')
 	@touch $(VENV)
+
+lock:                              ## Re-resolve uv.lock after editing pyproject.toml
+	uv lock
 
 venv: $(VENV)                      ## Same as above
 
@@ -52,6 +61,12 @@ run: $(VENV)                       ## Run the gateway against the fakes (drains 
 
 serve: $(VENV)                     ## Run the gateway against real providers (drains on SIGTERM)
 	LLMGW_PORT=8800 $(PY) -m llmgw.server
+
+image:                             ## Build the container image locally (needs Docker)
+	docker build --build-arg GIT_SHA=$(GIT_SHA) -t llmgw:$(GIT_SHA) -t llmgw:latest .
+
+deploy:                            ## Deploy to Fly (see DEPLOY.md for first-time setup)
+	fly deploy --build-arg GIT_SHA=$(GIT_SHA)
 
 lint: $(VENV)
 	$(VENV)/bin/ruff check src tests fakes bench

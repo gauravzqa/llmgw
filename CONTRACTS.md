@@ -206,3 +206,46 @@ here is under its own limits and did nothing wrong.
 *Enforced by:* `test_the_request_over_the_cap_is_shed_before_any_upstream_work`,
 `test_a_slot_freed_by_a_finished_stream_admits_the_next_request`,
 `test_shed_is_counted_under_overloaded_and_costs_no_tenant_credit`.
+
+---
+
+### C10 — In production, a bearer token names a tenant or the request is refused
+
+With `LLMGW_REQUIRE_TENANTS=1` the process refuses to start on the
+zero-config tenant path: no `LLMGW_TENANTS_FILE`, or a file whose only tenant
+is `anonymous`, is a startup error naming the variable to set. Tokens are
+resolved at startup from the environment (`token_env`), so the tenants file
+carries ids and limits only and a missing secret is a deploy that fails,
+never a tenant that quietly cannot authenticate. Once running, an unknown
+token is a 401 and is never downgraded to guest access; `X-Gw-Tenant`
+carries the id and nothing anywhere carries the token.
+
+The zero-config path stays for `make run` + `curl`. It is loud (a startup
+warning, `"tenant_mode": "anonymous"` in `/probe`) but loud is not the same
+as refused, and a gateway with two callers on one bucket is FAILURE-MODES
+row 6 with a green dashboard.
+
+*Enforced by:* `test_require_tenants_without_a_file_refuses_to_start_naming_both_vars`,
+`test_require_tenants_with_only_anonymous_in_the_file_is_refused`,
+`test_an_unset_or_empty_token_env_refuses_to_load_and_names_the_variable`,
+`test_repr_never_carries_a_token_from_either_source`.
+
+---
+
+### C11 — A provider's auth-failure body never reaches the client
+
+The one exception to C4. When the terminal error is `AuthenticationFailed`
+(upstream 401 or 403), the provider rejected the *gateway's* credential; the
+client never supplied one and nothing in that body is the client's to read.
+At least one provider's 401 quotes the tail of the key it rejected (findings
+log #30), which under a shared key is part of a shared secret. So the
+upstream status passes through and the body is replaced with the gateway's
+own `{"error": {"type": "upstream_auth", ...}}` naming the provider.
+Everything else -- classification, credential-scoped breaker, blame, the
+capture record -- is exactly as before; only the wire changes. Every other
+passthrough class is still forwarded byte for byte.
+
+*Enforced by:* `test_an_upstream_401_body_is_replaced_and_the_status_kept`,
+`test_a_non_auth_passthrough_body_is_still_the_providers_bytes`,
+`test_a_provider_401_reaches_the_client_as_a_status_without_the_body` and
+`test_a_provider_5xx_body_is_still_forwarded_byte_for_byte` (contract).
