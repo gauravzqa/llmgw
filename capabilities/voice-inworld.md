@@ -4,16 +4,17 @@ Repo: `/Users/sanjay/PREP/Evo/llmgw` @ `bc1d065`. Docs read today. Status key fo
 
 ## Verified 16 Sep (live and source) vs still unverified
 
-Second pass, 16 Sep 2026. `docs.inworld.ai/api-reference/*` still 302s to a
-login (`platform.inworld.ai/docs-auth/login-redirect`); `dev.docs.inworld.ai`
-does not resolve; `api.inworld.ai/openapi.json` is 404. No Inworld credential
-exists on this machine (Layrs has only `.env.example`; `tcg/.env` names the
-variable with an empty value), so the live probes below are **unauthenticated
-or fake-key** requests, which cost nothing and still pin error shapes,
-headers, the auth scheme and credential reflection. Wire formats come from the
-downloaded source of the plugin Layrs pins (`livekit-plugins-inworld==1.6.3`,
-sdist from PyPI), Inworld's own `inworld-api-examples` repository, and
-Pipecat's client. Rows touched carry `[live]` or `[source: file:line]`.
+Second and third pass, 16 Sep 2026. `docs.inworld.ai/api-reference/*` still
+302s to a login (`platform.inworld.ai/docs-auth/login-redirect`);
+`dev.docs.inworld.ai` does not resolve; `api.inworld.ai/openapi.json` is 404.
+The second pass ran unauthenticated and fake-key probes (error shapes, auth
+scheme, reflection); the third pass ran **authenticated probes with the
+portal key** (18 requests, about 4,200 characters synthesised on
+`inworld-tts-2-flash`, roughly $0.06 at the on-demand rate, less on a plan).
+Wire formats were first read from the downloaded source of the plugin Layrs
+pins (`livekit-plugins-inworld==1.6.3`, sdist from PyPI), Inworld's own
+`inworld-api-examples` repository and Pipecat's client, then confirmed on the
+wire. Rows touched carry `[live]` or `[source: file:line]`.
 
 | Item | Status | Evidence |
 |---|---|---|
@@ -22,17 +23,23 @@ Pipecat's client. Rows touched carry `[live]` or `[source: file:line]`.
 | Auth scheme | **Verified** | `[live]` `Authorization: Basic <key>` and `Authorization: Bearer <key>` behave identically; `x-api-key` is ignored |
 | Credential reflection | **Verified, present** | `[live]` the 403 message echoes the first four characters of the presented key, masked: `"Zm9v***"` |
 | Response request id | **Verified** | `[live]` `x-inworld-request-id` on every TTS/STT response; `x-envoy-upstream-service-time` (ms) alongside |
-| NDJSON framing | **Verified (source)** | Inworld's own example and Pipecat split on `\n`, skip empty lines, `JSON.parse` each line; error lines are `{"error":{code,message,details}}` |
+| NDJSON framing | **Verified `[live]`** | `content-type: application/json`, `transfer-encoding: chunked`, one JSON object per `\n`-terminated line, no blank lines, trailing newline, no terminator, ends on close; `usage` inside `result` on every line (count on the first, 0 after); timestamps on the same lines as audio; first decoded chunk carries a 44-byte RIFF/WAVE header for LINEAR16 (§2, appendix) |
+| SSE-parser prediction | **Verified `[live]`** | the captured bytes fed to `llmgw.sse.SSEParser` dispatch **0 events** on every stream; the 1 MiB bound raised `FrameTooLarge` at 1,052,672 cumulative bytes on the long LINEAR16 stream (line 19 of 123, about 16 s of audio); short streams end by close with no event, i.e. `FirstEventTimeout` |
+| Success headers | **Verified `[live]`** | `x-inworld-request-id`, `x-envoy-upstream-service-time` (33 to 255 ms), `grpc-metadata-*` mirrors, chunked; no rate-limit headers of any kind |
+| Error shapes with a valid key | **Verified `[live]`** | unknown `modelId` 400 code 3; unknown `voiceId` 404 code 5; 2,001 characters 400 code 3; **empty or whitespace text is a 200 with empty `audioContent` and `usage: null`**; an unsupported `audioEncoding` is a 200 with audio in a default encoding (§5) |
+| Credential reflection on non-auth errors | **Verified `[live]`, absent** | no 12-character substring of the key, and no `authorization` text, in any 2xx/4xx body or header from 18 authenticated calls |
+| Router with the portal key | **Verified `[live]`** | `GET /v1/models` is 404 code 5 with Basic and with Bearer; the Router path exists only as `/v1/chat/completions`, not probed further |
+| Field naming | **Verified `[live]`** | snake_case (`model_id`, `voice_id`, `audio_config.audio_encoding`) accepted alongside camelCase, same 200 |
 | WebSocket handshake vs auth | **Verified** | `[live]` upgrade returns 101 with no credential; the auth error arrives in-band as the first frame; with a bad key the socket stays silent (>15 s) |
 | WebSocket keepalive | **Verified absent** | `[source]` plugin: 60 s receive timeout, no ping; example client: none |
 | Token minting endpoint | **Verified (source)** | `POST /auth/v1/tokens/token:generate` with an `IW1-HMAC-SHA256` signed header built from a key+secret pair; returns `token`, `type`, `expirationTime`, `sessionId` |
 | Router base URL | **Verified** | `[live]` `POST https://api.inworld.ai/v1/chat/completions` exists (401 plain text, a different auth stack); `/v1/models` is 404 |
 | Realtime endpoint | **Verified (source)** | `wss://api.inworld.ai/api/v1/realtime/session?key=<client key>&protocol=realtime`, Basic auth |
 | Sync STT request/response shape | **Verified (source)** | §1 row; `usage.transcribedAudioMs`, `usage.modelId` |
-| Numeric rate and concurrency limits | Still unverified | need an authenticated account and a 429 |
+| Numeric rate and concurrency limits | Still unverified | no 429 was provoked (sequential calls only); no limit headers exist to read |
 | `Retry-After` on 429 | Still unverified | no 429 observed |
-| Streaming success framing details (content-type, per-line size, where `usage` appears, RIFF header) | Still unverified live | source-verified structure only; needs one authenticated `:stream` call (about 20 characters, well under a cent) |
-| Reflection of the credential on other error classes | Still unverified | only auth errors were observable without a key |
+| WebSocket success path (context lifecycle, `RECOGNITION_USAGE` cadence) | Still unverified live | source-verified only; not exercised |
+| 5xx / overloaded bodies | Still unverified | none observed |
 
 Doc URLs used: DOCS https://docs.inworld.ai · TTS https://docs.inworld.ai/tts/tts · MODELS https://docs.inworld.ai/tts/tts-models · STT https://docs.inworld.ai/stt/overview · RT https://docs.inworld.ai/realtime/overview · ROUTER https://docs.inworld.ai/router/introduction · AUTH https://docs.inworld.ai/portal/authentication · RL https://docs.inworld.ai/docs/resources/rate-limits · PRICE https://inworld.ai/pricing · QS https://inworld.ai/resources/tts-api-quickstart · JS https://inworld.ai/resources/javascript-tts-api-tutorial · LK-TTS livekit-plugins-inworld `tts.py` · LK-STT `stt.py` · PC pipecat `services/inworld/tts.py` · LKDOC https://docs.livekit.io/agents/models/tts/inworld/ · EX https://github.com/inworld-ai/inworld-api-examples · LEAK https://github.com/openclaw/openclaw/issues/146804.
 
@@ -40,8 +47,8 @@ Doc URLs used: DOCS https://docs.inworld.ai · TTS https://docs.inworld.ai/tts/t
 
 | capability | Inworld (doc) | protocol/unit | llmgw fit | evidence | note |
 |---|---|---|---|---|---|
-| TTS sync `POST https://api.inworld.ai/tts/v1/voice` | QS, JS | REST JSON in, JSON out (`audioContent` base64, `usage`) | **Proxyable today** as a buffered route, but **Needs new accounting** | `server/app.py:237` `ROUTE_TO_UPSTREAM_PATH` has only two chat routes; buffered path exists (`app.py` non-stream, `config.py:401` 8 MiB response cap) | Route table addition + a surface. Response is one JSON object; 2,000-char input → at most a few hundred KB of base64 audio, inside the 8 MiB cap |
-| TTS stream `POST /tts/v1/voice:stream` | JS, LK-TTS, PC | **NDJSON**: one JSON object per line, `{"result":{"audioContent":"<b64>","timestampInfo":{...}},"usage":{...}}`; ends on connection close, no terminator | **Needs new transport (framing)** | `pump.py:198` constructs `SSEParser` unconditionally; `sse.py:330-357` appends every line to `_raw` and treats `{"result"…` as an unknown field, never dispatching | See "What the SSE parser does with NDJSON" below: bytes are copied to the client, but the progress clock never ticks and the frame bound trips |
+| TTS sync `POST https://api.inworld.ai/tts/v1/voice` | QS, JS; `[live]` | REST JSON in, JSON out: exactly two top-level keys, `audioContent` (base64) and `usage` `{"processedCharactersCount":19,"modelId":"inworld-tts-2-flash"}`; no `timestampInfo` unless requested. `[live]` 19-character MP3 24 kHz: 31,104 audio bytes, 1.38 s wall from India, `x-envoy-upstream-service-time: 142` | **Proxyable today** as a buffered route, but **Needs new accounting** | `server/app.py:237` `ROUTE_TO_UPSTREAM_PATH` has only two chat routes; buffered path exists (`app.py` non-stream, `config.py:401` 8 MiB response cap) | Route table addition + a surface. 2,000 characters of LINEAR16 24 kHz is about 5.3 MB of audio, 7 MB base64 (measured on the stream path), so the 8 MiB buffered cap is tight for PCM and fine for MP3 |
+| TTS stream `POST /tts/v1/voice:stream` | JS, LK-TTS, PC; `[live]` | **NDJSON**: `content-type: application/json`, `transfer-encoding: chunked`, one object per `\n`-terminated line, no blank lines, trailing newline, no terminator, ends on close. Line shape `{"result":{"audioContent":"<b64>","usage":{"processedCharactersCount":N,"modelId":"…"},"timestampInfo":{…}?}}`: `usage` is **inside `result` on every line**, with the character count on the first line and `0` on the rest. `[live]` 19 chars LINEAR16: 5 lines, 121 KB wire, 90 KB audio, TTFB 360 ms, total 777 ms; 1,900 chars: 123 lines, 7.06 MB wire, 5.28 MB audio, TTFB 372 ms, total 6.4 s; steady-state line = 48,044 decoded bytes (1.0 s of 24 kHz 16-bit) = 64,161 wire bytes | **Needs new transport (framing)** | `pump.py:198` constructs `SSEParser` unconditionally; `sse.py:330-357` appends every line to `_raw` and treats `{"result"…` as an unknown field, never dispatching. `[live]` confirmed by feeding the captured bytes to `SSEParser`: 0 events on every stream; `FrameTooLarge` at 1,052,672 cumulative bytes (line 19 of the long stream) | See "What the SSE parser does with NDJSON" below: bytes are copied to the client, but the progress clock never ticks and the frame bound trips. A per-line frame bound of 1 MiB is generous: the largest line seen was 64 KB (PCM) and 15 KB (MP3) |
 | TTS WebSocket `wss://api.inworld.ai/tts/v1/voice:streamBidirectional` | LK-TTS, PC (docs page gated) | WS JSON: client `create` / `send_text` / `flush_context` / `close_context` with `contextId`; server `contextCreated` / `audioChunk` / `flushCompleted` / `contextClosed` / `error`; ≤5 contexts per socket | **Needs new transport (WebSocket)** | no `websocket` anywhere in `src/llmgw` (grep); Starlette app is HTTP routes only (`app.py:2488-2505`) | This is what the LiveKit plugin Layrs runs uses in production |
 | Voices: list `GET /tts/v1/voices`, clone `POST /voices/v1/voices:clone`, design, publish, update, delete | QS, LK-TTS | REST JSON | **Not a gateway concern** (control plane) | — | Clone bodies carry base64 samples; if ever proxied the 4 MiB request cap (`config.py:395`) bites |
 | STT sync `POST /stt/v1/transcribe` | STT; `[source: inworld-api-examples stt/python/example_stt.py:53-69,97-111]` | REST JSON in: `{"modelId","audioEncoding":"AUTO_DETECT","language","audioData":{"content":<b64>}}`; JSON out: `transcription.transcript`, `transcription.wordTimestamps[]`, `usage.transcribedAudioMs`, `usage.modelId`; ~16 MB max | **Proxyable today** as buffered (with cap raised) + **Needs new accounting** (audio ms is in the response) | `config.py:395` 4 MiB < 16 MB | Layrs does not use sync STT. Inworld's own example uses `modelId: "groq/whisper-large-v3"`, so that model id is live (corrects the doc delta below) |
@@ -55,8 +62,8 @@ Doc URLs used: DOCS https://docs.inworld.ai · TTS https://docs.inworld.ai/tts/t
 | capability | Inworld (doc) | protocol/unit | llmgw fit | evidence | note |
 |---|---|---|---|---|---|
 | HTTP stream framing | JS, LK-TTS, PC; `[source: inworld-api-examples tts/js/example_tts_stream.js:101-128; pipecat tts.py:440-470]` | NDJSON, `\n`-terminated JSON objects, no `data:` prefix, no terminal marker; both reference clients split on `\n`, **skip empty lines**, and `JSON.parse` each line, tolerating decode errors; stream ends at TCP close. `[live]` an HTTP-level failure on `:stream` is a normal status with body `{"error":{"code","message","details"}}` (the sync path returns the same object un-wrapped) | **Needs new transport (framing)** | `sse.py:224-357` | A JSONL framing mode is the smallest change; see below. Inworld's own examples send snake_case (`model_id`, `audio_encoding`) and the plugin sends camelCase (`modelId`): the API accepts both (protobuf JSON), so a model rewrite must look for both spellings |
-| Audio payload | JS, LK-TTS | `result.audioContent` base64 of the chosen encoding; PCM/LINEAR16 chunks may start with a 44-byte RIFF header (Pipecat strips it) | passthrough bytes | `pump.py` copies chunks verbatim | Base64 inflates 1.33×; PCM 24 kHz 16-bit ≈ 64 KB/s on the wire |
-| Timestamps | LK-TTS, PC, EX | `timestampInfo.wordAlignment{words[], wordStartTimeSeconds[], wordEndTimeSeconds[]}` / `characterAlignment`; phonemes and visemes on TTS-2; `timestampType: WORD|CHARACTER`, `timestampTransportStrategy: SYNC|ASYNC` | passthrough | — | With `ASYNC`, timestamps arrive in separate lines after audio — a "content vs meta" distinction the surface would classify |
+| Audio payload | JS, LK-TTS; `[live]` | `result.audioContent` base64 of the chosen encoding. `[live]` LINEAR16: the **first line's decoded bytes start with a 44-byte `RIFF…WAVE` header** (Pipecat strips it; a raw-PCM consumer must too); the first line is tiny (60 decoded bytes: header plus a few samples), then lines of about 14 to 48 KB decoded | passthrough bytes | `pump.py` copies chunks verbatim | Base64 inflates 1.33×; 24 kHz 16-bit PCM is 48 KB/s decoded, 64 KB/s on the wire, and Inworld emits it in one-second lines |
+| Timestamps | LK-TTS, PC, EX; `[live]` | `timestampInfo.wordAlignment{words[], wordStartTimeSeconds[], wordEndTimeSeconds[], phoneticDetails[{wordIndex, phones[{phoneSymbol, startTimeSeconds, durationSeconds, visemeSymbol}]}]}`; `timestampType: WORD|CHARACTER`, `timestampTransportStrategy: SYNC|ASYNC`. `[live]` with `timestampType: WORD` and the default strategy, every line carried both `audioContent` and `timestampInfo` (6 of 6); no timestamp-only lines were seen. Phones and visemes come unasked with word timestamps on TTS-2 | passthrough | — | Timestamp payloads add roughly 100 to 200 bytes per word on the wire; with `ASYNC` the plugin source expects timestamp-only lines, which the surface would classify META |
 | Errors mid-stream | LK-TTS | a line with top-level `error: {code, message}` (HTTP) or `result.status.code != 0` (WS) | needs surface `error_from_event` | `surfaces/base.py:199` | Same contract shape as `error_from_event` today |
 | WebSocket direction | LK-TTS | bidirectional, multiplexed by `contextId`; buffering knobs `autoMode`, `bufferCharThreshold` 120, `maxBufferDelayMs` 3000 | **Needs new transport** | — | Multiplexing several contexts on one socket is why the plugin pools ≤20 sockets × 5 contexts |
 | Session lifecycle / keepalive | LK-TTS `[source: tts.py:259-266 connect; :443-445 receive(timeout=60.0); :592-600 stale-context sweep at 120 s]` | no ping/pong; plugin uses a 60 s receive timeout, `Context not found` (code 5) treated as benign; connect headers `Authorization`, `X-User-Agent`, `X-Request-Id` | — | `clocks.py` liveness/progress split would map: `audioChunk` = progress, anything else = liveness | `[live]` the upgrade to `/tts/v1/voice:streamBidirectional` and `/stt/v1/transcribe:streamBidirectional` returns **101 with no credential at all**; the rejection arrives as the first text frame (`{"error":{"code":16,"message":"authentication is required","details":[{"errorType":"SESSION_TOKEN_INVALID","reconnectType":"NO_RETRY",...}]}}`); with a bad key the socket returned 101 and then nothing for 15 s. For a gateway: a WS connect budget must cover "101 then error frame", and a silent socket after 101 is not yet an authenticated session |
@@ -83,7 +90,7 @@ A **JSONL framing mode** would need: (a) a `Framer` protocol with two implementa
 | `temperature` (TTS-1.5 only, 0–2), `speakingRate`, `applyTextNormalization` ON/OFF, `language` BCP-47 | LK-TTS, EX | request fields | passthrough | — | Layrs pins `text_normalization="ON"` (`livekit_setup.py`) |
 | Encoding / sample rate | JS, LK-TTS | MP3, LINEAR16/PCM, WAV, OGG_OPUS, MULAW, ALAW, FLAC; 8–48 kHz; `bitrate` | passthrough | — | Encoding changes bytes/s → affects the frame bound and the pump buffer sizing (`buffer_bytes` 256 KiB) |
 | WS buffering `bufferCharThreshold` / `maxBufferDelayMs` / `autoMode` | LK-TTS | WS create fields | n/a until WS | — | |
-| Provider TTFB exposure | MODELS | server-side P90 figures only; no per-response timing header documented | gateway measures its own TTFE | `metrics.py` `llmgw_time_to_first_event_seconds` | The gateway's first CONTENT (first audio line) is the right TTFB proxy |
+| Provider TTFB exposure | MODELS; `[live]` | server-side P90 figures on the models page; on the wire, `x-envoy-upstream-service-time` gives the provider's own processing time (33 to 59 ms for `:stream`, 142 ms for a sync MP3 call, 255 ms for the voices list) while the client saw 360 to 390 ms to the first line from India: the difference is transit, which the gateway's own TTFE would include and this header would let it subtract | gateway measures its own TTFE | `metrics.py` `llmgw_time_to_first_event_seconds` | The gateway's first CONTENT (first audio line) is the right TTFB proxy; capture the envoy header alongside |
 | Client-side metrics Layrs reads today | `harness/dsa/metrics_capture.py:59-124` | LiveKit `TTSMetrics.ttfb`, `characters_count`, `audio_duration` per segment | — | — | Same three numbers the gateway would need per request: TTFB, characters, audio seconds (the last is derivable from bytes ÷ (rate × width) for PCM, not for MP3) |
 
 ## 4. Auth and headers
@@ -104,7 +111,9 @@ A **JSONL framing mode** would need: (a) a `Framer` protocol with two implementa
 | 429 | RL | "Your request is not processed — you need to wait and retry"; exponential backoff + jitter recommended; **no Retry-After documented** | `RateLimited`, NEUTRAL, jittered backoff | `errors.py:890`, `retry.py:145-202` | Retry-After floor simply unused |
 | Concurrency limits | RL, PRICE | per plan: TTS concurrent generations and WS connections; STT streaming concurrency; Realtime sessions; Router RPS — **numbers not published on either page** | `ProviderConn.max_concurrency` (connection count) | `catalog.py:68-80`, FAILURE-MODES row 7 | Set from the plan's number once known; for WS the unit is *contexts*, not connections |
 | 401/403 | `[live]` | **401** = no usable credential (missing header, or `x-api-key`, which is ignored): code 16, `www-authenticate: authentication is required`. **403** = credential presented but unknown/deleted: code 7, message echoes the key prefix masked | `AuthenticationFailed` for both, credential-scoped breaker, body scrubbed | `errors.py:892` | Transfers unchanged, and the 403 mapping is right for this provider (unlike AssemblyAI's 403-as-rate-limit and ElevenLabs' 403-as-plan-denial) |
-| 400 text validation | `tts_mixin.py:24` (Layrs) | "Text cannot be empty" for whitespace/punctuation-only text | `InvalidRequest` (client blame) | `errors.py:898` | Layrs already filters this before TTS |
+| 400 validation | `[live]` | unknown `modelId` → **400** `{"code":3,"message":"model_id: inworld-tts-999 is not supported."}`; text over the limit → **400** `{"code":3,"message":"text length should not exceed 2000 characters."}`; unknown `voiceId` → **404** `{"code":5,"message":"Unknown voice: NoSuchVoiceXYZ not found!"}` | `InvalidRequest` for the 400s (client blame); the 404 lands in `ModelNotFound` by status | `errors.py:896-898` | The voice-404 is a config-drift signal exactly like an unknown model; the `_looks_like_unknown_model` sniff would not match "Unknown voice", so it relies on the status rule |
+| Empty or whitespace text | `tts_mixin.py:24` (Layrs); `[live]` | **Not an error today**: `POST /tts/v1/voice` with `""` or `"   \n  "` returns **200** `{"audioContent":"","usage":null}`; on `:stream` one line `{"result":{"audioContent":"","usage":null}}`. Layrs' comment about a 400 for empty text is stale or model-dependent | a 200 with no audio and `usage: null` is a "success" the gateway would record as completed with zero characters | `accounting.py` exactness flags | Worth a surface rule: empty `audioContent` with `usage: null` is a client-fault outcome, not a completion |
+| Unsupported `audioEncoding` | `[live]` | `"FLURB"` is **accepted silently**: 200, audio returned in a default encoding (28,416 bytes for the 19-character text, MP3-sized), `usage` populated | passthrough | — | Protobuf JSON enum parsing tolerates unknown strings here; a gateway cannot rely on the provider to reject a bad encoding, so the client's expected encoding is not verifiable from the response headers (`content-type` is always `application/json`) |
 | 5xx / overloaded | not documented | — | `UpstreamServerError` / `UpstreamOverloaded` (503) | `errors.py:911-915` | |
 | Mid-stream WS error | LK-TTS | `result.status.code != 0`; code 5 "Context not found" benign | needs WS transport | — | |
 | Deadlines | — | TTS-2 TTFB 100 ms; a 2,000-char utterance streams for ~2 min of audio at most | `Budgets`: connect 2 s, first_event 20 s, progress 15 s, total 120 s | `clocks.py:241-273` | Defaults are LLM-shaped but not wrong for TTS; a TTS workload would want first_event ≈ 2 s, progress ≈ 5 s |
@@ -114,7 +123,7 @@ A **JSONL framing mode** would need: (a) a `Framer` protocol with two implementa
 | capability | Inworld (doc) | protocol/unit | llmgw fit | evidence | note |
 |---|---|---|---|---|---|
 | TTS unit | PRICE | **characters**: TTS-2 $25/1M on-demand → $12.50 Growth → "as low as $5" Enterprise; TTS-2 Flash $15 → $7 → sub-$5; free tier ≈70 min | **Needs new accounting** | `catalog.py:110-121` `ModelSpec` prices per 1M *tokens* (`input_per_m`, `output_per_m`, cache fields); `accounting.py:97` `TOKEN_KINDS = input/output/cache_read/cache_write`; `metrics.py` token counters | A `characters` kind (or a generic `unit` with a per-1M rate) is the minimal change; the dot product in `accounting.py:292-311` generalises |
-| Per-call usage report | JS, apis.io schema (via search), LK-TTS | `usage: {processedCharactersCount: int, modelId: str}` on the sync response and on NDJSON lines | surface `apply_usage` | `surfaces/base.py:198` | Exact, not estimated, when present — same two-flag exactness as finding 26 |
+| Per-call usage report | JS, LK-TTS; `[live]` | sync: top-level `usage: {processedCharactersCount: 19, modelId: "inworld-tts-2-flash"}`; stream: `result.usage` on **every** line, `processedCharactersCount` on the first line and `0` on every later one, so a surface must sum (or take the first) rather than read the last line; `usage: null` on empty input | surface `apply_usage` | `surfaces/base.py:198` | Exact, not estimated, when present — same two-flag exactness as finding 26. Because the count arrives on the first line, it is known before commitment for a stream that is cut later: a cut Inworld stream can still be billed exactly, unlike a cut LLM stream |
 | STT unit | PRICE | **per hour of audio**: $0.15/hr on-demand, $0.10/hr Creator+ ; streaming reports `RECOGNITION_USAGE` cumulative duration every 5 s | **Needs new accounting** + WS | — | Layrs `pricing.py:145` already prices STT per audio second |
 | Realtime | PRICE | not itemised on the page | — | — | |
 | LLM Router | PRICE | "at cost" (provider list price), 220+ models | token accounting transfers if the Router returns standard `usage` | `surfaces/openai.py:167-222` | Router's own pricing would need catalog rows per routed model |
@@ -185,6 +194,42 @@ TTS/STT response: `content-type: application/json`, `x-inworld-request-id:
 | same, `Authorization: Bearer <fake>` | 403 | identical to Basic |
 | `POST /tts/v1/voice`, Basic fake, valid body | 403 | same code-7 object, top level |
 | `POST /tts/v1/voice:stream`, Basic fake | 403 | `{"error":{"code":7,"message":"API key does not exist or was deleted: \"Zm9v***\"","details":[]}}` (wrapped) |
+
+Authenticated (portal key, third pass). Header set on every 2xx TTS response:
+`content-type: application/json`, `transfer-encoding: chunked`,
+`x-inworld-request-id: <32 hex>`, `x-envoy-upstream-service-time: <ms>`,
+`grpc-metadata-content-type: application/grpc`, `grpc-metadata-server: envoy`,
+`grpc-metadata-x-envoy-upstream-service-time: <ms>`, `grpc-metadata-date`,
+`server: istio-envoy`, `via: 1.1 google`, `alt-svc`. No rate-limit, quota or
+cost headers.
+
+| Request (`inworld-tts-2-flash`, voice Ashley) | Status | Observed |
+|---|---|---|
+| `GET /tts/v1/voices` | 200 | `{"voices":[…282…]}`, each `{languages, voiceId, displayName, description, tags, isCustom}`; 1.9 s, envoy 255 ms |
+| sync, 19 chars, MP3 24 kHz | 200 | `{"audioContent":<41,472 b64 = 31,104 bytes>,"usage":{"processedCharactersCount":19,"modelId":"inworld-tts-2-flash"}}`; 1.38 s, envoy 142 ms |
+| `:stream`, 19 chars, LINEAR16 24 kHz | 200 | 5 lines, 121,131 wire bytes, 90,460 decoded; lines of 181 / 55,201 wire bytes (60 / 41,324 decoded); first decoded bytes `RIFF..WAVE`; TTFB 0.360 s, total 0.777 s |
+| `:stream`, same, `timestampType: WORD` | 200 | 6 lines, every line `audioContent` + `timestampInfo`; 112,796 wire bytes; TTFB 0.389 s, total 0.554 s |
+| `:stream`, 1,900 chars, LINEAR16 | 200 | 123 lines, 7,056,089 wire bytes, 5,282,532 decoded; steady line 64,161 wire / 48,044 decoded (1.0 s of audio); TTFB 0.372 s, total 6.375 s |
+| `:stream`, 19 chars, MP3 | 200 | 5 lines, largest 15,489 wire / 11,540 decoded |
+| sync, `text: ""` and `"   \n  "` | 200 | `{"audioContent":"","usage":null}` |
+| sync, `modelId: inworld-tts-999` | 400 | `{"code":3,"message":"model_id: inworld-tts-999 is not supported.","details":[]}` |
+| sync, `voiceId: NoSuchVoiceXYZ` | 404 | `{"code":5,"message":"Unknown voice: NoSuchVoiceXYZ not found!","details":[]}` |
+| sync, 2,001 characters | 400 | `{"code":3,"message":"text length should not exceed 2000 characters.","details":[]}` |
+| sync, `audioEncoding: FLURB` | 200 | audio returned (28,416 bytes), usage populated: unknown enum accepted |
+| sync, snake_case body (`model_id`, `voice_id`, `audio_config`) | 200 | identical result to camelCase |
+| `GET /v1/models`, Basic or Bearer, valid key | 404 | `{"code":5,"message":"Not Found","details":[]}` |
+
+One `:stream` line as observed (base64 truncated to 16 characters, phonetic
+detail elided):
+
+```
+{"result":{"audioContent":"UklGRvRMAABXQVZF…","usage":{"processedCharactersCount":19,"modelId":"inworld-tts-2-flash"},"timestampInfo":{"wordAlignment":{"words":["Hello"],"wordStartTimeSeconds":[0],"wordEndTimeSeconds":[0.41],"phoneticDetails":[{"wordIndex":0,"phones":[{"phoneSymbol":"h","startTimeSeconds":0,"durationSeconds":0.03,"visemeSymbol":"cdgknstxyz"},…]}]}}}}
+```
+
+`llmgw.sse.SSEParser(max_frame_bytes=1 MiB)` fed these bytes in 4 KiB chunks:
+0 events on all three streams; `FrameTooLarge` raised at 1,052,672 cumulative
+bytes on the long stream (during line 19, about 16 s of audio); the short
+streams ended by close with no event.
 | `POST /stt/v1/transcribe`, Basic fake | 403 | same code-7 object |
 | `GET /v1/models`, Basic or Bearer fake | 404, no `x-inworld-request-id` | `{"code":5,"message":"Not Found","details":[]}` |
 | `POST /v1/chat/completions`, Basic fake | 401 | `Unauthorized` (plain text; the Router's auth stack) |

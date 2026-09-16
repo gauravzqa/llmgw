@@ -98,7 +98,7 @@ Inworld and OpenAI already fit the bearer path.
 | AssemblyAI pre-recorded, sync | audio seconds ($0.15 to $0.45/h plus additive add-ons) | `audio_duration` in the response | Same |
 | ElevenLabs TTS | characters ($0.05 per 1k Flash, $0.10 per 1k v3) | `character-cost` response header, arrives before the body | Header stripped by the response allowlist |
 | ElevenLabs STT | audio hours ($0.22 batch, $0.39 realtime) | derivable from timestamps or audio sent | Same |
-| Inworld TTS | characters ($15 to $25 per 1M on-demand, tier-dependent) | `usage.processedCharactersCount` on every response and line | Would be dropped |
+| Inworld TTS | characters ($15 to $25 per 1M on-demand, tier-dependent) | `result.usage.processedCharactersCount` on every stream line: the full count on the first line, `0` after (verified live 16 Sep), so billing is exact even on a cut stream; empty text is a 200 with `usage: null` | Would be dropped |
 | Inworld STT | audio hours ($0.15/h on-demand, $0.10/h paid tiers) | `RECOGNITION_USAGE` every 5 s over the socket | Transport |
 | OpenAI Realtime, chat audio | tokens, but audio at 8 to 50x the text rate ($32 in / $64 out per 1M on `gpt-realtime` and `gpt-audio`) | `usage.input_token_details.audio_tokens` etc. | Fields arrive on the chat route today and are priced as text: silent under-billing |
 | OpenAI TTS | `gpt-4o-mini-tts` tokens ($0.60 text in, $12 audio out per 1M) in SSE mode; nothing in binary mode; `tts-1*` per character | `speech.audio.done.usage` (SSE only) | SSE mode fits the four kinds exactly; binary mode has no meter |
@@ -221,9 +221,15 @@ come from the downloaded `livekit-plugins-inworld==1.6.3` source, Inworld's
 plus unauthenticated live probes on 16 Sep that pinned the error bodies
 (gRPC-status JSON), the 401/403 split, the auth scheme, credential
 reflection, `x-inworld-request-id`, the WebSocket "101 then in-band error"
-behaviour and the Router's endpoints. No Inworld credential exists on the
-machine, so the authenticated shapes (live `:stream` framing details, `usage`
-placement, rate limits) remain source-verified only. AssemblyAI's Sync API
+behaviour and the Router's endpoints, then authenticated probes (about $0.06)
+that confirmed the `:stream` framing (`application/json`, chunked, one JSON
+object per newline, no terminator, close-ended; a steady-state LINEAR16 line
+is exactly one second of audio, 64 KB on the wire; `SSEParser` produced zero
+events and tripped `FrameTooLarge` at line 19 of 123), `usage` placement, the
+44-byte RIFF header on the first chunk, six error shapes with no credential
+reflection, and that Inworld sends no rate-limit headers at all. Still
+unverified for Inworld: numeric rate and concurrency limits, `Retry-After`,
+5xx bodies, the WebSocket success path. AssemblyAI's Sync API
 reference page was unreachable; its request shape comes from the quickstart.
 OpenAI's audio and Realtime rows were verified live on 16 Sep (about $0.005):
 TTS SSE and binary, STT streaming and `whisper-1`, a client-secret mint, a
