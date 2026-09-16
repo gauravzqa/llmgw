@@ -13,7 +13,9 @@ a drain that finishes in-flight streams on SIGTERM, and a usage record for
 every terminal outcome.
 
 See [CONTRACTS.md](CONTRACTS.md) for the promises,
-[FAILURE-MODES.md](FAILURE-MODES.md) for what breaks without each piece.
+[FAILURE-MODES.md](FAILURE-MODES.md) for what breaks without each piece,
+[CAPABILITIES.md](CAPABILITIES.md) for what the three providers offer and
+which of it the gateway handles, passes through, or lacks (swept 16 Sep 2026).
 
 Author: Gaurav Pal.
 
