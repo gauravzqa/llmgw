@@ -22,7 +22,7 @@ wedges would look healthy for another full progress window.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from llmgw import errors
 from llmgw.surfaces.base import (
@@ -33,6 +33,7 @@ from llmgw.surfaces.base import (
     event_payload,
     is_blank,
     is_done_marker,
+    normalise_anthropic_stop_reason,
     parse_json_object,
     read_max_tokens,
     read_stream,
@@ -200,6 +201,15 @@ class AnthropicMessagesSurface:
             elif name == "message_delta":
                 block = payload.get("usage")
                 finalises = True
+                # The stop reason lives on this frame too (`delta.stop_reason`),
+                # which is the second reason `message_delta` must be read even
+                # though it is META: `max_tokens`, `refusal` and
+                # `model_context_window_exceeded` are all "completed" without it.
+                delta = payload.get("delta")
+                if isinstance(delta, dict):
+                    reason = normalise_anthropic_stop_reason(delta.get("stop_reason"))
+                    if reason is not None:
+                        usage.stop_reason = reason
             else:
                 return
             if not isinstance(block, dict):
@@ -258,6 +268,19 @@ class AnthropicMessagesSurface:
         if "overloaded" in etype:
             return errors.UpstreamOverloaded(message, upstream_body=ev.data)
         return errors.InStreamError(message, upstream_body=ev.data)
+
+    def stop_reason_from_body(self, payload: dict[str, Any]) -> str | None:
+        """`stop_reason` of a complete (non-streamed) message object.
+
+        On the buffered path the whole message arrives as one JSON object
+        with `stop_reason` at the top level, not under a `delta`; accounting
+        calls this because there are no frames for `apply_usage` to see.
+        Never raises.
+        """
+        try:
+            return normalise_anthropic_stop_reason(payload.get("stop_reason"))
+        except Exception:  # noqa: BLE001 - observability never breaks serving
+            return None
 
     def native_ending(self, last_event: SSEEvent | None = None) -> bytes:
         """Empty, and that is the contract rather than a stub (CONTRACTS.md C2).

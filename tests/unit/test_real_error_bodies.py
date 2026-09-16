@@ -153,3 +153,46 @@ def test_the_new_class_is_countable():
     """An outcome that cannot appear in `llmgw_requests_total{code=...}` is an
     outcome nobody can alert on."""
     assert E.InsufficientCredits.code in E.ERROR_CODES
+
+
+# ------------------------------------------ out of money, dressed as a 429
+#
+# NOT live captures, and marked so. OpenAI's billing 429s need an exhausted
+# account to observe and Anthropic's spend cap needs a cap; both shapes are
+# transcribed from the providers' current error documentation as read on
+# 2026-09-16 (capabilities/openai.md §5, capabilities/anthropic.md §5). Kept
+# here beside the live bodies because they test the same seam -- a status the
+# taxonomy thought it understood, refined by a body it had never seen -- and
+# so that the day one IS captured live it replaces the transcription in place.
+
+OPENAI_INSUFFICIENT_QUOTA_429_DOC = (
+    b'{"error":{"message":"You exceeded your current quota, please check your '
+    b'plan and billing details.","type":"insufficient_quota","param":null,'
+    b'"code":"insufficient_quota"}}'
+)
+
+ANTHROPIC_SPEND_CAP_429_DOC = (
+    b'{"type":"error","error":{"type":"rate_limit_error","message":"This request '
+    b'would exceed your organization\'s configured spend limit.",'
+    b'"details":{"error_code":"enforced_spend_limit_reached"}},"request_id":"req_x"}'
+)
+
+
+@pytest.mark.parametrize(
+    "body", [OPENAI_INSUFFICIENT_QUOTA_429_DOC, ANTHROPIC_SPEND_CAP_429_DOC],
+    ids=["openai-doc", "anthropic-doc"],
+)
+def test_out_of_money_on_a_429_is_a_billing_state_not_a_transient_rate_limit(body):
+    """Finding 8 fixed the 402 shape (OpenRouter). Two more providers say the
+    same thing with a 429 and a code; a status-only rule retried them."""
+    err = E.from_http_status(429, body=body, provider="p", model="m")
+    assert isinstance(err, E.InsufficientCredits)
+    assert err.retry_same is False
+    assert err.try_next is True
+    assert err.health is E.Health.NEUTRAL
+    assert err.blame is E.Blame.POLICY
+
+
+def test_the_openrouter_402_still_classifies_the_same_way():
+    err = E.from_http_status(402, body=OPENROUTER_INSUFFICIENT_CREDITS)
+    assert isinstance(err, E.InsufficientCredits)

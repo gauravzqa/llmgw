@@ -84,7 +84,7 @@ def test_price_dates_are_fresh_as_of_the_build_date():
     """Deterministic on purpose -- a test pinned to date.today() fails on a
     calendar boundary and teaches you nothing when it does. Bump the reference
     date when you re-verify the table; that edit IS the re-verification."""
-    stale = DEFAULT_CATALOG.stale_prices(today=dt.date(2026, 9, 9), max_age_days=120)
+    stale = DEFAULT_CATALOG.stale_prices(today=dt.date(2026, 9, 16), max_age_days=120)
     assert stale == [], f"re-verify rates for: {stale}"
 
 

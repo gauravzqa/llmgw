@@ -26,6 +26,7 @@ from llmgw.surfaces.base import (
     event_payload,
     is_blank,
     is_done_marker,
+    normalise_openai_finish_reason,
     parse_json_object,
     read_max_tokens,
     read_stream,
@@ -41,6 +42,21 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 # nothing but `tool_calls` for seconds at a time, and treating that as
 # non-progress would kill exactly the requests that take longest.
 _PROGRESS_KEYS = ("content", "tool_calls", "function_call", "refusal", "reasoning_content")
+
+
+def _finish_reason_of(payload: dict[str, Any]) -> str | None:
+    """The last non-null `choices[].finish_reason`, normalised, or None."""
+    choices = payload.get("choices")
+    if not isinstance(choices, list):
+        return None
+    found: str | None = None
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        reason = normalise_openai_finish_reason(choice.get("finish_reason"))
+        if reason is not None:
+            found = reason
+    return found
 
 
 class OpenAIChatSurface:
@@ -190,6 +206,14 @@ class OpenAIChatSurface:
             payload = event_payload(ev)
             if payload is None:
                 return
+            # The stop reason rides on an ordinary chunk (`finish_reason` on
+            # a choice), usually the last content or role chunk before the
+            # usage frame, and on several chunks when `n > 1`. Last non-null
+            # wins; DeepSeek's `insufficient_system_resource` arrives this
+            # way and is the only sign of a provider-side shed inside a 200.
+            reason = _finish_reason_of(payload)
+            if reason is not None:
+                usage.stop_reason = reason
             block = payload.get("usage")
             if not isinstance(block, dict):
                 return
@@ -242,6 +266,20 @@ class OpenAIChatSurface:
         if "overloaded" in etype or "overloaded" in code:
             return errors.UpstreamOverloaded(message, upstream_body=ev.data)
         return errors.InStreamError(message, upstream_body=ev.data)
+
+    def stop_reason_from_body(self, payload: dict[str, Any]) -> str | None:
+        """`finish_reason` of a complete chat-completion object, normalised.
+
+        The buffered path parses the whole response as one JSON object and
+        never builds frames, so it cannot reach `apply_usage`; accounting
+        calls this instead. Same mapping, same "last non-null choice wins".
+        Never raises: a body this method cannot read is a body with no stop
+        reason, not a failed request.
+        """
+        try:
+            return _finish_reason_of(payload)
+        except Exception:  # noqa: BLE001 - observability never breaks serving
+            return None
 
     def native_ending(self, last_event: SSEEvent | None = None) -> bytes:
         """Empty, and that is the contract rather than a stub (CONTRACTS.md C2).

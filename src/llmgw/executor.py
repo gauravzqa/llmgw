@@ -123,6 +123,7 @@ from .errors import (
     ClientDisconnected,
     Disposition,
     GatewayError,
+    Health,
     IncompleteStream,
     NoTargetsAvailable,
     Outcome,
@@ -130,6 +131,7 @@ from .errors import (
     RetryBudgetExhausted,
     decide,
 )
+from .metrics import normalize_stop_reason
 from .policy import ExecutionPlan
 from .pump import Pump, PumpResult, Sink
 from .retry import RetryBudget, RetryPolicy
@@ -777,8 +779,10 @@ class Executor:
 
                 inflight = None
                 # `None` is the honest spelling of "nothing went wrong": there
-                # is no error to decide on, so there is no Disposition.
-                self._settle(state, None)
+                # is no error to decide on, so there is no Disposition -- with
+                # one exception, a 200 whose stop reason says the provider
+                # shed the request (`_completion_disposition`).
+                self._settle(state, _completion_disposition(target, pump_result))
                 attempts.append(
                     AttemptRecord(
                         target=target,
@@ -1170,6 +1174,35 @@ def _context(plan: ExecutionPlan, target: Target) -> dict[str, str]:
         "workload": plan.workload_id,
         "credential_id": target.credential_key,
     }
+
+
+def _completion_disposition(
+    target: Target, pump_result: PumpResult | None
+) -> Disposition | None:
+    """What the breaker hears about a stream that COMPLETED.
+
+    Almost always `None`: a 200 that ran to its terminal marker is evidence
+    the target works. The exception is a completed stream whose stop reason
+    folds to `provider_shed` -- DeepSeek's `insufficient_system_resource` and
+    `aborted`, a provider refusing the work inside a 200 (PLAN-2 A3). The
+    request is still COMPLETED to the client and to accounting (bytes were
+    delivered, the provider billed them), but the target's circuit hears a
+    FAILURE, because it is the only signal that provider is degrading and a
+    breaker that cannot hear it will keep sending traffic into the shed.
+    Keyed to the target, never the credential: a shed says nothing about the
+    key. Read with `getattr` so a pump whose surface predates `stop_reason`
+    still settles cleanly."""
+    usage = getattr(pump_result, "usage", None)
+    if normalize_stop_reason(getattr(usage, "stop_reason", None)) != "provider_shed":
+        return None
+    return Disposition(
+        retry_same=False,
+        try_next=False,
+        health=Health.FAILURE,
+        health_key=target.health_key,
+        outcome=Outcome.COMPLETED,
+        reason="provider_shed",
+    )
 
 
 def _attribute(err: GatewayError, ctx: Mapping[str, str]) -> None:

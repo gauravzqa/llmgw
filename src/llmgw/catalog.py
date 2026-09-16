@@ -59,6 +59,16 @@ from typing import Literal
 
 ProviderKind = Literal["openai", "anthropic"]
 
+ReasoningLevel = Literal["off", "none", "minimal", "low", "medium", "high", "xhigh", "max"]
+"""The union of the providers' reasoning-effort vocabularies, as of 2026-09-16.
+
+OpenAI: `none | minimal | low | medium | high | xhigh | max`. DeepSeek:
+`none | low | high | max`. `off` is this catalog's own spelling for "send the
+provider's disable form". One literal for all three because a per-provider
+literal would make the catalog unable to describe a model until someone
+extends the type, which is how `medium` and `max` went missing for a quarter.
+"""
+
 
 @dataclass(frozen=True, slots=True)
 class ProviderConn:
@@ -117,13 +127,29 @@ class ModelSpec:
     context_window: int = 128_000
     max_output: int = 8_192
     can_reason: bool = False
-    reasoning: Literal["off", "low", "high", "xhigh"] | None = None
+    reasoning: ReasoningLevel | None = None
     priced_at: str = ""
     """ISO date the rates were last verified. Mandatory in practice."""
+
+    aliases: tuple[str, ...] = ()
+    """Other strings that name this model, resolvable by `Catalog.resolve`.
+
+    The provider's wire id (`api_model`) is always an alias implicitly; this
+    field is for the ids a provider *returns* that differ from the one it
+    accepts -- OpenAI answers `gpt-4o-mini-2024-07-18` to a request for
+    `gpt-4o-mini` -- and for retired ids still in callers' configs. The reason
+    it exists is the multi-turn loop: an SDK that copies the response `model`
+    into its next request sends the wire id back, and a gateway that only
+    knows catalog ids answers `400 unknown model` on turn two (observed live,
+    16 Sep 2026). Aliases make the echoed id acceptable; the streamed
+    response is still forwarded byte-for-byte, wire id and all.
+    """
 
     def __post_init__(self) -> None:
         if not self.priced_at:
             raise ValueError(f"{self.id}: priced_at is required")
+        if self.id in self.aliases:
+            raise ValueError(f"{self.id}: a model must not alias its own id")
 
 
 # --------------------------------------------------------------------------
@@ -220,10 +246,10 @@ PROVIDERS: dict[str, ProviderConn] = {
 MODELS: dict[str, ModelSpec] = {
     m.id: m
     for m in [
-        # OpenAI list prices as copied by the live smoke test on 2026-09-09.
-        # OpenAI exposes no price endpoint, so unlike the OpenRouter rows
-        # these are NOT externally verified; the date says when they were
-        # copied, not when they were checked.
+        # OpenAI list prices, verified 2026-09-16 against the gpt-4o-mini model
+        # page (capabilities/openai.md §7). OpenAI exposes no price endpoint,
+        # so this is a human check against a document, not a probe. The
+        # snapshot alias is what OpenAI puts in `model` on every response.
         ModelSpec(
             id="openai.gpt-4o-mini",
             provider="openai",
@@ -233,69 +259,122 @@ MODELS: dict[str, ModelSpec] = {
             output_per_m=0.60,
             context_window=128_000,
             max_output=16_384,
-            priced_at="2026-09-09",
+            priced_at="2026-09-16",
+            aliases=("gpt-4o-mini-2024-07-18",),
         ),
+        # Anthropic rates from platform.claude.com/docs/en/about-claude/pricing,
+        # read 2026-09-16 (capabilities/anthropic.md §7). Cache WRITE is
+        # 1.25x input for the 5-minute TTL on every current model; the 1-hour
+        # TTL is 2x and is not yet a separate field (PLAN-2 B3). Before this
+        # date `cache_write_per_m` was unset here, which priced every write
+        # at 1.0x -- a 20% under-bill on the write line of every cached
+        # request.
+        #
+        # Haiku 4.5's retirement floor is 2026-10-15 (model deprecations page);
+        # a successor row is due before then. `can_reason=True` because the
+        # 11 Sep live smoke streamed `thinking_delta` frames from it
+        # (`d.thinking.anthropic`); the previous False contradicted the
+        # evidence in bench/results/live_smoke.md.
         ModelSpec(
             id="anthropic.haiku-4-5",
             provider="anthropic",
             api_model="claude-haiku-4-5-20251001",
             input_per_m=1.00,
             cached_input_per_m=0.10,
+            cache_write_per_m=1.25,
             output_per_m=5.00,
             context_window=200_000,
             max_output=64_000,
-            priced_at="2026-05-27",
+            can_reason=True,
+            priced_at="2026-09-16",
+            aliases=("claude-haiku-4-5",),
         ),
+        # Context window is 1M, default, no beta header, standard pricing
+        # (models/sonnet-4-6/overview, 2026-09-16). The previous 200_000 was
+        # finding 35 in a new place: an output ceiling corrected while the
+        # context ceiling stayed 5x too low, so any pre-flight that trusted
+        # the catalog would refuse a legitimate long-context request.
         ModelSpec(
             id="anthropic.sonnet-4-6",
             provider="anthropic",
             api_model="claude-sonnet-4-6",
             input_per_m=3.00,
             cached_input_per_m=0.30,
+            cache_write_per_m=3.75,
             output_per_m=15.00,
-            context_window=200_000,
+            context_window=1_000_000,
             max_output=128_000,
             can_reason=True,
-            priced_at="2026-08-03",
+            priced_at="2026-09-16",
         ),
+        # Cheaper than Sonnet 4.6 on every axis and the current Sonnet;
+        # 4.6 is listed as legacy. The default Anthropic route should move
+        # here (policy files, not this table, decide that).
+        ModelSpec(
+            id="anthropic.sonnet-5",
+            provider="anthropic",
+            api_model="claude-sonnet-5",
+            input_per_m=2.00,
+            cached_input_per_m=0.20,
+            cache_write_per_m=2.50,
+            output_per_m=10.00,
+            context_window=1_000_000,
+            max_output=128_000,
+            can_reason=True,
+            priced_at="2026-09-16",
+        ),
+        # DeepSeek rates from api-docs.deepseek.com/quick_start/pricing, read
+        # 2026-09-16 (capabilities/deepseek.md §7). These are the PEAK rates,
+        # i.e. the upper bound: DeepSeek charges half of these outside
+        # 01:00-04:00 and 06:00-10:00 UTC on weekdays, and `ModelSpec` has no
+        # time-of-day dimension (PLAN-2 C, "peak/off-peak pricing"). Until it
+        # does, every DeepSeek cost record is an upper bound, stated as such.
+        #
+        # The previous numbers (0.435 / 0.003625 / 0.87 and 0.14 / 0.0028 /
+        # 0.28, dated 2026-06-22) predated DeepSeek's 2026-09-10 repricing and
+        # were wrong by 3x to 12x. Thinking is ON by default at effort `high`
+        # on both models; `reasoning="off"` below records the intent for the
+        # cheap-candidate role, which the gateway cannot yet enforce -- there
+        # is no per-target request default until PLAN-2 B5.
+        #
+        # DeepSeek's own docs disagree about whether `deepseek-v4-pro` is
+        # still served or routed to V4.1-Flash at Flash rates since
+        # 2026-09-14; the pricing page still lists it, so it stays.
         ModelSpec(
             id="deepseek.deepseek-v4-pro",
             provider="deepseek",
             api_model="deepseek-v4-pro",
-            input_per_m=0.435,
-            cached_input_per_m=0.003625,
-            output_per_m=0.87,
+            input_per_m=1.32,
+            cached_input_per_m=0.044,
+            output_per_m=3.96,
             context_window=1_048_576,
             max_output=393_216,
             can_reason=True,
             reasoning="off",
-            priced_at="2026-06-22",
+            priced_at="2026-09-16",
         ),
-        # RECONCILED 2026-09-10 against DeepSeek's live /models via `make probe`.
-        # The `deepseek-v4-flash` wire id was retired; DeepSeek now serves
-        # exactly `deepseek-flash` and `deepseek-v4-pro` (the probe's reachable
-        # set, 2 ids). `deepseek-flash` is the equivalent flash tier, so the
-        # api_model is moved onto it. Our catalog id is kept stable on purpose:
-        # workloads, fixtures, and smoke pin `deepseek.deepseek-v4-flash`, and
-        # the wire id is free to move under it (see ModelSpec.api_model).
-        #
-        # PRICE UNVERIFIED: DeepSeek does not publish prices on its free /models
-        # endpoint -- only OpenRouter does (see live/probe.py audit_prices) --
-        # so the rename could NOT be re-priced against the probe. The rates
-        # below are the retired `deepseek-v4-flash` numbers, and `priced_at` is
-        # deliberately left at the old 2026-06-22 (NOT bumped to today) to flag
-        # that they were not re-verified for `deepseek-flash`; a rename can be a
-        # repricing. Confirm against DeepSeek's pricing before trusting them.
+        # RECONCILED 2026-09-10 against DeepSeek's live /models via `make probe`:
+        # the `deepseek-v4-flash` wire id was retired and `deepseek-flash`
+        # (V4.1-Flash, released 2026-09-10) serves in its place. Our catalog
+        # id is kept stable on purpose -- workloads, fixtures and smoke pin
+        # `deepseek.deepseek-v4-flash` -- and the retired wire id is an alias
+        # so a caller still configured with it resolves here rather than 400s.
+        # Prices repriced 2026-09-16 with the row above; `can_reason=True`
+        # because thinking is on by default (the previous False was why the
+        # "cheap candidate" was paying reasoning rates unnoticed).
         ModelSpec(
             id="deepseek.deepseek-v4-flash",
             provider="deepseek",
             api_model="deepseek-flash",
-            input_per_m=0.14,          # UNVERIFIED for deepseek-flash; see note above
-            cached_input_per_m=0.0028,  # UNVERIFIED for deepseek-flash; see note above
-            output_per_m=0.28,         # UNVERIFIED for deepseek-flash; see note above
+            input_per_m=0.30,
+            cached_input_per_m=0.006,
+            output_per_m=1.20,
             context_window=1_048_576,
             max_output=393_216,
-            priced_at="2026-06-22",    # last date flash rates were verified (old id)
+            can_reason=True,
+            reasoning="off",
+            priced_at="2026-09-16",
+            aliases=("deepseek-v4-flash",),
         ),
         # CORRECTED 2026-09-10 against OpenRouter's live /api/v1/models.
         #
@@ -315,25 +394,25 @@ MODELS: dict[str, ModelSpec] = {
             id="openrouter.deepseek-v4-pro",
             provider="openrouter-toolsafe",
             api_model="deepseek/deepseek-v4-pro",
-            input_per_m=0.87,
-            cached_input_per_m=0.0725,
-            output_per_m=1.74,
+            input_per_m=1.60,
+            cached_input_per_m=0.135,
+            output_per_m=3.20,
             context_window=1_048_576,
             max_output=384_000,
             can_reason=True,
             reasoning="off",
-            priced_at="2026-09-10",
+            priced_at="2026-09-16",
         ),
         ModelSpec(
             id="openrouter.deepseek-v4-flash",
             provider="openrouter-toolsafe",
             api_model="deepseek/deepseek-v4-flash",
-            input_per_m=0.084,
-            cached_input_per_m=0.0168,
-            output_per_m=0.168,
+            input_per_m=0.08708,
+            cached_input_per_m=0.017416,
+            output_per_m=0.17416,
             context_window=1_048_576,
             max_output=384_000,
-            priced_at="2026-09-10",
+            priced_at="2026-09-16",
         ),
         ModelSpec(
             id="openrouter.qwen-3.6-plus",
@@ -377,12 +456,12 @@ MODELS: dict[str, ModelSpec] = {
             id="openrouter.llama-4-maverick",
             provider="openrouter",
             api_model="meta-llama/llama-4-maverick",
-            input_per_m=0.20,
+            input_per_m=0.1875,
             cached_input_per_m=None,  # no caching: falls back to input rate
-            output_per_m=0.696,
+            output_per_m=0.6525,
             context_window=1_048_576,
             max_output=115_200,
-            priced_at="2026-09-10",
+            priced_at="2026-09-16",
         ),
         ModelSpec(
             id="fake.echo",
@@ -440,7 +519,10 @@ class Catalog:
     ) -> None:
         self.models = dict(models if models is not None else MODELS)
         self.providers = dict(providers if providers is not None else PROVIDERS)
+        self._aliases: dict[str, str] = {}
+        self._ambiguous: dict[str, tuple[str, ...]] = {}
         self._validate()
+        self._index_aliases()
 
     def _validate(self) -> None:
         """Fail at construction, not at 3 a.m. on the request path.
@@ -457,13 +539,96 @@ class Catalog:
                     f"{model.provider!r}"
                 )
 
-    def resolve(self, model_id: str) -> Target:
+    def _index_aliases(self) -> None:
+        """Build the alias -> catalog id table, and decide what "ambiguous" is.
+
+        Two kinds of second name feed the table: every model's `api_model`
+        (implicit) and its declared `aliases` (explicit). The rules:
+
+        * A name that is also a catalog id never enters the table. Exact ids
+          win outright, so an alias can never shadow a real entry.
+        * A DECLARED alias claimed by two models is a config typo and fails
+          construction. Nobody writes the same alias twice on purpose.
+        * An IMPLICIT wire id shared by two models is legal -- the shipped
+          `fake.echo` and `fake.echo-anthropic` both answer to `fake-echo`,
+          and OpenRouter re-exports ids other providers also serve. Such a
+          name is recorded as ambiguous and refused at resolve time with the
+          candidates named, rather than guessed. A gateway that picks a
+          provider by coin toss when a client sends a bare wire id is a
+          gateway that bills the wrong provider on the toss it loses.
+        """
+        claims: dict[str, dict[str, bool]] = {}  # name -> {catalog id: declared?}
+        for model in self.models.values():
+            names = ((model.api_model, False), *((a, True) for a in model.aliases))
+            for name, declared in names:
+                if name in self.models:
+                    continue
+                claims.setdefault(name, {})[model.id] = declared
+        for name, owners in claims.items():
+            if len(owners) == 1:
+                self._aliases[name] = next(iter(owners))
+                continue
+            declared = sorted(mid for mid, is_declared in owners.items() if is_declared)
+            if len(declared) > 1:
+                raise ValueError(
+                    f"alias {name!r} is declared by more than one model: {declared}"
+                )
+            if len(declared) == 1:
+                # One model claimed it on purpose, others only happen to share
+                # the wire string. The explicit claim wins.
+                self._aliases[name] = declared[0]
+                continue
+            self._ambiguous[name] = tuple(sorted(owners))
+
+    def canonical_id(self, model_id: str, *, kind: ProviderKind | None = None) -> str:
+        """The catalog id a client-supplied model string names, or raise.
+
+        Resolution order: exact catalog id, then the alias table (wire ids
+        and declared aliases), then -- for a wire id several models share --
+        the one whose provider speaks `kind`, if exactly one does. `kind` is
+        the dialect of the route the request arrived on: a bare `deepseek-flash`
+        on `/v1/chat/completions` can only mean the OpenAI-shaped row, because
+        the Anthropic-shaped row could not serve that body. Without a hint, or
+        with two owners of the same kind, the id is refused as ambiguous.
+
+        An ambiguous wire id and an unknown string are both `PolicyError` --
+        POLICY blame, NEUTRAL health, no provider's breaker hears about it --
+        but with different messages, because "name the catalog id" and "no
+        such model" are different fixes.
+        """
         from .errors import PolicyError
 
-        model = self.models.get(model_id)
-        if model is None:
-            raise PolicyError(f"unknown model {model_id!r}", model=model_id)
+        if model_id in self.models:
+            return model_id
+        canonical = self._aliases.get(model_id)
+        if canonical is not None:
+            return canonical
+        owners = self._ambiguous.get(model_id)
+        if owners is not None:
+            if kind is not None:
+                same_kind = [
+                    mid for mid in owners
+                    if self.providers[self.models[mid].provider].kind == kind
+                ]
+                if len(same_kind) == 1:
+                    return same_kind[0]
+            raise PolicyError(
+                f"model {model_id!r} is a wire id shared by {list(owners)}; "
+                f"name the catalog id",
+                model=model_id,
+            )
+        raise PolicyError(f"unknown model {model_id!r}", model=model_id)
+
+    def resolve(self, model_id: str, *, kind: ProviderKind | None = None) -> Target:
+        """`Target` for a catalog id, a wire id, or a declared alias. `kind`
+        is the route's dialect, used only to break a wire-id tie."""
+        model = self.models[self.canonical_id(model_id, kind=kind)]
         return Target(model=model, provider=self.providers[model.provider])
+
+    @property
+    def aliases(self) -> dict[str, str]:
+        """A copy of the alias table: every second name and the id it means."""
+        return dict(self._aliases)
 
     def with_overrides(
         self,

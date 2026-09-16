@@ -558,6 +558,19 @@ class ServerConfig:
     kill timeout above this grace, or a SIGKILL, not the drain, ends the
     process and every stream still open with it."""
 
+    inject_include_usage: bool = False
+    """Add `stream_options: {include_usage: true}` to OpenAI-dialect streaming
+    requests that did not set `stream_options` (`LLMGW_INJECT_INCLUDE_USAGE`).
+
+    Without the flag the OpenAI dialect streams no usage frame at all, so
+    every streamed call bills by the byte estimate (`cost_basis=estimated`,
+    finding 27). Off by default because it is a second edit to the client's
+    bytes -- announced by `X-Gw-Body-Modified: 1` like the model rewrite --
+    and the byte-exact passthrough contract (`test_model_rewrite`) is the
+    default's to keep. Production sets it: an estimated bill is the worse
+    default there. Only OpenAI-kind providers, only when `stream` is true.
+    """
+
     drain_allow_short: bool = False
     """Escape hatch for the `total <= grace` check (`LLMGW_DRAIN_ALLOW_SHORT`).
 
@@ -860,6 +873,9 @@ class ServerConfig:
             ),
             drain_grace_seconds=_env_float(env, "LLMGW_DRAIN_GRACE", 130.0),
             drain_allow_short=_env_bool(env, "LLMGW_DRAIN_ALLOW_SHORT", default=False),
+            inject_include_usage=_env_bool(
+                env, "LLMGW_INJECT_INCLUDE_USAGE", default=False
+            ),
             max_streams=_env_optional_int(env, "LLMGW_MAX_STREAMS", 150),
         ).validated()
 

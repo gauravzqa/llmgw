@@ -86,6 +86,7 @@ from dataclasses import dataclass
 from .catalog import Catalog, ModelSpec, Target, price_of
 from .errors import Outcome
 from .executor import ExecutionResult
+from .metrics import normalize_stop_reason
 from .pump import PumpResult
 from .surfaces.base import Usage
 
@@ -164,6 +165,14 @@ class AccountingRecord:
     `code` label of `llmgw_requests_total`. Drawn from `errors.ERROR_CODES`
     plus `"none"`, exactly the closed set `metrics._CODES` allows."""
 
+    stop_reason: str | None = None
+    """Why the provider ended a completed response, folded onto
+    `metrics.STOP_REASONS` by `normalize_stop_reason`; None when the provider
+    said nothing (a cut stream, a buffered body the surface did not read).
+    The `stop_reason` label of `llmgw_stop_reason_total` and a capture field.
+    Read off `Usage.stop_reason` with `getattr` so a surface that predates the
+    field still accounts cleanly (PLAN-2 A3)."""
+
     @property
     def tokens_by_kind(self) -> dict[str, int]:
         """The four buckets keyed by `metrics.TOKEN_KINDS`, so the metrics wiring
@@ -232,6 +241,7 @@ def _account(result: ExecutionResult, *, catalog: Catalog) -> AccountingRecord:
         attempts=len(result.attempts),
         parse_failures=usage.parse_failures,
         code=result.error.code if result.error is not None else "none",
+        stop_reason=normalize_stop_reason(getattr(usage, "stop_reason", None)),
     )
 
 
@@ -367,4 +377,5 @@ def _fallback_record(result: object) -> AccountingRecord:
         attempts=attempt_count,
         parse_failures=0,
         code=code,
+        stop_reason=None,
     )

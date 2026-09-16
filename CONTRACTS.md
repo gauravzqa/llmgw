@@ -249,3 +249,61 @@ passthrough class is still forwarded byte for byte.
 `test_a_non_auth_passthrough_body_is_still_the_providers_bytes`,
 `test_a_provider_401_reaches_the_client_as_a_status_without_the_body` and
 `test_a_provider_5xx_body_is_still_forwarded_byte_for_byte` (contract).
+
+---
+
+### C12 — The gateway answers in catalog names, and tells you the provider's request id
+
+Two facts a client could not previously get back out of the gateway.
+
+**The model it was served by, in the name the gateway issued.** Every
+response with a served target carries `X-Gw-Model: <catalog id>`. On the
+buffered (non-streaming) path, when the request body was rewritten to the
+provider's wire id (`X-Gw-Body-Modified: 1`), the response body's top-level
+`model` is rewritten back to the catalog id. Streaming bodies are never
+rewritten: byte-for-byte passthrough holds, and the alias table in `policy`
+makes the wire id the provider echoes acceptable on the next turn instead.
+Before this, an SDK loop that re-sent the response's `model` got
+`400 unknown model` from the gateway (live, 16 Sep 2026).
+
+**The provider's own request id.** `X-Gw-Upstream-Request-Id` carries the
+upstream's `x-request-id` / `request-id` / `x-inworld-request-id` on success
+and on every error path, including the scrubbed auth path (C11): it is an
+identifier, not credential material, and it is the one thing a support
+ticket to the provider needs. The provider's rate-limit headers are still
+never forwarded; they are read into per-credential gauges instead.
+
+*Enforced by:* `test_x_gw_model_names_the_catalog_id_that_served`,
+`test_x_gw_model_follows_the_fallback`,
+`test_the_buffered_response_model_is_the_catalog_id_again`,
+`test_the_streaming_body_is_not_rewritten`,
+`test_a_billing_429_with_no_fallback_passes_through_with_the_upstream_request_id`
+(contract); `test_send_error_carries_the_providers_request_id_and_scrubs_auth`,
+`test_rewrite_response_model_puts_the_catalog_id_back_on_json_objects_only`
+(unit).
+
+---
+
+### C13 — Out of money is not a rate limit, and a queue is not an outage
+
+Two 429-shaped states the classifier now tells apart from a transient limit.
+
+**Billing.** A 429 whose body carries an out-of-money code — OpenAI's
+`insufficient_quota`, `credit_balance_exhausted`, the spend- and usage-limit
+codes; Anthropic's `details.error_code: enforced_spend_limit_reached` — or
+Anthropic's 400 "reached your specified API usage limits", classifies as
+`InsufficientCredits`: never retried against the same target, eligible for
+the next, NEUTRAL to the breaker, blamed on POLICY. Same disposition as the
+402 shape finding 8 fixed, on two more providers.
+
+**Queueing.** A first-event timeout that fires after the provider has shown
+liveness (SSE comments, empty-choices frames, `ping`) is
+`FirstEventTimeout(queued=True)`: NEUTRAL health, still `try_next`, still not
+`retry_same`, and counted on `llmgw_queued_at_provider_total`. A provider
+that holds a request in a queue for longer than the client's budget has cost
+the client its budget, not lost its health.
+
+*Enforced by:* `test_a_billing_429_falls_back_once_and_never_retries_the_same_target`,
+`test_an_impatient_budget_falls_back_and_counts_the_queue_not_an_outage`
+(contract); `test_out_of_money_as_a_429_is_insufficient_credits_not_rate_limited`,
+`test_a_queued_first_event_timeout_is_neutral_but_still_falls_back` (unit).

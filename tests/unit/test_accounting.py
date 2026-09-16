@@ -23,7 +23,7 @@ from llmgw.pump import PumpResult
 from llmgw.surfaces.base import Usage
 
 CATALOG = DEFAULT_CATALOG
-SONNET = "anthropic.sonnet-4-6"      # input 3.00, cached 0.30, out 15.00, cache_write None
+SONNET = "anthropic.sonnet-4-6"      # rates read from the catalog row at use
 HAIKU = "anthropic.haiku-4-5"        # input 1.00, cached 0.10, out 5.00
 QWEN = "openrouter.qwen-3.6-plus"    # input .325, cached .325, cache_write .41, out 1.95
 
@@ -97,9 +97,17 @@ def test_exact_usage_cost_is_the_dot_product_over_all_four_buckets():
 
     rec = account(result, catalog=CATALOG)
 
-    # input 1000*3.00 + cache_read 2000*0.30 + cache_write 100*3.00 (falls back
-    # to input, sonnet has no write rate) + output 500*15.00, all /1e6.
-    expected = (1000 * 3.00 + 2000 * 0.30 + 100 * 3.00 + 500 * 15.00) / 1_000_000
+    # The dot product over the four buckets at the spec's own rates. Read off
+    # the catalog rather than hard-coded, so a price correction (the Anthropic
+    # cache-write rate landed with PLAN-2 A5) changes the bill, not the test.
+    spec = CATALOG.models[SONNET]
+    write_rate = spec.cache_write_per_m
+    if write_rate is None:
+        write_rate = spec.input_per_m
+    expected = (
+        1000 * spec.input_per_m + 2000 * spec.cached_input_per_m
+        + 100 * write_rate + 500 * spec.output_per_m
+    ) / 1_000_000
     assert rec.cost_usd == pytest.approx(expected)
     assert rec.basis == "exact"
     assert rec.provider == "anthropic"
@@ -120,7 +128,9 @@ def test_cache_write_rate_is_used_when_the_spec_carries_one():
 
     rec = account(result, catalog=CATALOG)
 
-    assert rec.cost_usd == pytest.approx(1000 * 0.41 / 1_000_000)
+    assert rec.cost_usd == pytest.approx(
+        1000 * CATALOG.models[QWEN].cache_write_per_m / 1_000_000
+    )
 
 
 # ------------------------------------------------ cache_read is cheap and not folded in
@@ -138,8 +148,9 @@ def test_cache_read_is_priced_below_input_and_is_not_folded_into_input():
 
     rec = account(result, catalog=CATALOG)
 
-    assert rec.cost_usd == pytest.approx(1000 * 0.10 / 1_000_000)
-    assert rec.cost_usd != pytest.approx(1000 * 1.00 / 1_000_000)  # not folded in
+    haiku = CATALOG.models[HAIKU]
+    assert rec.cost_usd == pytest.approx(1000 * haiku.cached_input_per_m / 1_000_000)
+    assert rec.cost_usd != pytest.approx(1000 * haiku.input_per_m / 1_000_000)  # not folded in
     assert rec.tokens_by_kind["input"] == 0
     assert rec.tokens_by_kind["cache_read"] == 1000
 
@@ -154,8 +165,11 @@ def test_cache_read_falls_back_to_input_rate_never_zero_when_uncached():
 
     rec = account(result, catalog=CATALOG)
 
-    # input_per_m for maverick is 0.20; the fallback must be that, not 0.
-    assert rec.cost_usd == pytest.approx(1000 * 0.20 / 1_000_000)
+    # The fallback must be the row's own input rate, not 0. Read off the
+    # catalog: OpenRouter prices moved on 2026-09-16 and will move again.
+    maverick = CATALOG.models["openrouter.llama-4-maverick"]
+    assert maverick.cached_input_per_m is None, "the test exists for the uncached row"
+    assert rec.cost_usd == pytest.approx(1000 * maverick.input_per_m / 1_000_000)
     assert rec.cost_usd > 0
 
 

@@ -144,6 +144,14 @@ MODES: tuple[str, ...] = (
     "slow-drip",
     "huge-event",
     "split-frames",
+    # PLAN-2 phase A. Out-of-money as a 429 in each dialect's real shape; a
+    # provider 413; and a provider that queues under load -- SSE comments for
+    # `delay` seconds, then a correct stream -- which is what DeepSeek does
+    # instead of answering 429.
+    "429-billing-openai",
+    "429-billing-anthropic",
+    "413",
+    "queue-then-serve",
 )
 
 PATHS: dict[Surface, str] = {
@@ -320,6 +328,7 @@ _MODE_DEFAULTS: dict[str, dict[str, float | int]] = {
     "ping-forever": {"interval": 1.0, "events": 100_000},
     "huge-event": {"events": 1},
     "429": {"delay": 3.0},
+    "queue-then-serve": {"delay": 3.0},
 }
 
 
@@ -640,6 +649,19 @@ async def _body(surface: Surface, p: Params) -> AsyncIterator[bytes]:
             yield out(_heartbeat(surface))
         return
 
+    if mode == "queue-then-serve":
+        # A provider that queues instead of refusing: nothing but SSE comment
+        # lines -- liveness, never progress (C7) -- for `delay` seconds, then
+        # the ordinary stream. A gateway whose first-event budget is shorter
+        # than the delay must read this as a QUEUE (health NEUTRAL, PLAN-2
+        # A4), not as a dead provider; one whose budget is longer just waits.
+        waited = 0.0
+        while waited < p.delay:
+            step = min(0.25, p.delay - waited)
+            await asyncio.sleep(step)
+            waited += step
+            yield b": keep-alive\r\n\r\n" if p.crlf else b": keep-alive\n\n"
+
     # Everything below starts with the envelope and K real content events.
     for frame in _prefix(surface):
         yield out(frame)
@@ -803,6 +825,41 @@ def _handler(surface: Surface, default_mode: str) -> Callable[[Request], Awaitab
                     "x-ratelimit-reset-requests": f"{retry_after}s",
                 },
             )
+        if p.mode == "429-billing-openai":
+            # OpenAI has no 402. An exhausted balance or a hit spend limit is
+            # a 429 whose `code` says so, and the docs say "do not retry".
+            # Shape per capabilities/openai.md §5 (doc-derived, not a live
+            # capture). No Retry-After: there is nothing to wait for.
+            return JSONResponse(
+                {"error": {
+                    "message": "You exceeded your current quota, please check "
+                               "your plan and billing details.",
+                    "type": "insufficient_quota", "param": None,
+                    "code": "insufficient_quota",
+                }},
+                status_code=429,
+                headers={**hdr, "x-request-id": "req_fake_billing_openai"},
+            )
+        if p.mode == "429-billing-anthropic":
+            # Anthropic's spend cap: a 429 `rate_limit_error` with the reason
+            # one level down in `details.error_code` and, unlike a real rate
+            # limit, no `retry-after`. Shape per capabilities/anthropic.md §5.
+            return JSONResponse(
+                {"type": "error",
+                 "error": {
+                     "type": "rate_limit_error",
+                     "message": "This request would exceed your organization's "
+                                "configured spend limit.",
+                     "details": {"error_code": "enforced_spend_limit_reached"},
+                 },
+                 "request_id": "req_fake_billing_anthropic"},
+                status_code=429,
+                headers={**hdr, "request-id": "req_fake_billing_anthropic"},
+            )
+        if p.mode == "413":
+            # The provider's own body cap, under ours. Anthropic's is 32 MB.
+            return _raw(surface, 413, "request_too_large",
+                        "Request exceeds the maximum size of 32 MB", hdr)
         if p.mode == "stall-before-headers":
             return await _stall_before_headers(request, surface, p)
 

@@ -368,12 +368,38 @@ class FirstEventTimeout(GatewayError):
     the model may be generating right now and we would be billed twice for
     work we then throw away. Worse, a target slow enough to blow this clock is
     usually still slow one second later. Move on; do not re-ask the same
-    overloaded model to hurry up."""
+    overloaded model to hurry up.
+
+    `queued=True` is the one instance-level override of a class-level health
+    in the taxonomy, and it exists because of a provider behaviour the fakes
+    never modelled: DeepSeek does not 429 under load, it QUEUES -- holding the
+    request for up to ten minutes while sending SSE comment lines -- and
+    ElevenLabs does the same for a few hundred milliseconds. A first-event
+    clock that fires after the provider has been saying "still here" the whole
+    time has measured a queue, not an outage, and five of those in thirty
+    seconds would open a breaker against a provider that was healthy and
+    busy. So the pump passes `queued=True` when a liveness signal (comment,
+    empty-choices frame, `ping`) arrived before the clock fired, the health
+    flips to NEUTRAL, and `llmgw_queued_at_provider_total` counts it. Blame
+    stays PROVIDER -- it is their queue -- and the disposition is unchanged:
+    still `try_next`, still not `retry_same` (PLAN-2 A4, findings log 43)."""
 
     code = "first_event_timeout"
     retry_same = False
     try_next = True
     status = 504
+    queued: bool = False
+
+    def __init__(self, message: str = "", *, queued: bool = False, **kw: Any) -> None:
+        super().__init__(message, **kw)
+        self.queued = queued
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        # The pump stamps `queued` AFTER construction (`Pump._mark_queued`),
+        # so the health flip has to follow the attribute, not the constructor.
+        super().__setattr__(name, value)
+        if name == "queued" and value:
+            super().__setattr__("health", Health.NEUTRAL)
 
 
 class StallTimeout(GatewayError):
@@ -381,11 +407,27 @@ class StallTimeout(GatewayError):
 
     Note this can fire pre- or post-commitment; the class does not care, and
     `decide()` does. Heartbeats deliberately do NOT reset this clock: a
-    heartbeat is liveness, not progress."""
+    heartbeat is liveness, not progress.
+
+    `queued`, stamped by the pump: this stall fired before ANY content and
+    after at least one liveness signal -- the provider was queueing the
+    request, not dead. Health flips to NEUTRAL on the instance (class policy
+    unchanged), the disposition is otherwise the same, and
+    `llmgw_queued_at_provider_total` counts it. In practice this, not
+    `FirstEventTimeout`, is the class a queued wait ends in: the first
+    keep-alive comment satisfies the upstream's first-chunk budget, and it is
+    the pump's progress clock that then measures the silence (PLAN-2 A4,
+    findings log 43)."""
 
     code = "stall_timeout"
     try_next = True
     status = 504
+    queued: bool = False
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        super().__setattr__(name, value)
+        if name == "queued" and value:
+            super().__setattr__("health", Health.NEUTRAL)
 
 
 class UpstreamDisconnected(GatewayError):
@@ -424,6 +466,29 @@ class RequestTooLarge(GatewayError):
     health = Health.NEUTRAL
     blame = Blame.CLIENT
     outcome = Outcome.REJECTED
+    status = 413
+
+
+class UpstreamRequestTooLarge(GatewayError):
+    """The PROVIDER answered 413: the body was under our cap and over theirs.
+
+    Distinct from `RequestTooLarge` (our own cap, no upstream work) because the
+    two have different owners -- ours is a config knob, theirs is a published
+    limit -- and because this one carries the provider's body, which names
+    the limit. Same disposition as the client-fault family: no retry (the
+    same bytes will be too large again), no fallback by default (the next
+    provider's limit is not larger just because it is next), NEUTRAL, CLIENT
+    blame. Before this class existed a provider 413 fell through to
+    `UpstreamServerError`: retried, and counted against the provider's
+    circuit for a body the client chose (capabilities/anthropic.md, gap 8).
+    """
+
+    code = "upstream_request_too_large"
+    retry_same = False
+    try_next = False
+    health = Health.NEUTRAL
+    blame = Blame.CLIENT
+    passthrough = True
     status = 413
 
 
@@ -825,8 +890,41 @@ def _error_hints(body: bytes | None) -> tuple[str, str]:
     # that match the context-overflow rule, so a two-token prompt classified
     # as "context length exceeded". The substring was right there in the
     # payload and meant the opposite of what the rule assumed.
-    detail = " ".join(str(err.get(k) or "") for k in ("code", "message")).lower()
+    parts = [str(err.get(k) or "") for k in ("code", "message")]
+    # Anthropic puts the machine-readable reason one level down:
+    # `error.details.error_code` (e.g. `enforced_spend_limit_reached` on a
+    # 429 that carries no Retry-After). It is a code, not a param, so it
+    # belongs in the haystack the code rules read.
+    details = err.get("details")
+    if isinstance(details, dict):
+        parts.append(str(details.get("error_code") or ""))
+    detail = " ".join(parts).lower()
     return (etype, detail)
+
+
+# Out-of-money, arriving as a 429. OpenAI never uses 402: an exhausted
+# prepaid balance, a hit spend limit or a hit usage limit is a 429 whose
+# `code` says so, and the docs say plainly "do not retry -- add credit".
+# Anthropic's spend cap is a 429 with `details.error_code` and no
+# `retry-after`. A 429 classified as `RateLimited` is retry-same with
+# backoff and NEUTRAL, which is exactly wrong for an unpaid invoice: the
+# gateway retries a request that cannot succeed and never blames POLICY
+# (PLAN-2 A2, findings log 42, mirror of finding 8 on two more providers).
+_BILLING_429_CODES: tuple[str, ...] = (
+    "insufficient_quota",
+    "credit_balance_exhausted",
+    "organization_spend_limit_exceeded",
+    "project_spend_limit_exceeded",
+    "organization_usage_limit_exceeded",
+    "enforced_spend_limit_reached",
+)
+
+# Anthropic's self-set usage limit arrives as a 400 with prose; no code.
+_BILLING_400_HINT = "reached your specified api usage limits"
+
+
+def _looks_like_billing(detail: str) -> bool:
+    return any(code in detail for code in _BILLING_429_CODES)
 
 
 _UNKNOWN_MODEL_HINTS = (
@@ -865,6 +963,7 @@ def from_http_status(
     model: str | None = None,
     credential_id: str | None = None,
     attempt: int | None = None,
+    forbidden_means: str = "auth",
 ) -> GatewayError:
     """Map an upstream HTTP response onto the taxonomy.
 
@@ -873,6 +972,19 @@ def from_http_status(
     less often, so the string match is the subordinate signal. Anything
     unrecognised lands on the conservative default for its class rather than
     on a guess.
+
+    `forbidden_means` is the one per-provider knob, and it is a knob because
+    403 is the status providers disagree about most. OpenAI (region block),
+    Anthropic (permission error) and Inworld (bad key, verified live) mean
+    "this credential may not do this" -- `"auth"`, the default, and the
+    credential-scoped class is right. AssemblyAI's REST rate limit is a 403
+    (`"rate_limit"`); ElevenLabs' plan, voice and model denials are 403s
+    (`"policy"`). Under the default rule either one opens the credential
+    breaker for every tenant on a per-voice mistake or a polling burst. The
+    value comes from the provider row (`ProviderConn.forbidden_means` once
+    the voice rows land; `getattr` with the default until then), never from
+    the body: a 403 body is exactly the thing a mis-scoped provider gets
+    wrong.
     """
     etype, detail = _error_hints(body)
     after = parse_retry_after(retry_after)
@@ -888,19 +1000,43 @@ def from_http_status(
     )
 
     if status == 429:
+        if _looks_like_billing(detail):
+            return InsufficientCredits(detail or "out of credit", **kw)
         return RateLimited(f"rate limited by {provider or 'upstream'}", **kw)
+    if status == 403 and forbidden_means == "rate_limit":
+        return RateLimited(f"rate limited by {provider or 'upstream'} (403)", **kw)
+    if status == 403 and forbidden_means == "policy":
+        # A plan, voice or model the credential is not entitled to. Config
+        # drift or a caller asking for something the plan lacks; NEUTRAL,
+        # POLICY blame, no circuit hears it. The provider's body is the only
+        # place the entitlement is named, so it passes through.
+        err = PolicyError(detail or f"{provider or 'upstream'} refused (403)", **kw)
+        err.passthrough = True
+        # An upstream WAS asked, so this is not the gateway's own REJECTED.
+        err.outcome = Outcome.FAILED
+        return err
     if status in (401, 403):
         return AuthenticationFailed(f"auth rejected by {provider or 'upstream'}", **kw)
     if status == 402:
         return InsufficientCredits(detail or "insufficient credits", **kw)
     if status == 404:
         return ModelNotFound(f"model {model!r} not found at {provider}", **kw)
+    if status == 413:
+        return UpstreamRequestTooLarge(detail or "request too large for upstream", **kw)
+    if status == 409:
+        # Anthropic `conflict_error`, ElevenLabs `already_processing`: the
+        # request as sent cannot be applied. Not transient, not the
+        # provider's health; before this rule it fell through to
+        # `UpstreamServerError` and was retried against the circuit.
+        return InvalidRequest(detail or "upstream conflict", **kw)
     if status == 400 or status == 422:
         # Status alone cannot answer this. Anthropic returns 404 for an
         # unknown model; DeepSeek and OpenRouter return 400 with an
         # `invalid_request_error`, so a status-only rule blames the CLIENT for
         # a stale catalog and the "our config drifted" signal simply does not
         # exist on OpenAI-shaped providers. Body first, here and only here.
+        if _BILLING_400_HINT in detail:
+            return InsufficientCredits(detail, **kw)
         if _looks_like_unknown_model(detail):
             return ModelNotFound(detail or f"model {model!r} not found", **kw)
         if "context" in detail or "too long" in detail or "context_length" in detail:
@@ -926,7 +1062,8 @@ ERROR_CODES: frozenset[str] = frozenset(
     cls.code
     for cls in (
         AdmissionRejected, ConcurrencyRejected, ProviderKeyExhausted, BreakerOpen,
-        NoTargetsAvailable, PolicyError, RequestTooLarge, ResponseTooLarge,
+        NoTargetsAvailable, PolicyError, RequestTooLarge, UpstreamRequestTooLarge,
+        ResponseTooLarge,
         ConnectTimeout, ConnectionFailed,
         HeadersTimeout, FirstEventTimeout, StallTimeout, UpstreamDisconnected,
         IncompleteStream,

@@ -61,6 +61,13 @@ kill_timeout = "140s"
   # before trusting it (DEPLOY.md, "Re-deriving the cap").
   LLMGW_MAX_STREAMS = "150"
 
+  # Inject `stream_options.include_usage` on OpenAI-dialect streams when the
+  # client did not set stream_options, so streamed billing is exact instead
+  # of estimated (finding 27). Off by default in code because it is a body
+  # edit; on in production because the bills are the point. Reported under
+  # X-Gw-Body-Modified like the model rewrite.
+  LLMGW_INJECT_INCLUDE_USAGE = "1"
+
   # Multi-tenant is mandatory in production: without a tenants file the
   # gateway would serve every bearer token as one anonymous tenant. The
   # file ships in the image (Dockerfile copies config/); the tokens it names

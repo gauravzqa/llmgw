@@ -427,6 +427,31 @@ def apply_api_model(body: bytes, api_model: str) -> tuple[bytes, bool]:
 # ==========================================================================
 
 
+def apply_include_usage(body: bytes) -> tuple[bytes, bool]:
+    """Ask the OpenAI dialect to stream its usage frame. Opt-in (`ServerConfig.
+    inject_include_usage`); the third and last body edit next to
+    `apply_api_model` and `apply_extra_body`, reported through the same flag.
+
+    Only when the body is a JSON object with `stream: true` and NO
+    `stream_options` key. A client that set `stream_options` -- to anything,
+    including `include_usage: false` -- has made a choice and keeps it; a
+    client that said nothing gets the one setting under which the gateway can
+    bill exactly instead of by the byte estimate (finding 27). Never touches
+    a non-streaming body, and never a body the surface could not parse: the
+    caller sees `(body, False)` and the bytes go through untouched.
+    """
+    try:
+        parsed = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return body, False
+    if not isinstance(parsed, dict) or parsed.get("stream") is not True:
+        return body, False
+    if "stream_options" in parsed:
+        return body, False
+    merged: dict[str, Any] = {**parsed, "stream_options": {"include_usage": True}}
+    return json.dumps(merged, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), True
+
+
 def map_transport_error(
     exc: BaseException, *, after_headers: bool, **ctx: Any
 ) -> errors.GatewayError:
@@ -547,8 +572,12 @@ class Upstream:
         read_size: int = DEFAULT_READ_SIZE,
         max_error_body: int = DEFAULT_MAX_ERROR_BODY,
         transport: httpx.AsyncBaseTransport | None = None,
+        inject_include_usage: bool = False,
     ) -> None:
         self._catalog = catalog
+        self._inject_include_usage = inject_include_usage
+        """`ServerConfig.inject_include_usage`: the third body edit, applied
+        in `open()` next to the other two and announced the same way."""
         self._clock = clock or SystemClock()
         """Unused on every current path: every wait in this module derives from
         the `Deadline` the caller passes in, which carries its own clock. Held
@@ -700,7 +729,10 @@ class Upstream:
         # overrides ours.
         body, renamed = apply_api_model(req.body, target.model.api_model)
         body, merged = apply_extra_body(body, provider.extra_body)
-        body_modified = renamed or merged
+        injected = False
+        if self._inject_include_usage and req.stream and provider.kind == "openai":
+            body, injected = apply_include_usage(body)
+        body_modified = renamed or merged or injected
 
         try:
             client = self._client_for(provider)
@@ -737,7 +769,13 @@ class Upstream:
                 raise map_transport_error(exc, after_headers=False, **ctx) from exc
 
             if not 200 <= response.status_code < 300:
-                raise await self._classify_status(response, deadline, budgets, ctx)
+                raise await self._classify_status(
+                    response, deadline, budgets, ctx,
+                    # Per-provider meaning of 403 (`errors.from_http_status`).
+                    # `getattr` until the catalog row grows the field with the
+                    # voice providers; the default is today's rule.
+                    forbidden_means=getattr(provider, "forbidden_means", "auth"),
+                )
 
             yield UpstreamStream(
                 response,
@@ -760,6 +798,8 @@ class Upstream:
         deadline: Deadline,
         budgets: Budgets,
         ctx: dict[str, Any],
+        *,
+        forbidden_means: str = "auth",
     ) -> errors.GatewayError:
         """Read at most `max_error_body` bytes, then hand the status to the
         taxonomy.
@@ -781,7 +821,12 @@ class Upstream:
         return errors.from_http_status(
             response.status_code,
             body=body,
+            # The headers ride on the error: `send_error` reads the
+            # provider's request id off them, and `_record` its rate-limit
+            # budget (PLAN-2 A6d/e). Neither reaches the client verbatim.
+            headers=dict(response.headers),
             retry_after=response.headers.get("retry-after"),
+            forbidden_means=forbidden_means,
             **ctx,
         )
 
@@ -824,6 +869,7 @@ __all__ = [
     "UpstreamRequest",
     "UpstreamStream",
     "apply_api_model",
+    "apply_include_usage",
     "apply_extra_body",
     "build_headers",
     "join_url",

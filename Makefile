@@ -27,6 +27,8 @@ venv: $(VENV)                      ## Same as above
 
 test: unit                         ## Default loop: the fast tier only
 
+ci: lint unit contract             ## What .github/workflows/ci.yml runs on every push
+
 unit: $(VENV)                      ## Tier 1: no sockets, no sleeps. Target < 3s
 	$(PYTEST) tests/unit -q
 

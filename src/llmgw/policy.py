@@ -442,7 +442,11 @@ class PolicySnapshot:
     # ------------------------------------------------------------ planning
 
     def plan_for(
-        self, workload_id: str | None = None, *, model: str | None = None
+        self,
+        workload_id: str | None = None,
+        *,
+        model: str | None = None,
+        kind: str | None = None,
     ) -> ExecutionPlan:
         """The ordered plan for one request. Pure lookup; cannot fail on config.
 
@@ -460,6 +464,13 @@ class PolicySnapshot:
         still resolved through the catalog, so an unknown model is a
         `PolicyError` and not a request to a provider that has never heard of
         it.
+
+        `model` may also be a wire id or a declared alias (`Catalog.resolve`):
+        the id a provider echoed in its last response is what an SDK sends on
+        the next turn, and turn two must not 400. `kind=` is the dialect of
+        the route the request arrived on (`"openai"` / `"anthropic"`); it is
+        used only to break a tie when two providers of different dialects
+        share a wire id, since only the same-dialect one could serve the body.
         """
         wid = workload_id if workload_id is not None else self.default_workload
         workload = self.workloads.get(wid)
@@ -469,7 +480,9 @@ class PolicySnapshot:
             )
 
         if model is not None:
-            targets: tuple[Target, ...] = (self.catalog.resolve(model),)
+            targets: tuple[Target, ...] = (
+                self.catalog.resolve(model, kind=kind),  # type: ignore[arg-type]
+            )
         else:
             targets = tuple(
                 self.catalog.resolve(mid)
@@ -906,6 +919,7 @@ def _canonical_catalog(catalog: Catalog) -> str:
                 "context_window": m.context_window,
                 "max_output": m.max_output,
                 "priced_at": m.priced_at,
+                "aliases": list(m.aliases),
             }
             for mid, m in catalog.models.items()
         },

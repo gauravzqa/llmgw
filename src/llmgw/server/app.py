@@ -199,8 +199,10 @@ import dataclasses
 import json
 import logging
 import math
+import time
 from collections.abc import Coroutine, Mapping
 from contextlib import asynccontextmanager, suppress
+from datetime import UTC
 from typing import Any, TypeVar
 
 from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry, generate_latest
@@ -217,6 +219,7 @@ from llmgw.capture import Capture, CaptureRecord, FileSink, NullSink
 from llmgw.catalog import Target
 from llmgw.clocks import Budgets, Clock, Deadline, SystemClock, phase
 from llmgw.executor import NO_RETRIES, ExecutionResult, Executor, credential_health_key
+from llmgw.metrics import normalize_stop_reason
 from llmgw.policy import ExecutionPlan, PolicySnapshot, PolicyStore
 from llmgw.pump import Sink
 from llmgw.retry import RetryPolicy
@@ -377,6 +380,13 @@ def gw_headers(
         (b"x-gw-policy-id", _ascii(policy_id)),
         (b"x-gw-catalog-id", _ascii(catalog_id)),
     ]
+    if target is not None:
+        # The CATALOG id of the model that served, as opposed to the wire id
+        # the provider echoes in its body (`gpt-4o-mini-2024-07-18`). The
+        # body's `model` is what an SDK loop re-sends on the next turn, and
+        # until PLAN-2 A1 that re-send was a `400 unknown model`; this header
+        # is the canonical name a client can learn without parsing the body.
+        out.append((b"x-gw-model", _ascii(target.model.id)))
     if tenant is not None:
         out.append((b"x-gw-tenant", _ascii(tenant)))
     if breaker is not None:
@@ -494,6 +504,158 @@ def _retry_after_header(seconds: float) -> bytes:
 
 
 # ==========================================================================
+# What the upstream's response headers tell us (and the client never sees)
+# ==========================================================================
+
+UPSTREAM_REQUEST_ID_HEADER = b"x-gw-upstream-request-id"
+"""The provider's own request id, re-emitted under our prefix. It is the one
+thing a support ticket to the provider needs and the one thing the
+response-header allowlist used to drop; re-emitting it under `X-Gw-` says
+whose id it is. Not credential material (PLAN-2 A6d)."""
+
+_UPSTREAM_REQUEST_ID_NAMES = ("x-request-id", "request-id", "x-inworld-request-id")
+_UPSTREAM_PROCESSING_MS_NAMES = ("openai-processing-ms", "x-envoy-upstream-service-time")
+
+# OpenAI dialect: `x-ratelimit-remaining-{requests,tokens}` with resets as
+# Go-style durations ("6m0s", "1s", "20ms"). Anthropic:
+# `anthropic-ratelimit-{requests,tokens,input-tokens,output-tokens}-remaining`
+# with resets as RFC 3339 timestamps. Folded onto `metrics.RATELIMIT_KINDS`.
+_RATELIMIT_HEADERS: tuple[tuple[str, str, str], ...] = (
+    ("requests", "x-ratelimit-remaining-requests", "x-ratelimit-reset-requests"),
+    ("tokens", "x-ratelimit-remaining-tokens", "x-ratelimit-reset-tokens"),
+    ("requests", "anthropic-ratelimit-requests-remaining",
+     "anthropic-ratelimit-requests-reset"),
+    ("tokens", "anthropic-ratelimit-tokens-remaining", "anthropic-ratelimit-tokens-reset"),
+    ("input_tokens", "anthropic-ratelimit-input-tokens-remaining",
+     "anthropic-ratelimit-input-tokens-reset"),
+    ("output_tokens", "anthropic-ratelimit-output-tokens-remaining",
+     "anthropic-ratelimit-output-tokens-reset"),
+)
+
+_DURATION_UNITS = (("ms", 0.001), ("h", 3600.0), ("m", 60.0), ("s", 1.0))
+
+
+def parse_reset_seconds(value: str | None, *, now: float | None = None) -> float | None:
+    """Seconds until a provider budget refills, from either spelling.
+
+    Go durations (`1h2m3.5s`, `20ms`), bare numbers (seconds), or an RFC 3339
+    timestamp (Anthropic). Never negative, never raises: a header we cannot
+    read leaves the gauge alone rather than failing a request.
+    """
+    if value is None:
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        return max(0.0, float(text))
+    except ValueError:
+        pass
+    if "T" in text and ("Z" in text or "+" in text or text.count("-") >= 3):
+        from datetime import datetime
+        try:
+            when = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=UTC)
+        reference = time.time() if now is None else now
+        return max(0.0, when.timestamp() - reference)
+    total = 0.0
+    rest = text
+    while rest:
+        for unit, scale in _DURATION_UNITS:
+            if rest.endswith(unit):
+                rest = rest[: -len(unit)]
+                # Peel the number in front of the unit.
+                i = len(rest)
+                while i > 0 and (rest[i - 1].isdigit() or rest[i - 1] == "."):
+                    i -= 1
+                num = rest[i:]
+                rest = rest[:i]
+                if not num:
+                    return None
+                try:
+                    total += float(num) * scale
+                except ValueError:
+                    return None
+                break
+        else:
+            return None
+    return max(0.0, total)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class UpstreamTelemetry:
+    """What one upstream response told us about itself, headers only."""
+
+    request_id: str | None
+    processing_ms: float | None
+    ratelimits: tuple[tuple[str, float | None, float | None], ...]
+    """`(kind, remaining, reset_seconds)` per `metrics.RATELIMIT_KINDS` kind
+    the provider reported. Either number may be None."""
+
+
+def parse_upstream_telemetry(
+    headers: Mapping[str, str] | None, *, now: float | None = None
+) -> UpstreamTelemetry:
+    """Pull request id, processing time and rate-limit budget off a provider's
+    response headers. Case-insensitive on the names; never raises."""
+    if not headers:
+        return UpstreamTelemetry(None, None, ())
+    lower = {str(k).lower(): str(v) for k, v in headers.items()}
+    request_id = next((lower[n] for n in _UPSTREAM_REQUEST_ID_NAMES if lower.get(n)), None)
+    processing_ms: float | None = None
+    for name in _UPSTREAM_PROCESSING_MS_NAMES:
+        raw = lower.get(name)
+        if raw:
+            try:
+                processing_ms = float(raw.strip())
+            except ValueError:
+                processing_ms = None
+            else:
+                break
+    limits: list[tuple[str, float | None, float | None]] = []
+    for kind, remaining_name, reset_name in _RATELIMIT_HEADERS:
+        remaining_raw = lower.get(remaining_name)
+        reset_raw = lower.get(reset_name)
+        if remaining_raw is None and reset_raw is None:
+            continue
+        remaining: float | None
+        try:
+            remaining = float(remaining_raw.strip()) if remaining_raw else None
+        except ValueError:
+            remaining = None
+        limits.append((kind, remaining, parse_reset_seconds(reset_raw, now=now)))
+    return UpstreamTelemetry(request_id, processing_ms, tuple(limits))
+
+
+def rewrite_response_model(body: bytes, catalog_model_id: str) -> bytes:
+    """On the BUFFERED path, put the catalog id back into the response `model`.
+
+    The request's `model` was rewritten to the provider's wire id
+    (`X-Gw-Body-Modified: 1`), so the provider answers with the wire id -- or
+    a snapshot of it -- and an SDK that echoes the response model into its
+    next request sends a name the gateway did not issue. Streaming bodies are
+    never rewritten (byte-for-byte passthrough holds; the alias table in
+    `policy` makes the echoed wire id acceptable instead). Here the whole
+    body is in hand and already re-measured for `content-length`, so the
+    rewrite is one field in a JSON object we are about to send anyway. Any
+    body that is not a JSON object with a string `model` goes out untouched.
+    """
+    try:
+        parsed = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return body
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("model"), str):
+        return body
+    if parsed["model"] == catalog_model_id:
+        return body
+    parsed["model"] = catalog_model_id
+    return json.dumps(parsed, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+# ==========================================================================
 # The pieces the pump plugs into
 # ==========================================================================
 
@@ -543,18 +705,40 @@ class BufferedSink:
     still have put the status line on the wire.
     """
 
-    __slots__ = ("_send", "_stream", "_exchange", "_spent")
+    __slots__ = ("_send", "_stream", "_exchange", "_surface", "_spent")
 
-    def __init__(self, send: Send, *, stream: UpstreamStream, exchange: Exchange) -> None:
+    def __init__(
+        self, send: Send, *, stream: UpstreamStream, exchange: Exchange,
+        surface: Surface | None = None,
+    ) -> None:
         self._send = send
         self._stream = stream
         self._exchange = exchange
+        self._surface = surface
         self._spent = False
 
     async def send(self, chunk: bytes) -> None:
         if self._spent:  # pragma: no cover - the executor sends exactly once
             raise RuntimeError("the buffered response has already been sent")
         self._spent = True
+        # The buffered path has no frames for `apply_usage` to read a stop
+        # reason from, so ask the dialect about the whole body (PLAN-2 A3).
+        # Recorded on the exchange for `_record`; never raises, never
+        # changes the bytes.
+        reader = getattr(self._surface, "stop_reason_from_body", None)
+        if reader is not None:
+            try:
+                payload = json.loads(chunk)
+            except (ValueError, UnicodeDecodeError):
+                payload = None
+            if isinstance(payload, dict):
+                self._exchange.buffered_stop_reason = reader(payload)
+        if self._stream.body_modified and self._exchange.target is not None:
+            # The request's `model` was rewritten to the wire id, so the
+            # provider's answer names the wire id; put the catalog id back so
+            # a client echoing the response model on its next turn sends a
+            # name the gateway issued (PLAN-2 A1). Buffered path only.
+            chunk = rewrite_response_model(chunk, self._exchange.target.model.id)
         headers = response_headers(
             self._stream, exchange=self._exchange, streaming=False,
             content_length=len(chunk),
@@ -1311,7 +1495,8 @@ class Gateway:
 
     async def startup(self) -> None:
         self._upstream = Upstream(self.config.catalog, clock=self.clock,
-                                  http2=self.config.http2)
+                                  http2=self.config.http2,
+                                  inject_include_usage=self.config.inject_include_usage)
 
         # Register the whole metric contract into the process registry. After
         # this line /metrics answers with real families; the comment on
@@ -1522,7 +1707,7 @@ class Exchange:
     """
 
     __slots__ = ("snapshot", "catalog_id", "workload_id", "target", "attempts",
-                 "started", "tenant", "breaker")
+                 "started", "tenant", "breaker", "upstream", "buffered_stop_reason")
 
     def __init__(
         self, snapshot: PolicySnapshot, *, catalog_id: str, workload_id: str
@@ -1533,6 +1718,14 @@ class Exchange:
         self.target: Target | None = None
         self.attempts: int = 0
         self.started: bool = False
+        self.upstream: UpstreamTelemetry | None = None
+        """What the answering upstream's response headers said about itself
+        (request id, processing time, rate-limit budget). Written by
+        `observe_upstream` at status commitment or from the terminal error,
+        read by `gw_headers` (the request id) and `_record` (the rest)."""
+        self.buffered_stop_reason: str | None = None
+        """The buffered path's stop reason, from `Surface.stop_reason_from_body`
+        in `BufferedSink.send`; the streaming path's comes through `Usage`."""
         self.tenant: str | None = None
         """The admitted tenant's ID. Set by `__call__` the moment
         `resolve_tenant` answers, so every response after that point --
@@ -1542,8 +1735,16 @@ class Exchange:
         written by `_WatchedBreaker.acquire` at the instant of refusal --
         which is before the status line, so the streaming path can carry it."""
 
+    def observe_upstream(self, headers: Mapping[str, str] | None) -> None:
+        """Record the provider's self-description once; first observation
+        wins, because the first is the one from the response we are serving
+        (or the terminal error) and a later call is a retry's leftovers."""
+        if self.upstream is not None or not headers:
+            return
+        self.upstream = parse_upstream_telemetry(headers)
+
     def gw_headers(self) -> list[tuple[bytes, bytes]]:
-        return gw_headers(
+        out = gw_headers(
             policy_id=self.snapshot.id,
             catalog_id=self.catalog_id,
             workload_id=self.workload_id,
@@ -1552,6 +1753,9 @@ class Exchange:
             tenant=self.tenant,
             breaker=self.breaker,
         )
+        if self.upstream is not None and self.upstream.request_id:
+            out.append((UPSTREAM_REQUEST_ID_HEADER, _ascii(self.upstream.request_id)))
+        return out
 
 
 class PassthroughEndpoint:
@@ -1733,7 +1937,10 @@ class PassthroughEndpoint:
                 # no workload; see the module docstring for why the other way
                 # round makes every candidate unreachable.
                 plan = snapshot.plan_for(
-                    workload_id, model=None if requested is not None else facts.model
+                    workload_id, model=None if requested is not None else facts.model,
+                    # The route's dialect, so a wire id shared across dialects
+                    # (an alias, PLAN-2 A1) resolves to this surface's target.
+                    kind=self._surface.name.split("_", 1)[0],
                 )
                 # `exchange.target` is deliberately NOT pre-set to
                 # `plan.primary` here. `X-Gw-Served-By` means "the target that
@@ -1898,10 +2105,14 @@ class PassthroughEndpoint:
             # ==============================================================
             exchange.attempts = tally.opens
             exchange.target = tally.target
+            # The provider's request id, processing time and rate-limit
+            # budget, read here because this is the response being served.
+            exchange.observe_upstream(stream.headers)
             if not streaming:
                 # The buffered path sends its status from inside the sink,
                 # one write later, because that is where the length is known.
-                return BufferedSink(send, stream=stream, exchange=exchange)
+                return BufferedSink(send, stream=stream, exchange=exchange,
+                                    surface=self._surface)
             headers = response_headers(stream, exchange=exchange, streaming=True)
             # Set BEFORE the await, for the same reason `pump.py` sets its own
             # commitment flag early: a send that raises may still have put the
@@ -2026,6 +2237,9 @@ class PassthroughEndpoint:
             rec = accounting.account(result, catalog=gw.config.catalog)
             provider, model = rec.provider, rec.model
             outcome = rec.outcome.value
+            stop_reason = rec.stop_reason
+            if stop_reason is None:
+                stop_reason = normalize_stop_reason(exchange.buffered_stop_reason)
 
             # Time-to-first-event, when a content byte actually arrived: the
             # winning attempt's start to the pump's first-content instant.
@@ -2073,6 +2287,40 @@ class PassthroughEndpoint:
                         collectors.time_to_first_event(
                             provider=provider, model=model, seconds=ttfe
                         )
+                # Why the provider stopped (PLAN-2 A3). Only when it said:
+                # through `Usage` on the streaming path, through the body
+                # reader on the buffered one.
+                if stop_reason is not None:
+                    collectors.stop_reason(surface=surface, stop_reason=stop_reason)
+                # Timeouts that fired while the provider was sending liveness
+                # and no content: a queue, not an outage (A4). The pump stamps
+                # `queued` on the clock error it raised -- a `StallTimeout`
+                # in practice, since the first keep-alive satisfies the
+                # first-chunk budget -- so read the attribute, not the class.
+                # Counted per attempt, off the attempt's own error.
+                for attempt in result.attempts:
+                    if getattr(attempt.error, "queued", False):
+                        collectors.queued_at_provider(
+                            provider=attempt.target.provider.id,
+                            model=attempt.target.model.id,
+                        )
+
+            # What the upstream's headers said (A6d/e). The served response
+            # was observed at commitment; a terminal error carries its own.
+            if result.error is not None:
+                exchange.observe_upstream(result.error.upstream_headers)
+            telemetry = exchange.upstream
+            if collectors is not None and telemetry is not None and telemetry.ratelimits:
+                credential_target = exchange.target or (
+                    result.attempts[-1].target if result.attempts else None
+                )
+                if credential_target is not None:
+                    credential = credential_target.provider.key()
+                    for kind, remaining, reset_s in telemetry.ratelimits:
+                        collectors.provider_ratelimit(
+                            credential=credential, kind=kind,
+                            remaining=remaining, reset_seconds=reset_s,
+                        )
 
             capture = gw.capture
             if capture is not None:
@@ -2095,6 +2343,13 @@ class PassthroughEndpoint:
                     duration_s=duration_s,
                     error_code=None if rec.code == "none" else rec.code,
                     recorded_at=gw.clock.now(),
+                    stop_reason=stop_reason,
+                    upstream_request_id=(
+                        telemetry.request_id if telemetry is not None else None
+                    ),
+                    upstream_processing_ms=(
+                        telemetry.processing_ms if telemetry is not None else None
+                    ),
                 ))
         except Exception:  # noqa: BLE001 - the hook observes; it does not vote
             # On the cancel path this runs mid-cancellation, so a raise here
@@ -2147,6 +2402,10 @@ async def send_error(
     providers today and is an assumption rather than an observation.
     """
     body = err.upstream_body if (err.passthrough and err.upstream_status) else None
+    # The provider's request id rides on the error's headers (`upstream.py`
+    # keeps them since PLAN-2 A6d); it is the one thing a caller can quote to
+    # the provider about a failure, and `gw_headers()` emits it.
+    exchange.observe_upstream(err.upstream_headers)
     if isinstance(err, errors.AuthenticationFailed):
         # THE ONE EXCEPTION TO C4 (CONTRACTS.md C11). A 401/403 from the
         # provider means the provider rejected OUR credential -- the client

@@ -244,6 +244,42 @@ class Collectors:
             surface=self._one_of(surface, M.SURFACES, "surface", m),
         ).inc(n)
 
+    def stop_reason(self, *, surface: str, stop_reason: str) -> None:
+        """`llmgw_stop_reason_total`: why a completed response ended, already
+        folded onto `STOP_REASONS` by `metrics.normalize_stop_reason`."""
+        m = "llmgw_stop_reason_total"
+        self._by_name[m].labels(  # type: ignore[attr-defined]
+            surface=self._one_of(surface, M.SURFACES, "surface", m),
+            stop_reason=self._one_of(stop_reason, M.STOP_REASONS, "stop_reason", m),
+        ).inc()
+
+    # ---- provider signals --------------------------------------------------
+
+    def queued_at_provider(self, *, provider: str, model: str) -> None:
+        """`llmgw_queued_at_provider_total`: a first-event timeout that fired
+        after the provider had shown liveness (a queue, not an outage)."""
+        self._by_name["llmgw_queued_at_provider_total"].labels(  # type: ignore[attr-defined]
+            provider=provider, model=model,
+        ).inc()
+
+    def provider_ratelimit(
+        self, *, credential: str, kind: str,
+        remaining: float | None, reset_seconds: float | None,
+    ) -> None:
+        """The two `llmgw_provider_ratelimit_*` gauges for one credential and
+        budget kind. Either half may be absent; a header a provider did not
+        send leaves the gauge where it was."""
+        kind = self._one_of(kind, M.RATELIMIT_KINDS, "kind",
+                            "llmgw_provider_ratelimit_remaining")
+        if remaining is not None:
+            self._by_name["llmgw_provider_ratelimit_remaining"].labels(  # type: ignore[attr-defined]
+                credential=credential, kind=kind,
+            ).set(remaining)
+        if reset_seconds is not None:
+            self._by_name["llmgw_provider_ratelimit_reset_seconds"].labels(  # type: ignore[attr-defined]
+                credential=credential, kind=kind,
+            ).set(max(0.0, reset_seconds))
+
     # ---- recovery ----------------------------------------------------------
 
     def breaker_transition(self, *, provider: str, model: str, to: str) -> None:

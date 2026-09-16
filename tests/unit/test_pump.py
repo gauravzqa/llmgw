@@ -765,3 +765,107 @@ async def test_buffered_bytes_is_zero_before_and_after_a_run():
     assert pump.buffered_bytes == 0
     await pump.run(ScriptedSource(chunked(stream_bytes(OPENAI_CHAT), 37)))
     assert pump.buffered_bytes == 0
+
+
+# ================================================ queued, not dead (PLAN-2 A4)
+
+
+async def test_a_stall_after_heartbeats_with_no_content_is_marked_queued():
+    """DeepSeek holds a request for up to ten minutes sending `: keep-alive`.
+    The executor's first-event budget covers only the first CHUNK, and that
+    keep-alive arrives at once, so the timeout that ends a queued wait is the
+    pump's progress budget: a `StallTimeout` with no content ever seen. Marked
+    `queued` so the caller can keep the provider's health NEUTRAL -- a busy
+    provider is not a dead one, and five polite waits must not open a breaker."""
+    clock = ManualClock(start=0.0)
+    budgets = make_budgets(total=600.0, progress=15.0, client_stall=120.0)
+    sink = RecordingSink()
+    pump = make_pump(sink=sink, surface=OPENAI_CHAT, clock=clock, budgets=budgets)
+    source = PingForeverSource(wire.openai_comment("keep-alive"), clock=clock, gap=2.0)
+
+    task = asyncio.create_task(pump.run(source))
+    for _ in range(80):
+        if task.done():
+            break
+        await clock.advance(1.0)
+
+    with pytest.raises(E.StallTimeout) as caught:
+        await task
+    assert getattr(caught.value, "queued", False) is True
+    assert pump.liveness_before_first_event is True
+    assert pump.result.liveness_before_first_event is True
+    assert pump.result.content_events == 0
+    # The keep-alives were forwarded, so the pump IS committed: a comment is a
+    # body byte and C1 says the first byte to the client commits. That is the
+    # honest reading of today's contract and the reason `queued` can only fix
+    # the *health* of this failure, not its disposition -- once a provider's
+    # keep-alive has reached the client there is nothing to fall back to.
+    # Extending the commitment hold past heartbeat-only chunks is the
+    # executor's decision, not the pump's (PLAN-2 A4, noted for the owner).
+    assert pump.committed is True
+
+
+async def test_a_stall_with_no_heartbeats_is_not_queued():
+    """Silence is not a queue. Nothing arrived at all, so the provider gets
+    the ordinary provider-blamed stall."""
+    clock = ManualClock(start=0.0)
+    budgets = make_budgets(total=600.0, progress=15.0, client_stall=120.0)
+    sink = RecordingSink()
+    pump = make_pump(sink=sink, surface=OPENAI_CHAT, clock=clock, budgets=budgets)
+    source = PingForeverSource(b"", clock=clock, gap=1000.0)  # never yields in time
+
+    task = asyncio.create_task(pump.run(source))
+    for _ in range(40):
+        if task.done():
+            break
+        await clock.advance(1.0)
+
+    with pytest.raises(E.StallTimeout) as caught:
+        await task
+    assert getattr(caught.value, "queued", False) is False
+    assert pump.liveness_before_first_event is False
+
+
+async def test_heartbeats_then_content_is_a_normal_stream():
+    """The flag records history, not a verdict: a stream that heartbeats and
+    then produces is complete, exact, and raises nothing."""
+    frames = [wire.openai_comment(), wire.openai_heartbeat(), *wire.openai_stream()]
+    sink = RecordingSink()
+    pump = make_pump(sink=sink, surface=OPENAI_CHAT)
+    result = await pump.run(ScriptedSource(frames))
+    assert result.terminal_seen
+    assert result.liveness_before_first_event is True
+    assert result.content_events == len(wire.TOKENS)
+
+
+async def test_a_stall_after_content_is_never_queued():
+    """Once a word has been produced, a later silence is a stall in the
+    ordinary sense, whatever heartbeats preceded the first token."""
+    clock = ManualClock(start=0.0)
+    budgets = make_budgets(total=600.0, progress=5.0, client_stall=120.0)
+    sink = RecordingSink()
+    pump = make_pump(sink=sink, surface=OPENAI_CHAT, clock=clock, budgets=budgets)
+
+    class ContentThenSilence:
+        def __init__(self):
+            self._sent = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if not self._sent:
+                self._sent = True
+                return wire.openai_comment() + wire.openai_chunk("hello")
+            await clock.sleep(10_000.0)
+            raise StopAsyncIteration
+
+    task = asyncio.create_task(pump.run(ContentThenSilence()))
+    for _ in range(40):
+        if task.done():
+            break
+        await clock.advance(1.0)
+    with pytest.raises(E.StallTimeout) as caught:
+        await task
+    assert getattr(caught.value, "queued", False) is False
+    assert pump.result.content_events == 1

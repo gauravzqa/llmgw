@@ -1,0 +1,84 @@
+# llmgw CI. Three cheap tiers on every push and pull request, one free
+# reconciliation nightly. No path filter on purpose: this file works whether
+# the repository is standalone or vendored at `backend/llmgw/` (set
+# `defaults.run.working-directory` if it moves).
+#
+# The tiers mirror the Makefile so a red job is reproducible with one command:
+#   ruff      -> make lint
+#   unit      -> make unit       (tier 1: no sockets, no sleeps, ~2 s)
+#   contract  -> make contract   (tier 2: real sockets, real uvicorn, ~50 s)
+#   probe     -> make probe      (catalog vs the providers' live /models; free)
+# Chaos and scale are deliberately not here: chaos runs on merge in the
+# Makefile's own loop, scale needs a quiet 16-core box for an hour.
+
+name: ci
+
+on:
+  push:
+  pull_request:
+  schedule:
+    # Nightly catalog reconciliation. 03:17 UTC avoids the top-of-hour crowd.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_FROZEN: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  checks:
+    name: ${{ matrix.tier }}
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        tier: [ruff, unit, contract]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - name: Install from the lockfile
+        # The same resolution the image and the contract tests use. A CI that
+        # resolved fresh would test a dependency set nobody ships.
+        run: uv sync --frozen --extra dev --python 3.11
+      - name: ruff
+        if: matrix.tier == 'ruff'
+        run: uv run ruff check src tests fakes bench live
+      - name: unit
+        if: matrix.tier == 'unit'
+        run: uv run pytest tests/unit -q
+      - name: contract
+        if: matrix.tier == 'contract'
+        # Real loopback sockets and a real uvicorn; the fakes bind their own
+        # ports. `--timeout` per test is already set in pyproject.
+        run: uv run pytest tests/contract -q -m contract
+
+  probe:
+    name: catalog probe (nightly)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Allowed to fail without blocking anything: it reads the providers'
+    # model lists, which change without notice, and its job is to tell us
+    # so. A red probe is a catalog PR, not a broken build.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - run: uv sync --frozen --extra dev --python 3.11
+      - name: make probe
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: uv run python -m live.probe

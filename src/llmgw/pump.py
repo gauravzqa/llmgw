@@ -158,6 +158,15 @@ class PumpResult:
     in_stream_error: GatewayError | None
     """An `event: error` / `error` chunk inside a 200 body, if one arrived."""
 
+    liveness_before_first_event: bool = False
+    """A heartbeat (SSE comment, empty-`choices` chunk, `ping`) arrived before
+    any CONTENT event. With no content it distinguishes a provider that is
+    *queueing* the request -- DeepSeek holds a request for up to ten minutes
+    sending `: keep-alive` -- from one that is dead. The timeout that ends
+    such a wait is marked `queued=True` (see `_read`) so the caller can keep
+    its health NEUTRAL instead of feeding the breaker five polite waits in a
+    row (PLAN-2 A4)."""
+
 
 class Pump:
     """Copy one upstream stream to one client, and decide what it cost.
@@ -173,7 +182,7 @@ class Pump:
         "_parser", "_stall", "_committed", "_started", "_bytes_out", "_events",
         "_content_events", "_usage", "_terminal_seen", "_first_event_at",
         "_in_stream_error", "_last_event", "_debt", "_client_gone", "_drained",
-        "_source_ended",
+        "_source_ended", "_liveness_before_first",
     )
 
     def __init__(
@@ -212,8 +221,15 @@ class Pump:
         self._client_gone = False
         self._drained = False
         self._source_ended = False
+        self._liveness_before_first = False
 
     # ------------------------------------------------------------ inspection
+
+    @property
+    def liveness_before_first_event(self) -> bool:
+        """True once a HEARTBEAT frame has been seen with no CONTENT yet.
+        Stays True afterwards; it records that the wait was a live one."""
+        return self._liveness_before_first
 
     @property
     def committed(self) -> bool:
@@ -252,6 +268,7 @@ class Pump:
             terminal_seen=self._terminal_seen,
             first_event_at=self._first_event_at,
             in_stream_error=self._in_stream_error,
+            liveness_before_first_event=self._liveness_before_first,
         )
 
     # ------------------------------------------------------------------- run
@@ -350,10 +367,14 @@ class Pump:
         """
         try:
             while True:
-                async with phase(
-                    self._deadline, self._read_budget(), on_timeout=StallTimeout
-                ):
-                    chunk = await _next_chunk(source)
+                try:
+                    async with phase(
+                        self._deadline, self._read_budget(), on_timeout=StallTimeout
+                    ):
+                        chunk = await _next_chunk(source)
+                except StallTimeout as err:
+                    self._mark_queued(err)
+                    raise
                 if chunk is None:
                     for event in self._parser.close():
                         self._observe(event)
@@ -379,6 +400,26 @@ class Pump:
             # reader that dies without closing the buffer leaves the writer
             # parked forever and the TaskGroup unable to join.
             self._buffer.close()
+
+    def _mark_queued(self, err: GatewayError) -> None:
+        """Stamp a pre-content stall that followed heartbeats as `queued`.
+
+        The executor's `first_event` budget covers only the first *chunk*, and
+        a queueing provider's first chunk is a keep-alive that arrives at once.
+        So the timeout that actually ends a queued wait is THIS one: the
+        progress budget, with no content ever seen, raised here as
+        `StallTimeout`. Without content and with liveness observed, the
+        provider was alive and busy, not dead -- the same event as a 429 and
+        deserving the same NEUTRAL health. `queued` is set as an attribute
+        rather than passed to the constructor so this file does not depend on
+        the taxonomy having learned the keyword yet; `errors.py` reads it via
+        `getattr(err, "queued", False)`.
+        """
+        if self._first_event_at is None and self._liveness_before_first:
+            try:
+                err.queued = True  # type: ignore[attr-defined]
+            except AttributeError:  # pragma: no cover - slots on a future class
+                pass
 
     def _read_budget(self) -> float:
         """How long the next upstream read may take before we blame upstream.
@@ -416,6 +457,11 @@ class Pump:
                 self._stall.mark_progress()
                 self._debt = 0.0
             else:
+                if kind is EventKind.HEARTBEAT and self._first_event_at is None:
+                    # Recorded, not acted on: the socket is alive with nothing
+                    # generated yet. If this wait ends in a timeout, the
+                    # timeout is a queue, not a death.
+                    self._liveness_before_first = True
                 if kind is EventKind.TERMINAL:
                     self._terminal_seen = True
                 elif kind is EventKind.ERROR and self._in_stream_error is None:

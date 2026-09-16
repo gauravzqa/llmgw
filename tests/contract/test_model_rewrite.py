@@ -107,6 +107,30 @@ class Recorder:
             return [r.model for r in self.requests]
 
 
+ECHO_FIELD = "rec_echo"
+"""Opt-in, per request, carried IN THE BODY.
+
+The recorder echoes the served model id only when the client body says
+`"rec_echo": true`. A header would not survive the gateway (only an allowlist
+is forwarded); a body field does, because passthrough forwards unknown keys
+untouched -- which is itself the property being relied on. Off by default so
+the byte-exact assertions in this file keep comparing against the canonical
+`wire.MODEL` frames.
+"""
+
+
+def _requested_model(raw: bytes) -> str | None:
+    """The model to echo, or None when the request did not opt in."""
+    try:
+        parsed = json.loads(raw)
+    except ValueError:  # pragma: no cover - only if the gateway sent junk
+        return None
+    if not isinstance(parsed, dict) or parsed.get(ECHO_FIELD) is not True:
+        return None
+    model = parsed.get("model")
+    return model if isinstance(model, str) else None
+
+
 def recorder_app(recorder: Recorder) -> Starlette:
     """Both surfaces' paths, one handler, no parsing of anything that matters.
 
@@ -130,9 +154,24 @@ def recorder_app(recorder: Recorder) -> Starlette:
             if request.url.path == PATHS["anthropic"]
             else wire.openai_stream()
         )
+        # Echo the wire model the way real providers do: OpenAI answers
+        # `gpt-4o-mini-2024-07-18` to a request for `gpt-4o-mini`, and every
+        # provider puts the id it SERVED into the response. The canonical
+        # frames carry `wire.MODEL`; swapping in the id this upstream was
+        # asked for is what lets `test_alias_roundtrip.py` prove that the
+        # echoed id is acceptable on the next turn. Byte-exact everywhere
+        # else, so the equality assertions in this file still hold when the
+        # requested model is `wire.MODEL` itself.
+        requested = _requested_model(raw)
+        stream_bytes = wire.joined(frames)
+        if requested and requested != wire.MODEL:
+            stream_bytes = stream_bytes.replace(
+                json.dumps({"model": wire.MODEL})[1:-1].encode(),
+                json.dumps({"model": requested})[1:-1].encode(),
+            )
 
-        async def body():
-            yield wire.joined(frames)
+        async def body(payload: bytes = stream_bytes):
+            yield payload
 
         return StreamingResponse(body(), media_type="text/event-stream")
 
@@ -201,9 +240,10 @@ def catalog_for(base_url: str) -> Catalog:
             extra_headers={MODE_HEADER: mode}, max_concurrency=8,
         )
 
-    def spec(mid: str, provider: str, api_model: str) -> ModelSpec:
+    def spec(mid: str, provider: str, api_model: str, **extra) -> ModelSpec:
         return ModelSpec(id=mid, provider=provider, api_model=api_model,
-                         input_per_m=1.0, output_per_m=2.0, priced_at="2026-09-09")
+                         input_per_m=1.0, output_per_m=2.0, priced_at="2026-09-09",
+                         **extra)
 
     return Catalog(
         providers={
@@ -215,7 +255,13 @@ def catalog_for(base_url: str) -> Catalog:
         },
         models={
             "rec.candidate": spec("rec.candidate", "cand", CAND_WIRE),
-            "rec.incumbent": spec("rec.incumbent", "inc", INC_WIRE),
+            # The OpenAI-shaped and Anthropic-shaped incumbents share one wire
+            # string on purpose (that is the experiment above), which makes the
+            # bare wire id ambiguous. Declaring it as an alias here is the
+            # operator's tie-break, and it is what lets
+            # `test_alias_roundtrip.py` send the echoed id on a bare route
+            # without a dialect hint from the server.
+            "rec.incumbent": spec("rec.incumbent", "inc", INC_WIRE, aliases=(INC_WIRE,)),
             "rec.anth-candidate": spec("rec.anth-candidate", "anth-cand", CAND_WIRE),
             "rec.anth-incumbent": spec("rec.anth-incumbent", "anth-inc", INC_WIRE),
             # The one case where the client's string is already the wire

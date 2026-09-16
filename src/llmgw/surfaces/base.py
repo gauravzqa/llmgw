@@ -78,6 +78,82 @@ the one failure that looks like an upstream problem.
 """
 
 
+STOP_REASONS: tuple[str, ...] = (
+    "stop",
+    "length",
+    "tool_calls",
+    "content_filter",
+    "refusal",
+    "pause_turn",
+    "context_window_exceeded",
+    "provider_shed",
+    "unknown",
+)
+"""The closed set `Usage.stop_reason` draws from.
+
+Closed because it becomes a metric label (`llmgw_stop_reason_total`), and a
+label whose values a provider chooses is a label whose cardinality a provider
+chooses. Every provider value maps onto one of these; a value nobody has seen
+before is `unknown`, never itself.
+
+`provider_shed` is the one that earns the field its keep: DeepSeek's
+`insufficient_system_resource` (and `aborted`) mean the provider gave up on a
+request it had already accepted with a 200. It is the only signal that the
+provider is degrading under load, and until this field existed it was
+indistinguishable from a normal end of turn.
+"""
+
+_OPENAI_FINISH_REASONS: dict[str, str] = {
+    "stop": "stop",
+    "length": "length",
+    "tool_calls": "tool_calls",
+    "function_call": "tool_calls",
+    "content_filter": "content_filter",
+    "insufficient_system_resource": "provider_shed",
+    "aborted": "provider_shed",
+}
+
+_ANTHROPIC_STOP_REASONS: dict[str, str] = {
+    "end_turn": "stop",
+    "stop_sequence": "stop",
+    "max_tokens": "length",
+    "tool_use": "tool_calls",
+    "pause_turn": "pause_turn",
+    "refusal": "refusal",
+    "model_context_window_exceeded": "context_window_exceeded",
+}
+
+
+def normalise_openai_finish_reason(value: object) -> str | None:
+    """OpenAI-dialect `finish_reason` -> `STOP_REASONS`, or None for a null.
+
+    A non-string is `unknown` rather than None: the provider *did* stop and
+    said something we cannot read, which is different from not having stopped
+    yet. `compaction`, future values, and typos all land on `unknown` so the
+    metric never grows a label.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return "unknown"
+    return _OPENAI_FINISH_REASONS.get(value, "unknown")
+
+
+def normalise_anthropic_stop_reason(value: object) -> str | None:
+    """Anthropic `stop_reason` -> `STOP_REASONS`, or None for a null.
+
+    `compaction` maps to `unknown` on purpose: it is a bookkeeping stop in a
+    multi-iteration turn, not an answer ending, and giving it its own label
+    would suggest the gateway understands compaction accounting, which it
+    does not (PLAN-2 B3).
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return "unknown"
+    return _ANTHROPIC_STOP_REASONS.get(value, "unknown")
+
+
 class EventKind(Enum):
     """Which clock a frame is allowed to reset. This is CONTRACTS.md C7.
 
@@ -145,6 +221,22 @@ class Usage:
     `llmgw_usage_parse_failures_total`.
     """
 
+    stop_reason: str | None = None
+    """Why the model stopped, normalised to `STOP_REASONS`; None until the
+    provider said.
+
+    Before this field every finished stream was `outcome=completed`, and
+    "completed" covered an answer cut at `max_tokens`, a refusal, a context
+    window overflow and DeepSeek's `insufficient_system_resource` (a shed
+    inside a 200) exactly as well as it covered a real end of turn. An agent
+    truncated on every turn was 100% success on the dashboard. The provider
+    always said which; nothing read it. (Phase A3 of PLAN-2.)
+
+    Kept OFF `Usage.exact`: a stop reason is not a token count, and a stream
+    that reported usage but was cut before its last chunk keeps an exact bill
+    and a `None` here, which is the truth.
+    """
+
     @property
     def exact(self) -> bool:
         """The billing basis. Cost is input x price_in + output x price_out,
@@ -198,6 +290,12 @@ class Surface(Protocol):
     def apply_usage(self, ev: SSEEvent, usage: Usage) -> None: ...
     def error_from_event(self, ev: SSEEvent) -> errors.GatewayError | None: ...
     def native_ending(self, last_event: SSEEvent | None = None) -> bytes: ...
+
+    def stop_reason_from_body(self, payload: dict[str, Any]) -> str | None:
+        """The normalised stop reason of a complete, non-streamed response
+        body, or None. The buffered path has no frames for `apply_usage` to
+        see, so accounting asks the dialect directly. Never raises."""
+        ...
 
 
 # ==========================================================================

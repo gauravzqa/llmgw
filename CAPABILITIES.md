@@ -116,7 +116,7 @@ sent back, and out-of-money 429s that are retried.
 | Capability | OpenAI | Anthropic | DeepSeek | Note |
 |---|---|---|---|---|
 | 400 invalid request, unknown model, context length | S | S | S | Body sniff; `param` deliberately excluded (finding 7) |
-| 401 / 403 | S, scrubbed | S, scrubbed | S, scrubbed | 403 region block lumped with bad key; same outcome, low impact |
+| 401 / 403 | S, scrubbed | S, scrubbed | S, scrubbed | 403 is provider-scoped since Phase A (`forbidden_means`: auth, rate_limit, policy); the default `auth` is right for these three providers |
 | 402 | – | S | S | `InsufficientCredits`: no retry-same, try-next, POLICY blame |
 | **Out-of-money as 429** | **U: `credit_balance_exhausted`, spend and usage limit codes retried as `RateLimited`** | **U: `enforced_spend_limit_reached` (no `retry-after`) retried** | – | Same bug class as finding 8 on two more providers |
 | 404 | S | S | S | |

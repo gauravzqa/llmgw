@@ -135,6 +135,9 @@ def live_catalog(base: Catalog = DEFAULT_CATALOG) -> Catalog:
     identity_model = replace(
         base.models["anthropic.haiku-4-5"], id=IDENTITY_MODEL_ID,
         provider=IDENTITY_PROVIDER,
+        # A derived row must not inherit the source row's declared aliases:
+        # one alias claimed by two catalog ids is a construction error (A1).
+        aliases=(),
     )
     openai_provider = ProviderConn(
         id=OPENAI_PROVIDER, kind="openai", base_url="https://api.openai.com/v1",
@@ -558,6 +561,34 @@ STREAM_WORKLOADS = ("anthropic", "anthropic-identity", "deepseek", "openai",
 FALLBACK_WORKLOADS = ("fallback", "fallback-schema")
 
 
+def echo_roundtrip(gw: GatewayServer, *, out=sys.stdout) -> None:
+    """The two-turn loop against a real provider (PLAN-2 A1, finding 42).
+
+    Turn one names the catalog id. OpenAI answers with the snapshot id it
+    served (`gpt-4o-mini-2024-07-18` on 16 Sep 2026). Turn two sends that id
+    back exactly as an SDK's conversation object would. Before aliases the
+    second call was `400 policy_error: unknown model`; now it must route to the
+    same target. Two buffered calls, a few tokens each.
+    """
+    route = f"/workloads/openai{ROUTE_FOR['openai_chat']}"
+    body = body_for(OPENAI_CHAT, stream=False)
+    body["model"] = OPENAI_MODEL_ID
+    first = httpx.post(f"{gw.base_url}{route}", json=body, timeout=60)
+    echoed = first.json().get("model") if first.status_code == 200 else None
+    print(f"  echo-roundtrip turn 1: {first.status_code} model={echoed!r}", file=out)
+    if not echoed:
+        print("  echo-roundtrip: FAIL (turn 1 did not return a model)", file=out)
+        return
+    body["model"] = echoed
+    second = httpx.post(f"{gw.base_url}{ROUTE_FOR['openai_chat']}", json=body, timeout=60)
+    served = second.headers.get("x-gw-served-by")
+    verdict = "PASS" if second.status_code == 200 else "FAIL"
+    print(f"  echo-roundtrip turn 2 (model={echoed!r}): {second.status_code} "
+          f"served_by={served} -> {verdict}", file=out)
+    if second.status_code != 200:
+        print(f"    {second.text[:300]}", file=out)
+
+
 def run(*, spend: bool = True, out=sys.stdout) -> list[Measured]:
     catalog = live_catalog()
     results: list[Measured] = []
@@ -584,6 +615,8 @@ def run(*, spend: bool = True, out=sys.stdout) -> list[Measured]:
                 results.append(measure(
                     gw, wl, stream=False, catalog=catalog, model_id=MODEL_OF[wl],
                     label=f"{wl}/non-streaming"))
+
+            echo_roundtrip(gw, out=out)
 
             # ---- Task 3: fallback across two real providers, raw socket ----
             for wl in FALLBACK_WORKLOADS:

@@ -40,8 +40,8 @@ See [bench/results/live_smoke.md](bench/results/live_smoke.md).
 
 ```bash
 make venv      # uv venv + editable install
-make test      # tier 1: 917 tests, no sockets, no sleeps.  ~1.9s
-make contract  # tier 2: 150 tests, real sockets + real uvicorn. ~50s
+make test      # tier 1: 1013 tests, no sockets, no sleeps.  ~1.9s
+make contract  # tier 2: 165 tests, real sockets + real uvicorn. ~57s
 make chaos     # tier 3:  22 tests, randomized faults + invariants. ~60s
 make live      # tier 4:  10 tests, REAL providers, real money (~$0.0002)
 make trace     # walk one real stream through every layer
@@ -123,7 +123,8 @@ the leading hypothesis.
 
 | Report | What it holds |
 |---|---|
-| [load-S1-gw4-run.md](bench/results/load-S1-gw4-run.md) | 400 rps short calls: the per-request overhead floor |
+| [load-S1-gw4-run.md](bench/results/load-S1-gw4-run.md) | 400 rps short calls: the per-request overhead floor (16 Sep, after Phase A: +0.37 ms p50) |
+| [load-S1-gw4-run-20260910-baseline.md](bench/results/load-S1-gw4-run-20260910-baseline.md) | the same on 10 Sep (+1.04 ms p50) |
 | [load-S2-cap150-gw4-run.md](bench/results/load-S2-cap150-gw4-run.md) | 2,500 typical streams with the cap at 150: shed before degrade (15 Sep) |
 | [load-S2-cap300-gw4-run.md](bench/results/load-S2-cap300-gw4-run.md) | the same at 300: the cap holds, the CPU does not (15 Sep) |
 | [load-S2-gw4-run-20260910-baseline.md](bench/results/load-S2-gw4-run-20260910-baseline.md) | 2,500 typical streams, no cap: the event-throughput ceiling (10 Sep) |
@@ -133,7 +134,8 @@ the leading hypothesis.
 | [load-S5-gw4-run.md](bench/results/load-S5-gw4-run.md) | slow clients: backpressure |
 | [load-S6-gw4-run.md](bench/results/load-S6-gw4-run.md) | one hot tenant: isolation |
 | [load-S7-gw4-run.md](bench/results/load-S7-gw4-run.md) | provider killed mid-stream: breaker open and close |
-| [load-S8A-gw4-run.md](bench/results/load-S8A-gw4-run.md) | deploy under load, grace longer than the streams: zero cuts, exit at last stream end (15 Sep) |
+| [load-S8A-gw4-run.md](bench/results/load-S8A-gw4-run.md) | deploy under load, grace longer than the streams: zero cuts, exit at last stream end (16 Sep, after Phase A) |
+| [load-S8A-gw4-run-20260915.md](bench/results/load-S8A-gw4-run-20260915.md) | the same on 15 Sep |
 | [load-S8B-gw4-run.md](bench/results/load-S8B-gw4-run.md) | deploy under load, grace shorter than the streams: exit at grace + 3 s, cuts counted (15 Sep) |
 | [load-S8-gw4-run-20260910-baseline.md](bench/results/load-S8-gw4-run-20260910-baseline.md) | the 10 Sep drain that never exited |
 | [preliminary-S1S2S3.md](bench/results/preliminary-S1S2S3.md) | the single-process night, with the wedge |

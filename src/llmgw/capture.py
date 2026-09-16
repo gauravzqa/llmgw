@@ -122,6 +122,22 @@ class CaptureRecord:
     """When the record was cut, from the injected clock. Optional so a caller
     that has not wired a clock through still produces a valid line."""
 
+    stop_reason: str | None = None
+    """Why the provider ended a completed response (`metrics.STOP_REASONS`),
+    or None when it said nothing. `length` here and `completed` above is the
+    truncated-agent case a dashboard cannot see (PLAN-2 A3)."""
+
+    upstream_request_id: str | None = None
+    """The provider's own request id (`x-request-id`, `request-id`,
+    `x-inworld-request-id`), the one thing a support ticket to the provider
+    needs and the one thing the response-header allowlist used to drop. Also
+    returned to the client as `X-Gw-Upstream-Request-Id` (PLAN-2 A6d)."""
+
+    upstream_processing_ms: float | None = None
+    """The provider's self-reported server time (`openai-processing-ms`,
+    `x-envoy-upstream-service-time`). Against `first_event_latency` it splits
+    provider time from gateway-plus-network time for free."""
+
     def to_bytes(self) -> bytes:
         """Serialize to ONE JSON line with a trailing newline.
 

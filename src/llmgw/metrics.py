@@ -77,6 +77,75 @@ DENIAL_REASONS: tuple[str, ...] = (
 TOKEN_KINDS: tuple[str, ...] = ("input", "output", "cache_read", "cache_write")
 COST_BASIS: tuple[str, ...] = ("exact", "estimated")
 
+STOP_REASONS: tuple[str, ...] = (
+    "stop",
+    "length",
+    "tool_calls",
+    "content_filter",
+    "refusal",
+    "pause_turn",
+    "context_window_exceeded",
+    "provider_shed",
+    "unknown",
+)
+"""Why a completed response ended, as a closed vocabulary across dialects.
+
+Until PLAN-2 A3 the gateway never read `finish_reason` (OpenAI dialect) or
+`stop_reason` (Anthropic), so a response truncated at `max_tokens` on every
+turn, a refusal, a `pause_turn`, and DeepSeek's `insufficient_system_resource`
+-- a provider shedding load INSIDE a 200 -- all counted as `completed`. The
+vocabulary is the union of the three providers' values folded onto one
+axis; `STOP_REASON_ALIASES` is the fold. `provider_shed` is the one value that
+also feeds the breaker (it is a provider refusing work), which is why it is a
+metric label and not only a capture field."""
+
+STOP_REASON_ALIASES: dict[str, str] = {
+    # OpenAI dialect `finish_reason`
+    "stop": "stop",
+    "length": "length",
+    "tool_calls": "tool_calls",
+    "function_call": "tool_calls",
+    "content_filter": "content_filter",
+    # Anthropic `stop_reason`
+    "end_turn": "stop",
+    "stop_sequence": "stop",
+    "max_tokens": "length",
+    "tool_use": "tool_calls",
+    "pause_turn": "pause_turn",
+    "refusal": "refusal",
+    "model_context_window_exceeded": "context_window_exceeded",
+    "compaction": "stop",
+    # DeepSeek extensions to the OpenAI dialect
+    "insufficient_system_resource": "provider_shed",
+    "aborted": "provider_shed",
+    # The canonical names fold onto themselves, so a value a surface has
+    # already normalised (`surfaces.base`) passes through unchanged.
+    **{reason: reason for reason in STOP_REASONS},
+}
+
+
+def normalize_stop_reason(raw: object) -> str | None:
+    """Fold a provider's stop/finish reason onto `STOP_REASONS`.
+
+    `None` for "the provider said nothing" (a cut stream, a buffered path
+    that does not parse it), `"unknown"` for a value the fold has never seen
+    -- which is a counter you can alert on, not a label you can blow open.
+    """
+    if raw is None:
+        return None
+    text = str(raw).strip().lower()
+    if not text:
+        return None
+    return STOP_REASON_ALIASES.get(text, "unknown")
+
+
+RATELIMIT_KINDS: tuple[str, ...] = ("requests", "tokens", "input_tokens", "output_tokens")
+"""The per-credential budgets providers report in response headers:
+`x-ratelimit-remaining-{requests,tokens}` (OpenAI dialect) and
+`anthropic-ratelimit-{requests,tokens,input-tokens,output-tokens}-remaining`.
+Read into gauges labelled by the catalog CREDENTIAL id (bounded by the
+catalog, like `provider`), never forwarded to a client (PLAN-2 A6e)."""
+
 # Sized for an LLM gateway, not for a web service. The default Prometheus
 # buckets top out at 10s, which would put every streaming request in +Inf and
 # make the histogram useless for exactly the requests we care most about.
@@ -117,6 +186,10 @@ class MetricSpec:
                 total *= providers
             elif label == "model":
                 total *= models
+            elif label == "credential":
+                # One credential per provider row at most; shared keys
+                # (openrouter + openrouter-toolsafe) make it fewer.
+                total *= providers
             else:  # pragma: no cover - guarded by test_metrics
                 raise ValueError(
                     f"{self.name}: label {label!r} has no bounded value set. "
@@ -286,6 +359,42 @@ METRICS: tuple[MetricSpec, ...] = (
         "cannot distinguish the two is a bill you cannot defend.",
         labels=("provider", "model", "basis"),
         label_values=((), (), COST_BASIS),
+    ),
+    MetricSpec(
+        "llmgw_stop_reason_total",
+        "counter",
+        "Why completed responses ended, folded onto one vocabulary. `length` "
+        "on every turn is an agent truncated at max_tokens that reports 100% "
+        "success everywhere else; `provider_shed` is a provider refusing work "
+        "inside a 200.",
+        labels=("surface", "stop_reason"),
+        label_values=(SURFACES, STOP_REASONS),
+    ),
+    # ---- provider signals ------------------------------------------------
+    MetricSpec(
+        "llmgw_queued_at_provider_total",
+        "counter",
+        "First-event timeouts that fired while the provider was sending "
+        "liveness (comments, pings, empty frames): a queue, not an outage. "
+        "NEUTRAL to the breaker; this counter is the only place the wait shows.",
+        labels=("provider", "model"),
+    ),
+    MetricSpec(
+        "llmgw_provider_ratelimit_remaining",
+        "gauge",
+        "The provider's own remaining budget for a credential, from its "
+        "rate-limit response headers. The early-warning signal a 429 arrives "
+        "too late to give; never forwarded to clients.",
+        labels=("credential", "kind"),
+        label_values=((), RATELIMIT_KINDS),
+    ),
+    MetricSpec(
+        "llmgw_provider_ratelimit_reset_seconds",
+        "gauge",
+        "Seconds until the provider's budget for a credential refills, per "
+        "its rate-limit response headers.",
+        labels=("credential", "kind"),
+        label_values=((), RATELIMIT_KINDS),
     ),
     # ---- lifecycle ---------------------------------------------------------
     MetricSpec(
