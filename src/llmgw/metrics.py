@@ -70,6 +70,9 @@ DENIAL_REASONS: tuple[str, ...] = (
     "provider_key_concurrency",
     "tpm_reservation",
     "draining",
+    # Per-process stream cap (`ServerConfig.max_streams`): the process-wide
+    # shed, next to `draining`, and like it not a tenant's budget.
+    "overloaded",
 )
 TOKEN_KINDS: tuple[str, ...] = ("input", "output", "cache_read", "cache_write")
 COST_BASIS: tuple[str, ...] = ("exact", "estimated")

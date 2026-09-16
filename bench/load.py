@@ -74,13 +74,28 @@ import socket
 import statistics
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
 
 import httpx
 
+from bench._gwproc import (
+    budget_total_from_env,
+    drain_allow_short_from_env,
+    drain_grace_from_env,
+    fleet_mode,
+)
 from bench.scenarios import SCENARIOS, Scenario
+
+# Deliberately NOT `from llmgw.server.lifecycle import UVICORN_SHUTDOWN_TIMEOUT_S`
+# at module level. `lifecycle` imports `llmgw.server.app`, whose module-level
+# `app = build_app(ServerConfig.from_env())` builds a whole throwaway Gateway
+# on import -- in this driver and again in every load-generator process it
+# forks, each one logging the "bearer tokens are not checked" warning. The
+# load generators must not construct the system under test. S8 is the only
+# consumer of the constant, so it imports it lazily; see `_uvicorn_shutdown_s`.
 
 # --------------------------------------------------------------------------
 # Mergeable log-scaled histogram
@@ -256,6 +271,14 @@ class WorkerResult:
     ttfe: dict
     total: dict
     gaps: dict
+    # The two halves of a "client error", kept apart because a deploy verdict
+    # scores only one of them. A request that had received at least one byte
+    # and then saw a transport error, or a 200 whose body did not end with the
+    # surface's terminator, was CUT mid-stream. A request that never got a
+    # byte -- connect refused, a 503 `draining`, a timeout with nothing read --
+    # was REFUSED, which is what a closed listener is supposed to do.
+    cut_midstream: int = 0
+    refused_before_byte: int = 0
 
 
 def _classify_error(exc: BaseException) -> str:
@@ -294,7 +317,7 @@ async def _worker_main(spec: WorkerSpec) -> WorkerResult:
     ttfe = LogHistogram()
     total = LogHistogram()
     gaps = LogHistogram()
-    counters = dict(started=0, ok=0, error=0, late=0, bytes=0)
+    counters = dict(started=0, ok=0, error=0, late=0, bytes=0, cut=0, refused=0)
     errors_by_kind: dict[str, int] = {}
     status_counts: dict[str, int] = {}
     gw_headers_holder: dict = {"seen": None, "d_has_x_gw": None}
@@ -335,11 +358,13 @@ async def _worker_main(spec: WorkerSpec) -> WorkerResult:
             hdrs["X-Fake-Mode"] = flip
         url = next_url()
         t0 = time.perf_counter()
+        got_byte = False
         try:
             if spec.streaming:
                 first: float | None = None
                 last: float | None = None
                 nbytes = 0
+                tail = b""
                 read_budget_t = t0
                 async with client.stream("POST", url, json=spec.body,
                                          headers=hdrs) as r:
@@ -356,6 +381,10 @@ async def _worker_main(spec: WorkerSpec) -> WorkerResult:
                             continue
                         now = time.perf_counter()
                         nbytes += len(chunk)
+                        got_byte = True
+                        # Only the last few bytes are kept: enough to see the
+                        # `data: [DONE]` terminator, no per-event bookkeeping.
+                        tail = (tail + chunk)[-32:]
                         if first is None:
                             first = now
                             if measuring:
@@ -374,8 +403,16 @@ async def _worker_main(spec: WorkerSpec) -> WorkerResult:
                                 await asyncio.sleep(sleep)
                 if r.status_code == 200:
                     counters["ok"] += 1
+                    if not tail.rstrip().endswith(b"[DONE]"):
+                        # 200, no transport error, but the body did not end
+                        # with the terminator: the stream was closed early --
+                        # the native post-commit ending. That is a CUT, and
+                        # the only way a drain's residual reaches the client
+                        # without raising.
+                        counters["cut"] += 1
                 else:
                     counters["error"] += 1
+                    counters["refused"] += 1
                 counters["bytes"] += nbytes
                 if measuring:
                     total.record(time.perf_counter() - t0)
@@ -398,11 +435,16 @@ async def _worker_main(spec: WorkerSpec) -> WorkerResult:
                         total.record(dt)
                 else:
                     counters["error"] += 1
+                    counters["refused"] += 1
                 counters["bytes"] += len(r.content)
         except Exception as exc:
             counters["error"] += 1
             kind = _classify_error(exc)
             errors_by_kind[kind] = errors_by_kind.get(kind, 0) + 1
+            if got_byte:
+                counters["cut"] += 1
+            else:
+                counters["refused"] += 1
         finally:
             inflight -= 1
 
@@ -453,6 +495,7 @@ async def _worker_main(spec: WorkerSpec) -> WorkerResult:
         peak_inflight=peak_inflight, bytes_total=counters["bytes"],
         gw_headers=gw_headers_holder["seen"], d_has_x_gw=gw_headers_holder["d_has_x_gw"],
         ttfe=ttfe.to_dict(), total=total.to_dict(), gaps=gaps.to_dict(),
+        cut_midstream=counters["cut"], refused_before_byte=counters["refused"],
     )
 
 
@@ -802,6 +845,7 @@ class Fleet:
     anthropic_port: int
     gw_ports: list[int]
     fake_workers: int = 1
+    gw_logs: tuple[str, ...] = ()
 
     @property
     def gw_proc(self) -> subprocess.Popen:
@@ -912,6 +956,14 @@ def launch_fleet(*, unlimited: bool, tenants_file: str | None,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     gws: list[subprocess.Popen] = []
+    # Worker stderr goes to a FILE, never to a pipe nobody reads. A pipe holds
+    # 64 KiB; uvicorn writes a traceback per stream it cancels at the end of a
+    # drain, so the first drain that cuts a few dozen streams fills the pipe
+    # and the worker blocks on write(2) inside its logging handler -- and a
+    # process blocked in a log call cannot exit. That, not the drain, was the
+    # "still running after 60s" in the 10 Sep S8 report and the 15 Sep arm B.
+    log_dir = tempfile.mkdtemp(prefix="llmgw-bench-gw-")
+    gw_logs: list[str] = []
     for port in gw_ports:
         env_gw = dict(env)
         env_gw.update(
@@ -922,25 +974,52 @@ def launch_fleet(*, unlimited: bool, tenants_file: str | None,
         )
         if tenants_file:
             env_gw["BENCH_GW_TENANTS_FILE"] = tenants_file
-        gws.append(subprocess.Popen(
-            [sys.executable, "-m", "bench._gwproc"],
-            cwd=root, env=env_gw, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL,
-        ))
+        log_path = os.path.join(log_dir, f"gw-{port}.stderr")
+        with open(log_path, "wb") as err:
+            gws.append(subprocess.Popen(
+                [sys.executable, "-m", "bench._gwproc"],
+                cwd=root, env=env_gw, stderr=err, stdout=subprocess.DEVNULL,
+            ))
+        gw_logs.append(log_path)
     fleet = Fleet(fake, gws, openai_port, anthropic_port, gw_ports,
-                  fake_workers=fake_workers)
+                  fake_workers=fake_workers, gw_logs=tuple(gw_logs))
     _LIVE_FLEET_REFS[id(fleet)] = fleet
     if not _wait_http(f"{fleet.fake_base}/__stats", 15.0):
         fleet.stop()
         raise RuntimeError("fake upstream failed to start")
     # The workers boot concurrently; the wait budget is shared, not per-worker.
+    # Readiness is /healthz 200 (the same probe a load balancer uses), and a
+    # worker that EXITS before it is ready fails the launch immediately with
+    # its own words -- `BENCH_GW_REFUSED: ...` from bench/_gwproc.py when
+    # `validated()` rejected the config -- rather than after the timeout.
     deadline = time.monotonic() + 20.0 + 5.0 * (gw_workers - 1)
-    for gw, url in zip(gws, fleet.metrics_urls, strict=True):
-        if not _wait_http(url, max(1.0, deadline - time.monotonic())):
-            err = gw.stderr.read().decode(errors="replace") if gw.stderr else ""
+    for gw, base, log_path in zip(gws, fleet.gw_bases, gw_logs, strict=True):
+        err = _wait_worker(gw, f"{base}/healthz", max(1.0, deadline - time.monotonic()),
+                           log_path)
+        if err is not None:
             fleet.stop()
-            raise RuntimeError(f"gateway worker pid={gw.pid} failed to start; "
-                               f"stderr:\n{err[:2000]}")
+            raise RuntimeError(f"gateway worker pid={gw.pid} {err}")
     return fleet
+
+
+def _wait_worker(gw: subprocess.Popen, healthz_url: str, timeout: float,
+                 log_path: str) -> str | None:
+    """None once `healthz_url` answers 200; else why not (exited, or timed out)."""
+    deadline = time.monotonic() + timeout
+    with httpx.Client(timeout=2.0) as c:
+        while time.monotonic() < deadline:
+            if gw.poll() is not None:
+                with open(log_path, "rb") as f:
+                    err = f.read().decode(errors="replace")
+                return (f"exited with code {gw.returncode} before it was ready; "
+                        f"stderr:\n{err[-2000:]}")
+            try:
+                if c.get(healthz_url).status_code == 200:
+                    return None
+            except Exception:
+                pass
+            time.sleep(0.1)
+    return f"did not answer 200 on {healthz_url} within {timeout:.0f}s"
 
 
 def fake_total(fake_base: str) -> int:
@@ -975,6 +1054,8 @@ class ArmResult:
     samples: dict
     wall_s: float
     fake_requests: int
+    cut_midstream: int = 0
+    refused_before_byte: int = 0
 
 
 def run_arm(*, arm: str, url: str, scenario: Scenario, rate: float, workers: int,
@@ -1078,6 +1159,8 @@ def run_arm(*, arm: str, url: str, scenario: Scenario, rate: float, workers: int
         ttfe=ttfe, total=total, gaps=gaps,
         samples=_agg_samples(sampler.samples) if sampler else {},
         wall_s=wall, fake_requests=fake_after - fake_before,
+        cut_midstream=sum(r.cut_midstream for r in results),
+        refused_before_byte=sum(r.refused_before_byte for r in results),
     )
 
 
@@ -1224,12 +1307,16 @@ def env_snapshot(*, gw_workers: int = 1, fake_workers: int = 1) -> dict:
         "ts": time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime()),
         "gw_workers": gw_workers,
         "fake_workers": fake_workers,
+        # The deploy/overload knobs the fleet booted with, so every report's
+        # header says which S8 arm ran and what open-stream cap was in force.
+        **fleet_mode().as_dict(),
     }
 
 
 def _fleet_line(fleet: Fleet) -> str:
+    logs = f" gw_logs={os.path.dirname(fleet.gw_logs[0])}" if fleet.gw_logs else ""
     return (f"[fleet] fake={fleet.fake_base} (x{fleet.fake_workers}) "
-            f"gw={','.join(fleet.gw_bases)} gw_pids={fleet.gw_pids}")
+            f"gw={','.join(fleet.gw_bases)} gw_pids={fleet.gw_pids}{logs}")
 
 
 def run_scenario(scenario: Scenario, *, warm_s: float, measure_s: float,
@@ -1393,6 +1480,15 @@ def run_s6_isolation(scenario: Scenario, *, warm_s: float, measure_s: float,
     return "\n".join(out)
 
 
+def _uvicorn_shutdown_s() -> float:
+    """uvicorn's post-drain wait bound, imported only when S8 needs it.
+
+    Lazy so that importing this module (and forking load generators from it)
+    never imports `llmgw.server.app` -- see the note next to the imports."""
+    from llmgw.server.lifecycle import UVICORN_SHUTDOWN_TIMEOUT_S
+    return UVICORN_SHUTDOWN_TIMEOUT_S
+
+
 def run_s8_deploy(scenario: Scenario, *, warm_s: float, measure_s: float,
                   workers: int, rate: float, sample_interval: float,
                   gw_workers: int = 1, fake_workers: int = 1) -> str:
@@ -1423,28 +1519,46 @@ def run_s8_deploy(scenario: Scenario, *, warm_s: float, measure_s: float,
            f"env: {json.dumps(env, default=str)}", ""]
     at = scenario.deploy_sigterm_at or 60.0
 
+    # The drain contract the fleet was booted with. bench/_gwproc.py reads the
+    # same env, so the verdict is judged against what was actually configured
+    # rather than a constant here that could drift from it.
+    grace = drain_grace_from_env()
+    total_budget = budget_total_from_env()
+    stream_len = float(scenario.events or 0) * float(scenario.interval or 0.0)
+    # A worker must be GONE within the grace plus uvicorn's own bounded
+    # shutdown; the slack covers lifespan teardown and interpreter exit on a
+    # loaded laptop. The wait runs well past that so a slow exit is MEASURED,
+    # not truncated -- the old fixed 60 s wait is what printed "still running"
+    # against a 30 s grace and hid that the process never exited at all.
+    uvicorn_shutdown_s = _uvicorn_shutdown_s()
+    exit_expected = grace + uvicorn_shutdown_s + 5.0
+    exit_wait = exit_expected + 15.0
+    deploy_at_abs = time.monotonic() + warm_s + at
+    exit_times: dict[int, float | None] = {}
+    signalled: list[int] = []
+
     def deploy() -> None:
-        time.sleep(warm_s + at)
+        time.sleep(max(0.0, deploy_at_abs - time.monotonic()))
         targets = [p for p in fleet.gw_procs if p.poll() is None]
+        signalled.extend(p.pid for p in targets)
         if not targets:
             return
         t0 = time.monotonic()
         for p in targets:
             p.send_signal(signal.SIGTERM)
-        exits: list[str] = []
-        deadline = t0 + scenario.timeout_s
-        for p in targets:
-            try:
-                p.wait(timeout=max(0.0, deadline - time.monotonic()))
-                exits.append(f"pid {p.pid}: {time.monotonic()-t0:.2f}s")
-            except subprocess.TimeoutExpired:
-                exits.append(f"pid {p.pid}: still running after {scenario.timeout_s}s")
-        # `wait` returns in list order, so the elapsed time on the last entry
-        # that exited is the fleet drain duration (max over workers).
-        out.append(f"- SIGTERM sent to {len(targets)} gateway worker(s) at "
-                   f"measure+{at}s; fleet fully exited after "
-                   f"{time.monotonic()-t0:.2f}s (drain duration = max over workers)")
-        out.append(f"- per-worker exit: {'; '.join(exits)}")
+        # Poll, rather than `wait()` in list order: a sequential wait stamps a
+        # worker that exited early with the exit time of the slowest worker
+        # ahead of it in the list.
+        pending = list(targets)
+        deadline = t0 + exit_wait
+        while pending and time.monotonic() < deadline:
+            for p in list(pending):
+                if p.poll() is not None:
+                    exit_times[p.pid] = time.monotonic() - t0
+                    pending.remove(p)
+            time.sleep(0.05)
+        for p in pending:
+            exit_times[p.pid] = None
 
     try:
         deployer = threading.Thread(target=deploy, daemon=True)
@@ -1455,19 +1569,51 @@ def run_s8_deploy(scenario: Scenario, *, warm_s: float, measure_s: float,
                     warm_s=warm_s, measure_s=measure_s, fleet=fleet,
                     sample_interval=sample_interval,
                     headers=scenario.gateway_headers())
-        deployer.join(timeout=scenario.timeout_s + 10)
+        deployer.join(timeout=max(0.0, deploy_at_abs + exit_wait - time.monotonic()) + 10)
     finally:
         fleet.stop()
 
-    cut = sum(v for k, v in g.errors_by_kind.items()
-              if k in ("connect", "protocol") or k.startswith("os:"))
+    exited = [t for t in exit_times.values() if t is not None]
+    fleet_exit = max(exited) if exited else None
+    all_exited = bool(exit_times) and len(exited) == len(exit_times)
+    exit_ok = all_exited and fleet_exit is not None and fleet_exit <= exit_expected
+    per_worker = "; ".join(
+        (f"pid {pid}: {t:.2f}s" if t is not None
+         else f"pid {pid}: STILL RUNNING after {exit_wait:.0f}s")
+        for pid, t in exit_times.items()
+    ) or "none"
+    # The PLAN target -- zero cut streams -- is a claim about a grace sized
+    # above the stream length (arm A). With a grace deliberately shorter than
+    # the stream (arm B) cuts are the documented residual, and what is scored
+    # is only that the process exits on time.
+    cut_target_applies = grace >= stream_len
+    cut_ok = g.cut_midstream == 0
+    verdict = "PASS" if exit_ok and (cut_ok or not cut_target_applies) else "FAIL"
+
     out.append("")
     out.append(arm_tables(g))
     out.append("")
     out.append("## Drain verdict")
-    out.append(f"- client transport errors (cut streams): {cut} "
-               f"(target: 0); error breakdown: {g.errors_by_kind}")
-    out.append(f"- status mix: {g.status_counts}")
+    arm_label = ("A (grace >= stream: zero cuts expected)" if cut_target_applies
+                 else "B (grace < stream: cuts are the residual)")
+    out.append(f"- config: drain_grace={grace:.1f}s budget_total={total_budget:.1f}s "
+               f"allow_short={drain_allow_short_from_env()} "
+               f"stream_length={stream_len:.1f}s "
+               f"uvicorn_shutdown_timeout={uvicorn_shutdown_s:.1f}s "
+               f"-> arm {arm_label}")
+    out.append(f"- SIGTERM sent to {len(signalled)} gateway worker(s) at measure+{at}s; "
+               f"fleet fully exited after "
+               f"{f'{fleet_exit:.2f}s' if all_exited and fleet_exit is not None else 'NEVER'} "
+               f"(expected <= {exit_expected:.1f}s) -> {'OK' if exit_ok else 'FAIL'}")
+    out.append(f"- per-worker exit: {per_worker}")
+    out.append(f"- in-flight streams CUT (had >= 1 byte, then a transport error or no "
+               f"`data: [DONE]`): {g.cut_midstream} "
+               f"(PLAN target: 0{'' if cut_target_applies else ', not scored in arm B'})")
+    out.append(f"- arrivals REFUSED before a byte (connect refused after the listener "
+               f"closed, 503 draining, timeouts with nothing read): "
+               f"{g.refused_before_byte} (expected once the fleet is gone; not a cut)")
+    out.append(f"- error breakdown: {g.errors_by_kind}; status mix: {g.status_counts}")
+    out.append(f"- verdict: {verdict}")
     return "\n".join(out)
 
 

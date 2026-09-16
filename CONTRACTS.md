@@ -184,3 +184,25 @@ healthy providers — at exactly the moment you need those providers most.
 
 *Enforced by:* `breaker_ignores_client_cancel`,
 `test_client_faults_never_blame_the_provider`.
+
+---
+
+### C9 — The process sheds before it saturates
+
+A request that would take the process over `max_streams` is refused at
+ingress with 503 `overloaded` and `Retry-After: 1`: after the tenant is
+resolved and before its bucket is touched, before the body is read, before
+any upstream connection is opened. Streams already open are never affected.
+`/healthz`, `/metrics` and `/probe` are outside the cap.
+
+The load campaign's S2 measured the alternative: four processes went from
+29 ms to 2.6 s first-event latency at p50 and only then began returning
+504s. A proxy whose overload behaviour is "get slow, then fail" has made
+every client's timeout its own load shedder, at the worst possible point in
+the request. Refusing the (N+1)th stream is cheap and honest; serving it
+badly is neither. The 503 says "another replica", not "later": a tenant shed
+here is under its own limits and did nothing wrong.
+
+*Enforced by:* `test_the_request_over_the_cap_is_shed_before_any_upstream_work`,
+`test_a_slot_freed_by_a_finished_stream_admits_the_next_request`,
+`test_shed_is_counted_under_overloaded_and_costs_no_tenant_credit`.

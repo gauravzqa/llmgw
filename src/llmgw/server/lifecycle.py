@@ -15,7 +15,9 @@ The shape instead is a *sequence*, and the order is the whole contract:
        the requests that race that transition with a 503 "draining".
     2. WAIT for the in-flight streams to finish, bounded by the grace.
     3. only THEN tell uvicorn to exit, so its own shutdown cancels whatever is
-       left -- which, if the grace was sized right, is nothing.
+       left -- which, if the grace was sized right, is nothing -- and does so
+       within a SHORT bound (`UVICORN_SHUTDOWN_TIMEOUT_S`), never by waiting
+       on the leftovers a second time.
 
 Steps 1 and 2 are `Gateway.begin_drain()`. This file owns step 3 and the
 signal plumbing: it replaces uvicorn's default handlers (which would do the
@@ -68,6 +70,23 @@ log = logging.getLogger("llmgw.server.lifecycle")
 # the same handler.
 _DRAIN_SIGNALS: tuple[signal.Signals, ...] = (signal.SIGTERM, signal.SIGINT)
 
+# How long uvicorn's OWN shutdown may wait for open connections once
+# `should_exit` flips. By then `Gateway.begin_drain` has already waited the
+# full grace; whatever is still open is the documented residual and must be
+# cut NOW, not waited on a second time. uvicorn's default is None -- wait
+# forever -- and that is exactly how S8 (10 Sep) ended with four workers
+# "still running" long after a 30 s grace against 100 s streams: the grace
+# expired, `should_exit` was set, and uvicorn then sat on the open streams
+# until the bench gave up. In production that second wait is ended by the
+# orchestrator's SIGKILL, so every stream longer than the grace would be
+# killed mid-write instead of closed with its native ending, and the process
+# would never exit on its own. A few seconds is enough for those endings to
+# flush and for the lifespan shutdown to close the upstream pool. The deploy
+# arithmetic is therefore:
+#
+#     budgets.total <= drain_grace < drain_grace + this < kill_timeout
+UVICORN_SHUTDOWN_TIMEOUT_S: float = 3.0
+
 
 class _DrainingServer(uvicorn.Server):
     """`uvicorn.Server` with its own signal capture disabled.
@@ -86,6 +105,47 @@ class _DrainingServer(uvicorn.Server):
         yield
 
 
+_C2_ENDING_MESSAGE = "ASGI callable returned without completing response."
+"""uvicorn's name for the way this gateway ends a committed stream it cannot
+finish.
+
+CONTRACTS.md C2: after commitment the only honest ending is to stop --
+return from the ASGI callable without `more_body: False`, so the client sees
+a body with no chunked terminator, no `data: [DONE]`, no `message_stop`, no
+synthesised error frame. uvicorn closes the transport for us and then logs
+exactly this line at ERROR, once per stream, because from where it stands
+an app that returned mid-response has a bug. Here it is the contract.
+
+The line matters for the same reason the traceback burst did: it is emitted
+once per stream cut by a shutdown, in the same instant, and every byte of
+per-stream logging on a shutdown path is a byte an undrained stderr pipe has
+to absorb before the process can exit (the S8-B finding). The filter drops
+this one message and nothing else; uvicorn's other errors, including the
+`Cancel N running task(s)` line that says the grace was too short, still
+reach the log."""
+
+
+class _NotAnErrorHere(logging.Filter):
+    """Drop uvicorn's `_C2_ENDING_MESSAGE`; pass everything else."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.getMessage() != _C2_ENDING_MESSAGE
+
+
+def _quiet_c2_endings() -> None:
+    """Install `_NotAnErrorHere` on `uvicorn.error`, once.
+
+    Called from `serve()` AFTER `uvicorn.Config` has run its `dictConfig`,
+    which replaces handlers but leaves filters added to the logger object
+    alone. Idempotent: `addFilter` on an already-installed instance is a no-op,
+    and the module holds one instance so repeated `serve()` calls in a
+    process (the contract harness) never stack filters."""
+    logging.getLogger("uvicorn.error").addFilter(_C2_FILTER)
+
+
+_C2_FILTER = _NotAnErrorHere()
+
+
 async def serve(config: ServerConfig) -> DrainReport | None:
     """Run the gateway until a drain signal, then drain and exit.
 
@@ -97,8 +157,8 @@ async def serve(config: ServerConfig) -> DrainReport | None:
     not support signal handlers fell back to uvicorn's default path).
 
     The grace period is `config.drain_grace_seconds`; the orchestrator's own
-    kill timeout should sit above it so the drain, not a SIGKILL, is what ends
-    the process."""
+    kill timeout should sit above `grace + UVICORN_SHUTDOWN_TIMEOUT_S` so the
+    drain, not a SIGKILL, is what ends the process."""
     app = build_app(config)
     gateway: Gateway = app.state.gateway
     grace_s = config.drain_grace_seconds
@@ -114,8 +174,13 @@ async def serve(config: ServerConfig) -> DrainReport | None:
         # to avoid (see the lifespan docstring in app.py).
         lifespan="on",
         log_level="info",
+        # Bound uvicorn's own wait for open connections after `should_exit`.
+        # Our drain owns the real wait (the grace); this only has to be long
+        # enough for the leftovers' native endings to flush. See the constant.
+        timeout_graceful_shutdown=UVICORN_SHUTDOWN_TIMEOUT_S,
     )
     server = _DrainingServer(uconfig)
+    _quiet_c2_endings()
 
     loop = asyncio.get_running_loop()
     # A one-slot mutable so the handler (a plain callable, not a closure over a
@@ -142,9 +207,11 @@ async def serve(config: ServerConfig) -> DrainReport | None:
                 report.timed_out,
             )
             if report.cut:
-                # Not an error -- the documented row-9 residual -- but the one
-                # number S8 is scored on, so it is logged at WARNING, not INFO.
-                log.warning(
+                # A prediction, not the verdict: these are the streams uvicorn
+                # is ABOUT to cut. INFO here, so the shutdown path carries
+                # exactly one WARNING -- `log_shutdown_cuts`, after the cuts
+                # have happened and the count is final.
+                log.info(
                     "%d stream(s) still open after %.1fs grace; shutdown will "
                     "cut them", report.cut, grace_s,
                 )
@@ -197,8 +264,51 @@ async def serve(config: ServerConfig) -> DrainReport | None:
             with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
                 loop.remove_signal_handler(sig)
 
+    # uvicorn's `shutdown()` CANCELS the request tasks that outlived
+    # `timeout_graceful_shutdown` but does not await them, so `serve()` can
+    # return while their `except CancelledError` branches -- the ones that
+    # count themselves in `gateway.shutdown_cuts` -- have not run yet. Let
+    # them settle, bounded, before reading the count; without this the
+    # summary line reads 0 and the real cuts are counted during loop
+    # teardown, after anyone could log them. (Verified against uvicorn
+    # 0.52: `t.cancel(...)` in a loop, no `gather`.) Tasks leave
+    # `server_state.tasks` on completion, so the set is exactly the
+    # unsettled ones.
+    pending = {t for t in server.server_state.tasks if not t.done()}
+    if pending:
+        await asyncio.wait(pending, timeout=UVICORN_SHUTDOWN_TIMEOUT_S)
+
     report = state["report"]
-    return report if isinstance(report, DrainReport) else None
+    report = report if isinstance(report, DrainReport) else None
+    log_shutdown_cuts(gateway, report=report, grace_s=grace_s)
+    return report
+
+
+def log_shutdown_cuts(
+    gateway: Gateway, *, report: DrainReport | None, grace_s: float
+) -> None:
+    """The ONE line the shutdown path writes about cut streams.
+
+    Called after `server.serve()` has returned -- i.e. after uvicorn's
+    post-grace cancel has run through every open request and each has
+    counted itself in `gateway.shutdown_cuts` -- because that is the only
+    moment the number is final. Nothing per stream is logged before it, by
+    rule: on the S8-B run of 15 Sep 2026 a per-stream traceback and then a
+    per-stream WARNING both turned out to be output that scales with the
+    number of open streams, and output that scales with open streams is
+    what blocks a process on an undrained stderr pipe. This line's size is
+    bounded by the catalog (at most `top` targets are named) and by nothing
+    the client controls. Silent when nothing was cut, which is the S8 success
+    case and every idle deploy."""
+    cuts = gateway.shutdown_cuts
+    if cuts.total == 0:
+        return
+    open_at_expiry = report.cut if report is not None else -1
+    log.warning(
+        "%s (%d open when the %.1fs grace expired); per-request detail is in "
+        "the capture records (outcome=canceled)",
+        cuts.summary(), open_at_expiry, grace_s,
+    )
 
 
 def run(config: ServerConfig | None = None) -> DrainReport | None:

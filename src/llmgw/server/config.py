@@ -75,6 +75,7 @@ by the operator and not by the client.
 
 from __future__ import annotations
 
+import logging
 import os
 import tomllib
 from collections.abc import Mapping
@@ -87,6 +88,8 @@ from llmgw.catalog import DEFAULT_CATALOG, Catalog
 from llmgw.clocks import Budgets, Clock
 from llmgw.errors import PolicyError
 from llmgw.policy import PolicySnapshot
+
+log = logging.getLogger("llmgw.server.config")
 
 DEFAULT_FAKE_OPENAI_URL = "http://127.0.0.1:8801/v1"
 """Matches `make fakes` and the `fake-openai` entry in the shipped catalog.
@@ -253,6 +256,13 @@ def _env_int(env: Mapping[str, str], name: str, default: int) -> int:
     return int(_env_float(env, name, float(default)))
 
 
+def _env_optional_int(env: Mapping[str, str], name: str, default: int) -> int | None:
+    """An integer cap where `0` means "no cap". Unset keeps the default, so
+    the only way to switch a cap off is to say so explicitly."""
+    value = _env_int(env, name, default)
+    return None if value == 0 else value
+
+
 def _env_headers(
     env: Mapping[str, str], name: str, default: tuple[str, ...]
 ) -> tuple[str, ...]:
@@ -283,7 +293,7 @@ class ServerConfig:
 
     budgets: Budgets = field(
         default_factory=lambda: Budgets(
-            total=600.0,
+            total=120.0,
             connect=2.0,
             first_event=20.0,
             progress=15.0,
@@ -302,6 +312,13 @@ class ServerConfig:
 
     With no policy file these ARE the workload's budgets, passed straight into
     `single_target`, which is what keeps the zero-config path identical to P2.
+
+    `total` is 120 s, down from the 600 s the first six phases shipped with,
+    because the total is also the longest stream a deploy has to wait for:
+    `validated()` refuses a total above `drain_grace_seconds`, and a 10-minute
+    ceiling would have forced a 10-minute drain on every rollout. A workload
+    that genuinely needs longer says so in its own `[budgets]` table -- and
+    then owns the drain it implies.
     """
 
     buffer_bytes: int = 256 * 1024
@@ -439,7 +456,7 @@ class ServerConfig:
     constant. Over budget the record is DROPPED and counted, never awaited: a
     lost diagnostic beats a blocked request (FAILURE-MODES row 9)."""
 
-    drain_grace_seconds: float = 25.0
+    drain_grace_seconds: float = 130.0
     """How long a graceful shutdown waits for in-flight streams before it gives
     up and lets the deadline cut whatever is left (`LLMGW_DRAIN_GRACE`).
 
@@ -450,10 +467,76 @@ class ServerConfig:
     the bound on that wait. A stream still open when the grace expires is CUT,
     which is FAILURE-MODES.md row 11's honest residual: a graceful drain is not
     a promise that no stream is ever interrupted, only that none is interrupted
-    that could have finished within the grace. Sized so the common case (a
-    chat stream of a few seconds) always completes and only a genuinely
-    long-running request pays -- the orchestrator's own kill timeout should sit
-    above this so the drain, not a SIGKILL, is what ends the process."""
+    that could have finished within the grace.
+
+    The three numbers that have to agree, and who checks each:
+
+        budgets.total  <=  drain_grace_seconds  <  orchestrator kill timeout
+
+    The first inequality is checked here, in `validated()`: a total above the
+    grace means the gateway admits streams it has already decided to cut on
+    the next deploy, and the P7 campaign shipped exactly that (600 s total,
+    25 s grace) for six phases without any test noticing. The default is the
+    120 s total plus ten seconds for the exit itself. The second inequality
+    -- Fly's `kill_timeout`, Kubernetes' `terminationGracePeriodSeconds`,
+    systemd's `TimeoutStopSec` -- cannot be checked from inside the process,
+    because the process cannot see it; it is the deployment's job to keep the
+    kill timeout above this grace, or a SIGKILL, not the drain, ends the
+    process and every stream still open with it."""
+
+    drain_allow_short: bool = False
+    """Escape hatch for the `total <= grace` check (`LLMGW_DRAIN_ALLOW_SHORT`).
+
+    Set, a config whose total exceeds the grace starts anyway and logs a
+    WARNING with both numbers. For the bench, which deliberately drains
+    shorter than the streams it is serving to observe the cut, and for an
+    operator who has decided a fast rollout is worth cutting the long tail.
+    Off by default because the failure it permits -- every deploy truncates
+    the longest streams -- is one that a green dashboard will not show."""
+
+    max_streams: int | None = 150
+    """Per-process ceiling on requests inside the serving path
+    (`LLMGW_MAX_STREAMS`). `None` is uncapped; the env var takes `0` to mean
+    the same, because an unset variable has to keep the default.
+
+    The shed path the load campaign showed was missing. S2
+    (`bench/results/load-S2-gw4-run.md`) offered four processes ~2,500
+    streams at 100 rps: each pinned at 100 % CPU around 650 open streams,
+    first-event latency went from 29 ms to 2.6 s at p50, and only THEN did the
+    504s start -- the gateway degraded first and shed second, which is the
+    wrong order for a proxy whose job is to never be the slow hop. Nothing
+    per-process existed to refuse the 651st stream: admission is per tenant,
+    the key cap per credential, and a fleet of well-behaved tenants can still
+    sum past one event loop.
+
+    Checked at ingress, after the tenant is known and BEFORE tenant admission,
+    so a shed request costs no bucket credit (C6) and no body read. Refused
+    with 503 `overloaded` and `Retry-After: 1`: retry elsewhere, not later
+    against this replica. `/healthz`, `/metrics` and `/probe` are not subject
+    to it -- the cap exists so those keep answering.
+
+    The default is a measured number, not a guess, and it is a number for
+    ONE machine. The cap is a STREAM count standing in for the thing that
+    actually saturates a process, which is events per second: 150 slow-drip
+    streams are idle and 150 fast-model streams are 6,000 events/s. On the
+    16-core laptop the campaign ran on, with S2's 40 events/s streams, the
+    knee sat between the two runs that bracket it:
+
+      cap 300 (`bench/results/load-S2-cap300-gw4-run.md`): streams pinned at
+        exactly 300 per process, but every worker still at 100 % CPU and
+        3,217 requests timing out with 504 -- shedding, and still degraded.
+      cap 150 (`bench/results/load-S2-cap150-gw4-run.md`): 68 % CPU, zero
+        504s, and the admitted streams indistinguishable from the direct arm
+        (first-event p90 30.9 ms vs 31.6 ms, inter-event p99 37 vs 36 ms).
+
+    So 150 is the largest cap at which that machine shed BEFORE it degraded.
+    A Fly `shared-cpu-1x` is a fraction of one of those cores and will need a
+    lower number; a fast model with 200 events/s streams needs a lower number
+    on the same hardware. Derive it per deployment from an S2-style run
+    (`python -m bench.load --scenario S2` with `BENCH_GW_MAX_STREAMS`): the
+    right cap is the largest one where CPU stays off 100 % and admitted
+    first-event latency stays flat. Then pair it with the edge's connection
+    limit so the balancer stops routing before the process has to refuse."""
 
     def validated(self) -> ServerConfig:
         """Fail at startup, never on the request path.
@@ -477,6 +560,26 @@ class ServerConfig:
         # instant SIGTERM arrived, which is the opposite of the endpoint's job.
         if self.drain_grace_seconds <= 0:
             raise ValueError("drain_grace_seconds must be positive")
+        if self.budgets.total > self.drain_grace_seconds:
+            # The deploy inequality (see the `drain_grace_seconds` docstring).
+            # Refused, not clamped: clamping the total would silently shorten
+            # every request to fit the deploy, and clamping the grace would
+            # silently lengthen every deploy to fit the request; either is a
+            # number nobody configured.
+            message = (
+                f"budgets.total={self.budgets.total:g}s exceeds "
+                f"drain_grace_seconds={self.drain_grace_seconds:g}s: every stream "
+                f"longer than the grace is cut on deploy. Raise LLMGW_DRAIN_GRACE "
+                f"(and the orchestrator's kill timeout above it), lower "
+                f"LLMGW_BUDGET_TOTAL, or set LLMGW_DRAIN_ALLOW_SHORT=1 to accept the cut"
+            )
+            if not self.drain_allow_short:
+                raise ValueError(message)
+            log.warning("LLMGW_DRAIN_ALLOW_SHORT is set: %s", message)
+        if self.max_streams is not None and self.max_streams < 1:
+            # In code, None is the spelling for "uncapped"; a zero would refuse
+            # every request and look like an outage with no log line.
+            raise ValueError("max_streams must be positive, or None for no cap")
         banned = {h.lower() for h in self.forward_request_headers} & NEVER_FORWARDED
         if banned:
             raise ValueError(
@@ -590,7 +693,7 @@ class ServerConfig:
         """
         env = os.environ if env is None else env
         budgets = Budgets(
-            total=_env_float(env, "LLMGW_BUDGET_TOTAL", 600.0),
+            total=_env_float(env, "LLMGW_BUDGET_TOTAL", 120.0),
             connect=_env_float(env, "LLMGW_BUDGET_CONNECT", 2.0),
             first_event=_env_float(env, "LLMGW_BUDGET_FIRST_EVENT", 20.0),
             progress=_env_float(env, "LLMGW_BUDGET_PROGRESS", 15.0),
@@ -645,7 +748,9 @@ class ServerConfig:
             capture_queue_bytes=_env_int(
                 env, "LLMGW_CAPTURE_QUEUE_BYTES", 8 * 1024 * 1024
             ),
-            drain_grace_seconds=_env_float(env, "LLMGW_DRAIN_GRACE", 25.0),
+            drain_grace_seconds=_env_float(env, "LLMGW_DRAIN_GRACE", 130.0),
+            drain_allow_short=_env_bool(env, "LLMGW_DRAIN_ALLOW_SHORT", default=False),
+            max_streams=_env_optional_int(env, "LLMGW_MAX_STREAMS", 150),
         ).validated()
 
 

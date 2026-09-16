@@ -200,7 +200,7 @@ import json
 import logging
 import math
 from collections.abc import Coroutine, Mapping
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Any, TypeVar
 
 from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry, generate_latest
@@ -926,7 +926,10 @@ class DrainReport:
     non-zero is FAILURE-MODES.md row 11's residual made countable rather than
     hidden. `begin_drain` does not itself cut them -- it reports the count and
     lets the server's own shutdown cancel them through the existing terminal
-    path, so each still gets its CANCELED outcome and capture record."""
+    path, so each still gets its CANCELED outcome and capture record. This is
+    a count taken BEFORE the cuts; the streams actually cut are counted after
+    the fact in `Gateway.shutdown_cuts` (`ShutdownCuts`), which is the number
+    `lifecycle.log_shutdown_cuts` prints once the server has stopped."""
 
     duration_s: float
     """Wall time from flipping `draining` to the wait ending, by the injected
@@ -937,6 +940,60 @@ class DrainReport:
     if every in-flight stream finished first (so `cut == 0`). Redundant with
     `cut` by construction, kept because 'did we hit the deadline' is the
     question an operator asks and an equality against zero is not an answer."""
+
+
+class ShutdownCuts:
+    """The streams uvicorn's post-grace shutdown actually cut, counted.
+
+    This is the single source of truth for "cut". `DrainReport.cut` is the
+    number of streams still open when the grace expired -- a count taken
+    BEFORE the cuts, of what is about to happen. This counter is filled in
+    AFTER, once per stream, on the endpoint's shutdown-cut path, and is what
+    `lifecycle.log_shutdown_cuts` prints. The two agree unless a stream ends
+    on its own inside uvicorn's short bound, in which case this one is right.
+
+    Why a counter and not a log line per cut: the S8-B run of 15 Sep 2026
+    showed that anything written to stderr once per cut stream, in the same
+    instant, is a byte an undrained 64 KiB pipe must absorb before the
+    process can exit -- first as 4 KB tracebacks, then as 88-byte WARNINGs
+    that were still about 450 streams from blocking. Bounded output on the
+    shutdown path means output that does NOT scale with the number of open
+    streams, so the per-cut fact goes here, and stderr gets ONE line at the
+    end. `by_target` is bounded by the catalog: its keys are `str(Target)`,
+    of which a process has at most as many as it has targets, plus `"-"` for
+    a request cut before any target was chosen. The per-request detail
+    (tokens so far, cost, duration) is in the capture record each cut request
+    already wrote with `outcome=CANCELED` (C3); nothing is lost by not
+    logging it twice."""
+
+    __slots__ = ("total", "committed", "by_target")
+
+    def __init__(self) -> None:
+        self.total = 0
+        self.committed = 0
+        self.by_target: dict[str, int] = {}
+
+    def note(self, *, target: Target | None, committed: bool) -> None:
+        self.total += 1
+        if committed:
+            self.committed += 1
+        label = str(target) if target is not None else "-"
+        self.by_target[label] = self.by_target.get(label, 0) + 1
+
+    @property
+    def uncommitted(self) -> int:
+        return self.total - self.committed
+
+    def summary(self, *, top: int = 5) -> str:
+        """One bounded line: totals, then at most `top` targets."""
+        ranked = sorted(self.by_target.items(), key=lambda kv: (-kv[1], kv[0]))
+        shown = ", ".join(f"{label}={n}" for label, n in ranked[:top])
+        if len(ranked) > top:
+            shown += f", +{len(ranked) - top} more"
+        return (
+            f"shutdown cut {self.total} stream(s): committed={self.committed} "
+            f"uncommitted={self.uncommitted}; targets: {shown or '-'}"
+        )
 
 
 class Gateway:
@@ -953,7 +1010,8 @@ class Gateway:
     __slots__ = ("config", "clock", "registry", "draining", "policy",
                  "tenants", "admission", "breakers", "limiter",
                  "_upstream", "_derived", "_collectors", "_capture",
-                 "_inflight", "_idle", "_draining_denied")
+                 "_inflight", "_idle", "_draining_denied", "_overloaded_denied",
+                 "shutdown_cuts")
 
     def __init__(self, config: ServerConfig, *, clock: Clock | None = None) -> None:
         self.config = config.validated()
@@ -1081,6 +1139,16 @@ class Gateway:
         two places admission's own denials are surfaced -- so a drain's shed
         traffic is countable exactly like a rate or concurrency denial, which
         is what the pre-declared `metrics.DENIAL_REASONS` entry was for."""
+
+        self._overloaded_denied = 0
+        """Requests shed at ingress because `_inflight` was over
+        `config.max_streams`. The other process-wide refusal, surfaced the
+        same two ways as `_draining_denied` under reason `"overloaded"`."""
+
+        self.shutdown_cuts = ShutdownCuts()
+        """Streams cut by uvicorn's post-grace shutdown, counted instead of
+        logged per stream. Read once, by `lifecycle.log_shutdown_cuts`, after
+        the server has stopped -- the only moment the count is final."""
 
         self._upstream: Upstream | None = None
 
@@ -1330,6 +1398,26 @@ class Gateway:
         other denials where they are read, not where they are stored."""
         self._draining_denied += 1
 
+    def note_overloaded_denied(self) -> None:
+        """Count one request shed at ingress by the per-process stream cap.
+
+        Kept beside `note_draining_denied` and out of `AdmissionController`
+        for the same reason: the cap is a fact about THIS process's event
+        loop, not about any tenant's budget, and the tenant whose request was
+        refused did nothing wrong."""
+        self._overloaded_denied += 1
+
+    def over_capacity(self) -> bool:
+        """Is the serving path over `config.max_streams`?
+
+        Read AFTER `stream_entered()` for the current request, so the count
+        includes it: with a cap of N the (N+1)th concurrent request is the one
+        refused, and N streams may be open. The count is the drain tracker's,
+        not a second counter, so what a drain waits on and what the cap
+        refuses at can never disagree. `None` is uncapped."""
+        cap = self.config.max_streams
+        return cap is not None and self._inflight > cap
+
     def draining_denials(self) -> dict[str, int]:
         """The draining shed count, keyed by its `metrics.DENIAL_REASONS`
         value. Merged alongside `admission.denials()` and `limiter.denials()`
@@ -1337,6 +1425,12 @@ class Gateway:
         "draining"}` and `/probe`'s denial map agree -- the single reason the
         `"draining"` label was pre-declared in P0."""
         return {"draining": self._draining_denied}
+
+    def overloaded_denials(self) -> dict[str, int]:
+        """The stream-cap shed count under its `metrics.DENIAL_REASONS` value,
+        merged at the same two sites as `draining_denials()` -- so the label
+        is declared in the contract, not minted here."""
+        return {"overloaded": self._overloaded_denied}
 
     async def begin_drain(self, *, grace_s: float) -> DrainReport:
         """Stop taking new work, let in-flight streams finish, then report.
@@ -1575,6 +1669,27 @@ class PassthroughEndpoint:
             # workload's, and starting that clock before the request is
             # admitted would charge admission to the request.
             exchange.tenant = tenant = gw.resolve_tenant(scope)
+            # The per-process cap, between the tenant and its bucket. After
+            # the tenant, so the refusal carries `X-Gw-Tenant` and an unknown
+            # token is still a 401 rather than a 503 that leaks nothing;
+            # BEFORE admission, so a request refused for the process's sake
+            # costs the tenant no credit (C6) and, being before the body, no
+            # memory. 503 like `draining`, not 429: the tenant is under its
+            # limits and the right move is another replica, which is what
+            # `Retry-After: 1` says to a client behind a balancer. See
+            # `ServerConfig.max_streams` for the S2 numbers behind this line.
+            if gw.over_capacity():
+                gw.note_overloaded_denied()
+                await send_json_error(
+                    send, status=503, code="overloaded",
+                    message=(
+                        f"gateway is at its per-process stream cap "
+                        f"({config.max_streams}); retry against another replica"
+                    ),
+                    exchange=exchange,
+                    extra_headers=[(b"retry-after", b"1")],
+                )
+                return
             workload_id = gw.resolve_workload(snapshot, requested)
             exchange.workload_id = workload_id
             budgets = snapshot.workloads[workload_id].budgets
@@ -1630,6 +1745,68 @@ class PassthroughEndpoint:
                         no_retry=self._no_retry(scope),
                     ),
                 )
+        except asyncio.CancelledError:
+            # ------------------------- SHUTDOWN CUT ------------------------
+            # Exactly one thing cancels THIS task from outside: uvicorn's
+            # shutdown, `UVICORN_SHUTDOWN_TIMEOUT_S` after our own drain grace
+            # has already run out (lifecycle.py). A client disconnect cancels
+            # the WORKER inside `run_until_disconnect` and surfaces here as
+            # `ClientDisconnected`, never as a cancel of this task; the
+            # deadline paths raise their own `GatewayError`s. So a cancel that
+            # arrives while `gw.draining` is the shutdown cut. One that
+            # arrives while NOT draining is somebody else's -- a harness
+            # tearing down, a future in-process caller -- and keeps its
+            # asyncio meaning: re-raised untouched. `draining` is the only
+            # discriminator available; uvicorn's cancel message is a private
+            # string and is not read.
+            if not gw.draining:
+                raise
+            # Letting the CancelledError out made uvicorn log it as
+            # `ERROR: Exception in ASGI application` with a ~4 KB traceback,
+            # once PER STREAM: hundreds of tracebacks per deploy, and where
+            # stderr is a pipe nobody drains, a process blocked inside its
+            # logging handler that never exits at all (S8-B, 15 Sep 2026).
+            # Absorbing it is safe here and only here. The task was told to
+            # stop and has stopped: every `finally` between the cut and this
+            # line has already run -- the worker cancelled and awaited, the
+            # permit released, the terminal record written with
+            # outcome=CANCELED and `cost_basis=estimated` (C3), the tracker
+            # paired in the `finally` below -- and uvicorn owns the task and
+            # closes the transport whether we raise or return. `uncancel()`
+            # tells asyncio the request has been handled, so nothing above us
+            # sees a phantom pending cancel.
+            task = asyncio.current_task()
+            if task is not None:
+                task.uncancel()
+            # NO log line here, by rule. This path fires once per open stream
+            # in the same instant, and every byte it writes to stderr is a
+            # byte an undrained 64 KiB pipe must absorb before the process can
+            # exit: 4 KB tracebacks hung the S8-B workers outright, and the
+            # 88-byte WARNING that replaced them was still ~450 streams from
+            # doing the same. So the fact is COUNTED (`ShutdownCuts`, bounded
+            # by the catalog) and stderr gets exactly one summary line from
+            # `lifecycle.log_shutdown_cuts` after uvicorn has stopped. The
+            # per-request detail -- tokens so far, cost, duration -- is in
+            # the capture record this request already wrote with
+            # outcome=CANCELED.
+            gw.shutdown_cuts.note(target=exchange.target, committed=exchange.started)
+            if not exchange.started:
+                # No status on the wire yet, so there is still an honest one
+                # to send: the same 503 the ingress shed gives a request that
+                # arrived after `draining` flipped. Best-effort -- the client
+                # may already be gone, and a raise here would put the
+                # traceback back.
+                with suppress(Exception):
+                    await send_json_error(
+                        send, status=503, code="draining",
+                        message="gateway shut down before this request was served",
+                        exchange=exchange,
+                        extra_headers=[(b"retry-after", b"1")],
+                    )
+            # After commitment: return, do not complete. No `more_body:
+            # False` means no chunked terminator -- the C2 ending, the same
+            # one the post-commitment `GatewayError` branch below uses.
+            return
         except Unauthenticated as exc:
             await send_json_error(
                 send, status=401, code="unauthenticated", message=str(exc),
@@ -1985,7 +2162,8 @@ async def send_json_error(
     exchange: Exchange,
     extra_headers: list[tuple[bytes, bytes]] | None = None,
 ) -> None:
-    """A failure with no taxonomy class. Today that is two: 413 and 401."""
+    """A failure with no taxonomy class. Today that is four: 401, 413, and the
+    two process-wide 503s (`draining`, `overloaded`)."""
     body = json.dumps({"error": {"type": code, "message": message}}).encode("utf-8")
     headers = exchange.gw_headers()
     headers.append((b"content-type", b"application/json"))
@@ -2163,6 +2341,12 @@ def build_app(config: ServerConfig | None = None, *, clock: Clock | None = None)
             # exactly then -- but it says so, so "why is /healthz 503" has an
             # answer on the same endpoint. Read off the flag, no upstream call.
             "draining": gateway.draining,
+            # The cap and the number it is compared against, together, so
+            # "why 503 overloaded" is answerable from one read. `inflight`
+            # counts this probe's neighbours, not the probe: operational
+            # routes are outside the endpoint's open/finally pair.
+            "max_streams": gateway.config.max_streams,
+            "inflight": gateway.inflight,
             "fake_upstreams": gateway.config.fake_upstreams,
             "targets": [{
                 "provider": target.provider.id,
@@ -2254,6 +2438,7 @@ def build_app(config: ServerConfig | None = None, *, clock: Clock | None = None)
                 **gateway.admission.denials(),
                 **gateway.limiter.denials(),
                 **gateway.draining_denials(),
+                **gateway.overloaded_denials(),
             },
         })
 
@@ -2324,6 +2509,7 @@ __all__ = [
     "Gateway",
     "PassthroughEndpoint",
     "RequestTooLarge",
+    "ShutdownCuts",
     "Unauthenticated",
     "app",
     "bearer_token",

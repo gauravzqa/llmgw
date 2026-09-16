@@ -350,7 +350,7 @@ class Collectors:
         try:
             self.sync_admission_denied(
                 {**gateway.admission.denials(), **gateway.limiter.denials(),
-                 **gateway.draining_denials()}
+                 **gateway.draining_denials(), **gateway.overloaded_denials()}
             )
         except Exception:  # noqa: BLE001
             log.exception("failed to sample admission_denied")

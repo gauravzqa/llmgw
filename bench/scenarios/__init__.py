@@ -199,6 +199,13 @@ _reg(Scenario(
     question="Drain: client errors must be ZERO when SIGTERM lands mid-stream.",
     produces="client errors (target 0); drain duration; streams cut (target 0).",
     # S8 runs the S3 workload, then SIGTERMs the gateway at t=60 into measure.
+    # Streams are 200 x 0.5 s = 100 s. Two arms, chosen by env (bench/_gwproc):
+    #   A  default: drain grace = total budget (600 s) >= stream; zero cuts.
+    #   B  BENCH_GW_DRAIN_GRACE=30 BENCH_GW_BUDGET_TOTAL=600: grace < stream;
+    #      cuts are the residual, the process must still exit at grace + ~3 s.
+    #      (drain_allow_short is set automatically when grace < total; the
+    #      total must be set too, or it defaults to grace - 5 and the DEADLINE,
+    #      not the drain, would end every stream.)
     rate=10.0, smoke_rate=5.0, streaming=True,
     mode="slow-drip", events=200, interval=0.5,
     driver="s8_deploy",

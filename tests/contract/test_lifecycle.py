@@ -31,19 +31,26 @@ return-to-zero all run exactly as they would under the signal handler.
 from __future__ import annotations
 
 import asyncio
+import functools
+import os
 import socket
+import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import httpx
 import pytest
 import uvicorn
+from bench.scenarios import GATEWAY_MODEL
 from fakes.upstream import PATHS
 from starlette.applications import Starlette
 
 from llmgw.server.app import DrainReport, Gateway, build_app
 from llmgw.server.config import ServerConfig
+from llmgw.server.lifecycle import _C2_ENDING_MESSAGE
 from tests.contract.conftest import BREAKER_NEVER_TRIPS, Fakes
 from tests.contract.test_fallback import (
     KEY,
@@ -172,7 +179,6 @@ def drain_server(fakes: Fakes, tmp_path):
     stream, just paced, so there is a real in-flight window to drain and the
     stream still ends with `data: [DONE]`.
     """
-    import os
 
     os.environ.setdefault(KEY_ENV, KEY)
     policy_file = tmp_path / "lifecycle.toml"
@@ -337,3 +343,289 @@ async def test_drain_under_concurrent_load_cuts_nothing(
     assert report.cut == 0, "no open stream should be cut when all finish within grace"
     assert report.timed_out is False
     assert gw.gateway.inflight == 0
+
+
+# ==========================================================================
+# The PROCESS exits: SIGTERM -> drain -> uvicorn's bounded shutdown -> exit 0
+# ==========================================================================
+#
+# Everything above drives `begin_drain` on a threaded server and stops the
+# server itself. That proves the drain; it does not prove the process goes
+# away afterwards. S8 (10 Sep) showed it does not: after a 30 s grace against
+# 100 s streams, `should_exit` flipped and uvicorn then waited on the still-open
+# streams indefinitely -- four workers "still running" long after the grace.
+# These two tests run the REAL entry (`lifecycle.run`, via `bench._gwproc`,
+# the same module the scale bench and `python -m llmgw.server` share) in a
+# subprocess, SIGTERM it with a slow-drip stream mid-flight, and time the
+# exit. The fakes are the session fixture's in-thread servers; the subprocess
+# reaches them over loopback like any other client.
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+@dataclass
+class GatewayProcess:
+    proc: subprocess.Popen
+    port: int
+    stderr_path: Path
+
+    @property
+    def base_url(self) -> str:
+        return f"http://127.0.0.1:{self.port}"
+
+    def url(self) -> str:
+        return f"{self.base_url}{ROUTE}"
+
+    def stderr(self) -> str:
+        try:
+            return self.stderr_path.read_text(errors="replace")[-4000:]
+        except OSError:  # pragma: no cover
+            return ""
+
+    def stderr_all(self) -> str:
+        try:
+            return self.stderr_path.read_text(errors="replace")
+        except OSError:  # pragma: no cover
+            return ""
+
+    def kill(self) -> None:
+        if self.proc.poll() is None:
+            self.proc.kill()
+            self.proc.wait(timeout=5)
+
+
+def _launch_gateway_process(
+    fakes: Fakes, tmp_path, *, grace_s: float, total_s: float, allow_short: bool
+) -> GatewayProcess:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    env = dict(os.environ)
+    env.update(
+        BENCH_GW_PORT=str(port),
+        BENCH_FAKE_OPENAI_URL=fakes.openai.base_url,
+        BENCH_FAKE_ANTHROPIC_URL=fakes.anthropic.base_url,
+        BENCH_GW_DRAIN_GRACE=str(grace_s),
+        BENCH_GW_BUDGET_TOTAL=str(total_s),
+        BENCH_GW_DRAIN_ALLOW_SHORT="1" if allow_short else "0",
+    )
+    stderr_path = tmp_path / f"gw-{port}.stderr"
+    with stderr_path.open("wb") as err:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "bench._gwproc"],
+            cwd=REPO_ROOT, env=env, stdout=subprocess.DEVNULL, stderr=err,
+        )
+    gw = GatewayProcess(proc=proc, port=port, stderr_path=stderr_path)
+    deadline = time.monotonic() + 20.0
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(f"gateway process exited at boot:\n{gw.stderr()}")
+        try:
+            if httpx.get(f"{gw.base_url}/metrics", timeout=1.0).status_code == 200:
+                return gw
+        except httpx.HTTPError:
+            pass
+        time.sleep(0.05)
+    gw.kill()
+    raise RuntimeError(f"gateway process did not come up:\n{gw.stderr()}")
+
+
+def _slow_drip(events: int, interval_s: float) -> dict[str, str]:
+    # Forwarded by bench._gwproc's `forward_request_headers` (x-fake-*), so the
+    # fake shapes the stream and the gateway just passes it through.
+    return {
+        "X-Fake-Mode": "slow-drip",
+        "X-Fake-Events": str(events),
+        "X-Fake-Interval": str(interval_s),
+    }
+
+
+async def _stream_until_closed(
+    client: httpx.AsyncClient, url: str, headers: dict[str, str],
+    first_byte: asyncio.Event,
+) -> tuple[int, bytes, bool]:
+    """Stream to completion or cut, reporting (status, body, truncated).
+
+    `first_byte` is set as soon as any body byte arrives, so the test can send
+    SIGTERM only once the stream is unambiguously mid-flight."""
+    payload = {
+        "model": GATEWAY_MODEL, "stream": True, "max_tokens": 64,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    chunks: list[bytes] = []
+    status = 0
+    truncated = False
+    try:
+        async with client.stream("POST", url, json=payload, headers=headers) as r:
+            status = r.status_code
+            try:
+                async for chunk in r.aiter_raw():
+                    chunks.append(chunk)
+                    first_byte.set()
+            except httpx.HTTPError:
+                truncated = True
+    except httpx.HTTPError:
+        truncated = True
+    return status, b"".join(chunks), truncated
+
+
+async def _wait_exit(proc: subprocess.Popen, limit_s: float) -> float | None:
+    """Seconds until `proc` exits, or None if it is still running at `limit_s`."""
+    t0 = time.monotonic()
+    try:
+        await asyncio.get_running_loop().run_in_executor(
+            None, functools.partial(proc.wait, timeout=limit_s)
+        )
+    except subprocess.TimeoutExpired:
+        return None
+    return time.monotonic() - t0
+
+
+async def test_process_exits_at_grace_when_a_stream_outlives_it(fakes: Fakes, tmp_path):
+    """Arm B in miniature: grace 2 s, a 15 s stream. The drain times out, the
+    stream is cut (the documented residual), and the PROCESS must still be gone
+    within grace + UVICORN_SHUTDOWN_TIMEOUT_S -- not sit on the open stream."""
+    from llmgw.server.lifecycle import UVICORN_SHUTDOWN_TIMEOUT_S
+
+    grace_s = 2.0
+    gw = _launch_gateway_process(
+        fakes, tmp_path, grace_s=grace_s, total_s=30.0, allow_short=True
+    )
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+            first_byte = asyncio.Event()
+            task = asyncio.ensure_future(_stream_until_closed(
+                client, gw.url(), _slow_drip(events=60, interval_s=0.25), first_byte,
+            ))
+            await asyncio.wait_for(first_byte.wait(), timeout=10.0)
+
+            gw.proc.send_signal(subprocess.signal.SIGTERM)
+            exited_after = await _wait_exit(gw.proc, limit_s=grace_s + 20.0)
+
+            assert exited_after is not None, (
+                f"process still running {grace_s + 20.0:.0f}s after SIGTERM with a "
+                f"{grace_s}s grace -- uvicorn is waiting on the open stream.\n{gw.stderr()}"
+            )
+            budget = grace_s + UVICORN_SHUTDOWN_TIMEOUT_S + 2.5
+            assert exited_after <= budget, (
+                f"exit took {exited_after:.2f}s; expected <= {budget:.1f}s "
+                f"(grace {grace_s}s + uvicorn {UVICORN_SHUTDOWN_TIMEOUT_S}s + slack)"
+            )
+            assert gw.proc.returncode == 0, gw.stderr()
+
+            status, payload, truncated = await asyncio.wait_for(task, timeout=10.0)
+            assert status == 200
+            # The residual, made visible: the stream did not get its terminator.
+            assert truncated or not payload.endswith(DONE), (
+                "a 15 s stream completed inside a 2 s grace; the fake did not drip"
+            )
+            _assert_cut_logged_quietly(gw.stderr_all(), cuts=1)
+    finally:
+        gw.kill()
+
+
+# Upper bound on a worker's WHOLE stderr for a drain that cuts a handful of
+# streams: startup lines, the drain's INFO lines, uvicorn's one `Cancel N
+# running task(s)`, and the single summary WARNING. It must NOT scale with the
+# number of cut streams -- that scaling (4 KB tracebacks, then 88-byte lines,
+# once per stream) is what blocked the S8-B workers on an undrained 64 KiB
+# pipe. If this trips, something on the shutdown path is logging per stream.
+_SHUTDOWN_STDERR_BOUND = 8 * 1024
+
+
+def _assert_cut_logged_quietly(stderr: str, *, cuts: int) -> None:
+    """A shutdown that cuts streams writes ONE summary WARNING naming the
+    count, nothing per stream at any level, and nothing at ERROR: no
+    `Exception in ASGI application` traceback (the S8-B pipe hang) and no
+    `returned without completing response` (uvicorn's name for the C2
+    ending). uvicorn's single `Cancel N running task(s)` line is allowed --
+    it is the one line that says the grace was too short."""
+    assert "Exception in ASGI application" not in stderr, stderr[-3000:]
+    assert "Traceback" not in stderr, stderr[-3000:]
+    assert _C2_ENDING_MESSAGE not in stderr, stderr[-3000:]
+    assert stderr.count("shutdown cut") == 1, stderr[-3000:]
+    assert f"shutdown cut {cuts} stream(s)" in stderr, stderr[-3000:]
+    assert len(stderr) < _SHUTDOWN_STDERR_BOUND, (len(stderr), stderr[-3000:])
+    errors = [ln for ln in stderr.splitlines() if "ERROR" in ln]
+    assert all("timeout graceful shutdown exceeded" in ln for ln in errors), errors
+
+
+async def test_shutdown_cuts_are_one_summary_line_and_no_tracebacks(
+    fakes: Fakes, tmp_path
+):
+    """Several streams outlive a short grace at once. The cuts are counted
+    and reported as ONE summary WARNING after uvicorn stops; stderr carries
+    no per-stream line, no traceback and no per-stream ERROR, so the burst
+    that blocked an undrained stderr pipe cannot form at any N."""
+    from llmgw.server.lifecycle import UVICORN_SHUTDOWN_TIMEOUT_S
+
+    n, grace_s = 5, 2.0
+    gw = _launch_gateway_process(
+        fakes, tmp_path, grace_s=grace_s, total_s=30.0, allow_short=True
+    )
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+            firsts = [asyncio.Event() for _ in range(n)]
+            tasks = [
+                asyncio.ensure_future(_stream_until_closed(
+                    client, gw.url(), _slow_drip(events=60, interval_s=0.25), first,
+                ))
+                for first in firsts
+            ]
+            await asyncio.wait_for(
+                asyncio.gather(*(f.wait() for f in firsts)), timeout=10.0
+            )
+
+            gw.proc.send_signal(subprocess.signal.SIGTERM)
+            exited_after = await _wait_exit(gw.proc, limit_s=grace_s + 20.0)
+            assert exited_after is not None, gw.stderr()
+            assert exited_after <= grace_s + UVICORN_SHUTDOWN_TIMEOUT_S + 2.5
+            assert gw.proc.returncode == 0, gw.stderr()
+
+            results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=10.0)
+            for status, payload, truncated in results:
+                assert status == 200
+                assert truncated or not payload.endswith(DONE)
+            _assert_cut_logged_quietly(gw.stderr_all(), cuts=n)
+    finally:
+        gw.kill()
+
+
+async def test_process_exits_promptly_when_streams_finish_inside_grace(
+    fakes: Fakes, tmp_path
+):
+    """Arm A in miniature: grace 8 s, a ~1.2 s stream. The stream completes
+    UNCUT, and the process exits shortly after it ends -- well before the grace
+    would have expired -- because the drain returns on completion and uvicorn's
+    shutdown has nothing left to wait for."""
+    grace_s = 8.0
+    gw = _launch_gateway_process(
+        fakes, tmp_path, grace_s=grace_s, total_s=30.0, allow_short=True
+    )
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+            first_byte = asyncio.Event()
+            task = asyncio.ensure_future(_stream_until_closed(
+                client, gw.url(), _slow_drip(events=6, interval_s=0.2), first_byte,
+            ))
+            await asyncio.wait_for(first_byte.wait(), timeout=10.0)
+
+            gw.proc.send_signal(subprocess.signal.SIGTERM)
+            exited_after = await _wait_exit(gw.proc, limit_s=grace_s + 10.0)
+
+            status, payload, truncated = await asyncio.wait_for(task, timeout=10.0)
+            assert status == 200
+            assert not truncated, "a stream that fits inside the grace was cut"
+            assert payload.endswith(DONE)
+
+            assert exited_after is not None, gw.stderr()
+            # ~1.2 s of stream left, plus lifespan teardown and interpreter exit.
+            # Strictly below the grace is the point: the drain ended when the
+            # stream did, not when the clock ran out.
+            assert exited_after < grace_s - 1.0, (
+                f"exit took {exited_after:.2f}s with a {grace_s}s grace: the drain "
+                f"waited for the grace instead of the stream"
+            )
+            assert gw.proc.returncode == 0, gw.stderr()
+    finally:
+        gw.kill()
