@@ -8,6 +8,9 @@ file per provider, with a doc URL and `file:line` evidence on every row:
 - [capabilities/openai.md](capabilities/openai.md)
 - [capabilities/anthropic.md](capabilities/anthropic.md)
 - [capabilities/deepseek.md](capabilities/deepseek.md)
+- [capabilities/voice.md](capabilities/voice.md): AssemblyAI, ElevenLabs,
+  Inworld and OpenAI audio/Realtime, with the Layrs voice agent as the
+  reference caller (summary in the "Voice providers" section below)
 
 Legend. **S** supported: the gateway parses, accounts, classifies or routes it.
 **P** passthrough: forwarded byte-for-byte and it works, but the gateway is
@@ -211,6 +214,39 @@ multi-turn, vision, JSON, DeepSeek as the cheap candidate).
 12. **Minor misclassifications.** 403 region block as bad key; Anthropic 409 and
     413 as retryable server errors; reasoning-effort vocabulary drift in
     `ModelSpec`; `stream_options.include_usage` not injected (finding 27).
+
+## Voice providers: AssemblyAI, ElevenLabs, Inworld, OpenAI audio
+
+Full matrix in [capabilities/voice.md](capabilities/voice.md). The short
+version: **nothing the Layrs voice agent runs in production can pass through
+llmgw today, and the reason is transport, not design.** Production TTS and
+STT are Inworld over bidirectional WebSockets; the fallbacks are OpenAI's
+binary TTS stream and AssemblyAI's WebSocket STT. The gateway has no
+WebSocket route or upstream client and a pump that feeds every byte to an SSE
+parser, so a binary or NDJSON stream is copied to the client for a few
+seconds, then cut by the first-event clock or the 1 MiB frame bound and
+recorded as a provider stall with $0 accounted.
+
+| Need | Covers | Size |
+|---|---|---|
+| Second and third framer (JSONL, raw bytes) beside the SSE parser | Inworld and ElevenLabs HTTP TTS, OpenAI binary TTS | small |
+| `ProviderConn.auth_scheme` (raw key, `xi-api-key`, Basic) and a wider scrub for reversible credentials | all three non-OpenAI providers | small |
+| Units other than tokens (characters, seconds, audio token kinds) | every voice product; also the audio tokens already arriving unpriced on the chat route | medium |
+| Per-surface body caps and multipart forwarding | OpenAI and ElevenLabs STT, AssemblyAI sync; also chat vision and PDF | medium |
+| Voice HTTP surfaces with path and query templating, a `tts` budget profile | all HTTP voice paths | medium each |
+| Token minting routes with pinned session config and capped duration | OpenAI `client_secrets`, AssemblyAI `/v3/token`, ElevenLabs tokens | small, highest leverage |
+| A WebSocket data plane | the production voice path | a second program, not a phase |
+
+What transfers unchanged: deadlines, commitment, byte-bounded backpressure,
+per-credential concurrency (which is how ElevenLabs and Inworld meter it),
+credential-scoped breakers, admission, the liveness-versus-progress split,
+the status taxonomy, capture and drain. Two collisions to fix regardless: 403
+is a rate limit on AssemblyAI and a plan/voice denial on ElevenLabs, and both
+would open the credential breaker; and voice sessions run to hours against a
+120 s total budget and 130 s drain grace. Layrs-side drift found on the way:
+a deprecated Inworld TTS model in production, an AssemblyAI default model
+running at 3x the labelled rate, a legacy OpenAI STT model, and per-minute
+prices for per-character products.
 
 ## Suggested order
 
