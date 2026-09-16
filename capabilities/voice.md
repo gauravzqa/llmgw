@@ -51,7 +51,7 @@ style, non-token units, and eventually a second data plane.
 |---|---|---|---|---|---|
 | Streaming STT | WebSocket, binary in / JSON out | WebSocket (Scribe v2 Realtime), base64 in / JSON out | WebSocket `:streamBidirectional`, base64 in / JSON out | WebSocket (Realtime transcription session) | Transport |
 | Batch / sync STT | HTTP raw PCM in, JSON out (Sync, ≤120 s, ≤40 MB); async REST + poll/webhook | multipart in (or `source_url` JSON), JSON out | HTTP JSON, audio inline (≤16 MB) | multipart in, JSON or SSE out (≤25 MB) | Proxyable with per-surface body cap and multipart forwarding; the `source_url` and inline-JSON variants are closest |
-| TTS streaming over HTTP | – | chunked binary (`/stream`); NDJSON (`/stream/with-timestamps`) | NDJSON (`:stream`) | chunked binary, or SSE with `stream_format: "sse"` | Framing (raw and NDJSON); OpenAI SSE mode parses today |
+| TTS streaming over HTTP | – | chunked binary (`/stream`); NDJSON (`/stream/with-timestamps`) | NDJSON (`:stream`) | chunked binary, or SSE with `stream_format: "sse"` | Framing (raw and NDJSON); OpenAI SSE mode parses today but the chat surface classifies its events as heartbeats, so it still needs its own surface |
 | TTS streaming over WebSocket | – | `stream-input`, multi-context | `:streamBidirectional`, ≤5 contexts per socket | – | Transport |
 | TTS buffered | – | HTTP JSON in, whole audio out | HTTP JSON in, JSON with base64 out | HTTP JSON in, whole audio out | Proxyable with per-surface response cap |
 | Speech-to-speech / realtime agent | Voice Agent API (product) | Agents Platform (WS/WebRTC) | Realtime API (OpenAI-protocol WS/WebRTC) | Realtime API (WS/WebRTC/SIP) | Transport; arguably Control (competing runtimes) |
@@ -62,7 +62,7 @@ style, non-token units, and eventually a second data plane.
 
 | Shape | Who | What the current pump does | Needed |
 |---|---|---|---|
-| SSE `data:` JSON | OpenAI TTS (`sse`), OpenAI STT `stream: true` | Parses; needs only a `Surface` class per endpoint | `audio_speech`, `audio_transcription` surfaces |
+| SSE `data:` JSON, CRLF-terminated | OpenAI TTS (`sse`), OpenAI STT `stream: true` | Parses (verified live 16 Sep: CRLF frames, max frame 2.6 KB against the 1 MiB bound), but `OpenAIChatSurface.classify` labels `speech.audio.delta` and `transcript.text.delta` HEARTBEAT and the `done` events META: no progress, no commitment, usage never applied | `audio_speech`, `audio_transcription` surfaces; the parser is not the problem |
 | NDJSON, one object per line, no blank lines, ends on close | Inworld `:stream`, ElevenLabs `with-timestamps` | Every line appended to one SSE frame as an unknown field; no event fires; `FirstEventTimeout` at 20 s; `FrameTooLarge` at 1 MiB cumulative (about 16 s of 24 kHz PCM) | `JSONLFramer` beside `SSEParser`: one event per line, per-line bound, no terminator; surface classifies audio lines as CONTENT, timestamp-only lines as META |
 | Raw bytes (mp3, pcm), no framing, ends on close | ElevenLabs `/stream`, OpenAI TTS default | Same failure as above; the repo's gzip note (`upstream.py:606-612`) describes it exactly | Raw framing: first byte = first event, every chunk = progress, EOF = terminal, native ending = close |
 | Bidirectional JSON or binary frames | all four providers' realtime products | Not reachable | WebSocket data plane |
@@ -73,10 +73,11 @@ style, non-token units, and eventually a second data plane.
 |---|---|---|
 | AssemblyAI | `Authorization: <raw key>` (no `Bearer`); temporary tokens as a query param | Not injectable: `build_headers` knows `Bearer` and `x-api-key`; `authorization` is in `NEVER_FORWARDED`, so this is code not config |
 | ElevenLabs | `xi-api-key` | Not injectable; two lines once a `ProviderKind` exists |
-| Inworld | `Authorization: Basic <portal key>` (reversible base64) | Not injectable; and because the credential is reversible, the scrub should cover every non-2xx body from this provider, not only 401/403 |
+| Inworld | `Authorization: Basic <portal key>` in the docs, but `Bearer <key>` behaves identically (verified live 16 Sep, unauthenticated probes); `x-api-key` ignored. Bad key is 403 code 7, missing key 401 code 16; the 403 body echoes the key's first four characters masked | **Injectable today** with the existing bearer path; the scrub must still cover the 403 body (finding 30 shape, prefix not suffix) |
 | OpenAI audio | `Bearer`; `OpenAI-Safety-Identifier` for per-user attribution; ephemeral `ek_` keys for browsers | Bearer works; no place to inject the tenant as the safety identifier |
 
-A `ProviderConn.auth_scheme` (`bearer | x-api-key | raw | basic`) covers all four.
+A `ProviderConn.auth_scheme` (`bearer | x-api-key | raw`) covers all four;
+Inworld and OpenAI already fit the bearer path.
 
 ### Errors and limits that collide with current rules
 
@@ -188,11 +189,13 @@ Layrs-side findings that do not wait for the gateway:
 3. **Characters, seconds and audio tokens are not a currency the gateway
    has.** No voice cost record can be right; the per-call meters exist on the
    wire for every provider and are all dropped today.
-4. **Three credential styles cannot be injected** (raw key, `xi-api-key`,
-   Basic). Two lines each once `auth_scheme` exists.
-5. **403 is not a credential failure on these providers.** Rate limit
+4. **Two credential styles cannot be injected** (AssemblyAI's raw key,
+   ElevenLabs' `xi-api-key`). Two lines each once `auth_scheme` exists;
+   Inworld turned out to accept `Bearer`.
+5. **403 is not a credential failure on two of these providers.** Rate limit
    (AssemblyAI) and plan/voice/model denial (ElevenLabs) would open the
-   credential breaker for every tenant.
+   credential breaker for every tenant. On Inworld a 403 is a bad key, so the
+   rule must be provider-scoped rather than changed globally.
 6. **Session length breaks the deploy arithmetic.** AssemblyAI sessions run to
    3 hours, OpenAI Realtime to 60 minutes, against a 120 s total budget and a
    130 s drain grace. Token minting with a capped session duration is the
@@ -213,8 +216,16 @@ Layrs-side findings that do not wait for the gateway:
 ## Verification boundary
 
 Inworld's `docs.inworld.ai/api-reference/*` requires a login; its wire shapes
-come from public tutorials, the LiveKit plugin source Layrs pins (1.6.3) and
-Pipecat's Inworld service, cross-checked where two agree. AssemblyAI's Sync
-API reference page was unreachable; its request shape comes from the
-quickstart. OpenAI's `realtime-websocket` and `realtime-sip` guides returned
-404 to the fetcher; those rows cite search snippets. No provider was called.
+come from the downloaded `livekit-plugins-inworld==1.6.3` source, Inworld's
+`inworld-api-examples` repository and Pipecat, cross-checked where two agree,
+plus unauthenticated live probes on 16 Sep that pinned the error bodies
+(gRPC-status JSON), the 401/403 split, the auth scheme, credential
+reflection, `x-inworld-request-id`, the WebSocket "101 then in-band error"
+behaviour and the Router's endpoints. No Inworld credential exists on the
+machine, so the authenticated shapes (live `:stream` framing details, `usage`
+placement, rate limits) remain source-verified only. AssemblyAI's Sync API
+reference page was unreachable; its request shape comes from the quickstart.
+OpenAI's audio and Realtime rows were verified live on 16 Sep (about $0.005):
+TTS SSE and binary, STT streaming and `whisper-1`, a client-secret mint, a
+text-only Realtime WebSocket session and a bad-key 401; the two guides that
+404'd were found under `voice-websockets` and `voice-sip`.
