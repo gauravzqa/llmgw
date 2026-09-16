@@ -66,6 +66,12 @@ kill_timeout = "140s"
   # budgets). Same convention: ships in the image under /app/config/.
   # Unset = the single-target default route from LLMGW_DEFAULT_MODEL.
   # LLMGW_POLICY_FILE = "/app/config/workloads.toml"
+  #
+  # The default route. Every request routes here until a policy file exists;
+  # the client's `model` is rewritten to this target's wire id. The code
+  # default is `fake.echo` (the local fake at 127.0.0.1:8801), which in
+  # production is a 502 on every request -- so this line is not optional.
+  LLMGW_DEFAULT_MODEL = "openai.gpt-4o-mini"
 
   # LLMGW_FAKE_UPSTREAMS is intentionally unset -> false. NEVER set it true here.
   # Provider keys (ANTHROPIC_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY,

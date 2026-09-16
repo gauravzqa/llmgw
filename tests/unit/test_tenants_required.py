@@ -173,3 +173,33 @@ def test_the_shipped_example_file_loads_with_its_env_var_set():
     assert table.resolve("tok-example") == "layrs"
     with pytest.raises(ValueError, match="LLMGW_TENANT_LAYRS_TOKEN"):
         TenantTable.from_toml(text, env={})
+
+
+# ---------------------------------------------------------------- default route
+# LLMGW_REQUIRE_TENANTS is the production switch. In production the
+# zero-policy default route must not be the local fake: the code default is
+# `fake.echo`, and a fly.toml that forgets LLMGW_DEFAULT_MODEL would answer
+# every request with a 502 while /healthz stays green.
+
+
+def test_production_mode_refuses_a_fake_default_route(tmp_path):
+    path = tmp_path / "tenants.toml"
+    path.write_text(_toml("[tenants.layrs]\ntokens = [\"t\"]" + LIMITS))
+    config = ServerConfig(tenants_file=str(path), require_tenants=True)
+    assert config.default_model == "fake.echo"
+    with pytest.raises(ValueError, match="routes to the fake provider"):
+        config.validated()
+
+
+def test_production_mode_accepts_a_real_default_route(tmp_path):
+    path = tmp_path / "tenants.toml"
+    path.write_text(_toml("[tenants.layrs]\ntokens = [\"t\"]" + LIMITS))
+    config = ServerConfig(
+        tenants_file=str(path), require_tenants=True, default_model="openai.gpt-4o-mini",
+    )
+    assert config.validated() is config
+
+
+def test_fake_default_route_is_fine_outside_production_mode():
+    # The zero-config `make run` + curl path must keep working.
+    assert ServerConfig().validated().default_model == "fake.echo"

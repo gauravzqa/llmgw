@@ -666,6 +666,25 @@ class ServerConfig:
                 "to start on the anonymous-tenant path. Point LLMGW_TENANTS_FILE at a "
                 "tenants.toml with at least one tenant, or unset LLMGW_REQUIRE_TENANTS"
             )
+        if self.require_tenants and not self.fake_upstreams and not self.has_policy_document:
+            # LLMGW_REQUIRE_TENANTS is the production switch, and in production
+            # the zero-policy default route MUST NOT point at a fake. The code
+            # default is `fake.echo` (127.0.0.1:8801), so a fly.toml that
+            # forgets LLMGW_DEFAULT_MODEL would 502 every request with a
+            # healthy /healthz. Found while writing that fly.toml, 16 Sep 2026.
+            spec = self.catalog.models.get(self.default_model)
+            provider = self.catalog.providers.get(spec.provider) if spec else None
+            if provider is not None and (
+                provider.id.startswith("fake-")
+                or "127.0.0.1" in (provider.base_url or "")
+                or "localhost" in (provider.base_url or "")
+            ):
+                raise ValueError(
+                    f"LLMGW_REQUIRE_TENANTS is set but LLMGW_DEFAULT_MODEL="
+                    f"{self.default_model!r} routes to the fake provider "
+                    f"{provider.id!r} ({provider.base_url}): set LLMGW_DEFAULT_MODEL "
+                    f"to a real catalog model or ship a LLMGW_POLICY_FILE"
+                )
         self.tenant_limits.validate()
         self.breaker.validate()
         return self

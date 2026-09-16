@@ -178,6 +178,17 @@ PROVIDERS: dict[str, ProviderConn] = {
         api_key_env="DEEPSEEK_API_KEY",
         max_concurrency=32,
     ),
+    # Added 16 Sep 2026 (finding 36: a working key to 135 models the catalog
+    # could not route to). Same entry the live smoke test had been building
+    # for itself; now shipped so `LLMGW_DEFAULT_MODEL` can name an OpenAI
+    # model in production.
+    "openai": ProviderConn(
+        id="openai",
+        kind="openai",
+        base_url="https://api.openai.com/v1",
+        api_key_env="OPENAI_API_KEY",
+        max_concurrency=32,
+    ),
     # The fake upstreams from fakes/upstream.py, wired in by tests and by the
     # local dev config. Present in the shipped catalog on purpose: a test
     # target that needs a special code path is a test target that proves
@@ -209,6 +220,21 @@ PROVIDERS: dict[str, ProviderConn] = {
 MODELS: dict[str, ModelSpec] = {
     m.id: m
     for m in [
+        # OpenAI list prices as copied by the live smoke test on 2026-09-09.
+        # OpenAI exposes no price endpoint, so unlike the OpenRouter rows
+        # these are NOT externally verified; the date says when they were
+        # copied, not when they were checked.
+        ModelSpec(
+            id="openai.gpt-4o-mini",
+            provider="openai",
+            api_model="gpt-4o-mini",
+            input_per_m=0.15,
+            cached_input_per_m=0.075,
+            output_per_m=0.60,
+            context_window=128_000,
+            max_output=16_384,
+            priced_at="2026-09-09",
+        ),
         ModelSpec(
             id="anthropic.haiku-4-5",
             provider="anthropic",
