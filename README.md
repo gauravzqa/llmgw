@@ -15,7 +15,8 @@ every terminal outcome.
 See [CONTRACTS.md](CONTRACTS.md) for the promises,
 [FAILURE-MODES.md](FAILURE-MODES.md) for what breaks without each piece,
 [CAPABILITIES.md](CAPABILITIES.md) for what the three providers offer and
-which of it the gateway handles, passes through, or lacks (swept 16 Sep 2026).
+which of it the gateway handles, passes through, or lacks (swept 16 Sep 2026),
+[PLAN-2.md](PLAN-2.md) for the build order that closes those gaps, text and voice.
 
 Author: Gaurav Pal.
 
