@@ -13,6 +13,7 @@ import pytest
 
 from llmgw import errors as E
 from llmgw.catalog import DEFAULT_CATALOG, Catalog, ModelSpec, ProviderConn
+from llmgw.errors import PolicyError
 
 
 def _conn(pid: str, kind: str = "openai") -> ProviderConn:
@@ -35,7 +36,8 @@ def _spec(mid: str, provider: str, api_model: str, aliases: tuple[str, ...] = ()
         ("gpt-4o-mini-2024-07-18", "openai.gpt-4o-mini"),       # the echoed snapshot
         ("claude-haiku-4-5-20251001", "anthropic.haiku-4-5"),   # wire id
         ("claude-haiku-4-5", "anthropic.haiku-4-5"),            # short alias
-        ("deepseek-flash", "deepseek.deepseek-v4-flash"),       # current wire id
+        # `deepseek-flash` is shared with the Anthropic-dialect row since C4;
+        # it resolves by the route's dialect (see the test below), not bare.
         ("deepseek-v4-flash", "deepseek.deepseek-v4-flash"),    # retired wire id
         ("claude-sonnet-5", "anthropic.sonnet-5"),
     ],
@@ -43,6 +45,19 @@ def _spec(mid: str, provider: str, api_model: str, aliases: tuple[str, ...] = ()
 def test_shipped_aliases_resolve_to_their_catalog_id(sent: str, canonical: str):
     assert DEFAULT_CATALOG.canonical_id(sent) == canonical
     assert DEFAULT_CATALOG.resolve(sent).model.id == canonical
+
+
+def test_a_wire_id_shared_across_dialects_resolves_by_route_kind():
+    """C4: `deepseek-flash` is the wire id of both `deepseek.deepseek-v4-flash`
+    (OpenAI dialect) and `deepseek-anthropic.deepseek-v4-flash` (Anthropic
+    dialect). The server always passes the route's dialect, so each surface
+    reaches its own row; the bare string is ambiguous by design."""
+    assert DEFAULT_CATALOG.canonical_id("deepseek-flash", kind="openai") == (
+        "deepseek.deepseek-v4-flash")
+    assert DEFAULT_CATALOG.canonical_id("deepseek-flash", kind="anthropic") == (
+        "deepseek-anthropic.deepseek-v4-flash")
+    with pytest.raises(PolicyError, match="shared by"):
+        DEFAULT_CATALOG.canonical_id("deepseek-flash")
 
 
 def test_the_alias_table_is_visible_for_probe_and_debugging():

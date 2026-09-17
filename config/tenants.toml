@@ -4,8 +4,25 @@
 # and hand the same value to the caller. No [tenants.anonymous] section, so a
 # request without a bearer token is a 401. max_concurrency stays below
 # LLMGW_MAX_STREAMS (150) so one tenant cannot fill the process.
+#
+# max_sessions (Phase E) bounds the credentials the gateway will MINT for the
+# tenant that are alive at once -- Realtime client secrets and AssemblyAI
+# streaming tokens -- since the sessions they open never transit the gateway.
+# A reservation lives for the credential's TTL and is released by expiry.
 [tenants.layrs]
 token_env = "LLMGW_TENANT_LAYRS_TOKEN"
 rate_per_second = 50.0
 burst = 100
 max_concurrency = 96
+max_sessions = 8
+
+# Pinned Realtime session (Phase E1). Written OVER the client's `session` on
+# POST /v1/realtime/client_secrets: a client cannot widen these. Conservative
+# on purpose -- the mini model, one voice, no tools, a bounded answer, and a
+# ten-minute credential.
+[tenants.layrs.realtime]
+model = "openai.gpt-realtime-mini"
+voice = "cedar"
+tools = []
+max_output_tokens = 1024
+expires_after_seconds_cap = 600

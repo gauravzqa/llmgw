@@ -22,6 +22,7 @@ wedges would look healthy for another full progress window.
 
 from __future__ import annotations
 
+import json
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
@@ -77,6 +78,13 @@ class AnthropicMessagesSurface:
 
     name = "anthropic_messages"
     path = "/v1/messages"
+    # Phase C route registry: the client route carries the dialect prefix,
+    # the upstream path is what Anthropic serves.
+    dialect = "anthropic"
+    routes = ("/anthropic/v1/messages",)
+    upstream_path = "/v1/messages"
+    methods = ("POST",)
+    forward_query = False
 
     # Phase B1/B4/B6: the dialect is SSE over a JSON request with no budget
     # profile of its own -- i.e. exactly what it was before these existed.
@@ -335,6 +343,27 @@ class AnthropicMessagesSurface:
         if "overloaded" in etype:
             return errors.UpstreamOverloaded(message, upstream_body=ev.data)
         return errors.InStreamError(message, upstream_body=ev.data)
+
+    def usage_from_body(self, payload: dict[str, Any], usage: Usage) -> None:
+        """A complete `message` body carries the final `usage` and the
+        `stop_reason` in one object, which is exactly what a `message_delta`
+        frame carries -- so the buffered path reuses the streaming reader by
+        presenting the body as that frame (Phase C, finding 50). Never raises.
+        """
+        try:
+            block = payload.get("usage")
+            if not isinstance(block, dict):
+                return
+            from llmgw.sse import SSEEvent
+
+            frame = {"type": "message_delta", "usage": block,
+                     "delta": {"stop_reason": payload.get("stop_reason")}}
+            self.apply_usage(
+                SSEEvent(event="message_delta", data=json.dumps(frame).encode("utf-8")),
+                usage,
+            )
+        except Exception:  # noqa: BLE001 - billing never breaks serving
+            usage.parse_failures += 1
 
     def stop_reason_from_body(self, payload: dict[str, Any]) -> str | None:
         """`stop_reason` of a complete (non-streamed) message object.

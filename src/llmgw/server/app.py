@@ -199,6 +199,7 @@ import dataclasses
 import json
 import logging
 import math
+import re
 import time
 from collections.abc import Coroutine, Mapping
 from contextlib import asynccontextmanager, suppress
@@ -219,15 +220,23 @@ from llmgw.capture import Capture, CaptureRecord, FileSink, NullSink
 from llmgw.catalog import Target
 from llmgw.clocks import Budgets, Clock, Deadline, SystemClock, phase
 from llmgw.executor import NO_RETRIES, ExecutionResult, Executor, credential_health_key
+from llmgw.metrics import SURFACES as METRIC_SURFACES
 from llmgw.metrics import normalize_stop_reason
 from llmgw.policy import ExecutionPlan, PolicySnapshot, PolicyStore
 from llmgw.pump import Sink
 from llmgw.retry import RetryPolicy
 from llmgw.server.config import ANONYMOUS_TENANT, ServerConfig, TenantTable
 from llmgw.server.telemetry import Collectors
-from llmgw.surfaces import SURFACES as _SHIPPED_SURFACES
-from llmgw.surfaces import Surface, for_path
-from llmgw.surfaces.base import RequestFacts
+from llmgw.surfaces import REGISTRY, Surface
+from llmgw.surfaces.base import (
+    CREDENTIAL_QUERY_KEYS,
+    RequestFacts,
+    surface_dialect,
+    surface_forward_query,
+    surface_methods,
+    surface_routes,
+    surface_upstream_path,
+)
 from llmgw.upstream import Upstream, UpstreamRequest, UpstreamStream
 
 log = logging.getLogger("llmgw.server")
@@ -240,11 +249,13 @@ T = TypeVar("T")
 # ==========================================================================
 
 ROUTE_TO_UPSTREAM_PATH: dict[str, str] = {
-    "/v1/chat/completions": "/v1/chat/completions",
-    "/anthropic/v1/messages": "/v1/messages",
+    route: surface_upstream_path(surface)
+    for surface in REGISTRY
+    for route in surface_routes(surface)
 }
-"""Client route -> the path we send upstream, which is also the key
-`surfaces.for_path()` is registered under.
+"""Client route -> the path we send upstream. Derived from the route
+registry (`surfaces.REGISTRY`, Phase C); kept under its old name because
+tests and tooling read it.
 
 The two differ for Anthropic and that is on purpose. A gateway that offers
 several dialects needs the *client* route to name the dialect, because
@@ -1488,6 +1499,14 @@ class Gateway:
             raise Unauthenticated("unknown bearer token")
         return tenant
 
+    def realtime_pin(self, tenant: str) -> Mapping[str, Any] | None:
+        """The tenant's pinned Realtime session fields (Phase E1), or None on
+        the zero-config path or for a tenant that pinned nothing."""
+        if self.tenants is None:
+            return None
+        getter = getattr(self.tenants, "realtime_pin", None)
+        return getter(tenant) if callable(getter) else None
+
     def tenant_limits_for(self, tenant: str) -> TenantLimits | None:
         """The limits `tenant` would be admitted under, from config alone --
         for the probe, which must answer for a tenant that has never sent a
@@ -1713,7 +1732,7 @@ class Exchange:
 
     __slots__ = ("snapshot", "catalog_id", "workload_id", "target", "attempts",
                  "started", "tenant", "breaker", "upstream", "buffered_stop_reason",
-                 "defaulted_keys")
+                 "defaulted_keys", "mint", "pinned_keys", "request_facts")
 
     def __init__(
         self, snapshot: PolicySnapshot, *, catalog_id: str, workload_id: str
@@ -1733,6 +1752,15 @@ class Exchange:
         """The buffered path's stop reason, from `Surface.stop_reason_from_body`
         in `BufferedSink.send`; the streaming path's comes through `Usage`."""
         self.defaulted_keys: tuple[str, ...] = ()
+        self.mint: bool = False
+        """This request minted a credential on the tenant's behalf (Phase E);
+        the capture record is written with `kind="mint"`."""
+        self.pinned_keys: tuple[str, ...] = ()
+        """Session keys the tenant's pin overrode on a mint."""
+        self.request_facts: Any = None
+        """`Surface.parse_request`'s answer for this request, kept so a
+        stream the provider never metered can be billed from the request
+        side (`Surface.usage_estimate`, Phase D: OpenAI's binary TTS)."""
         """Request keys the served attempt filled in from the target's
         `request_defaults` (PLAN-2 B5); copied off the `UpstreamStream` at
         status commitment, listed in the capture record."""
@@ -1768,7 +1796,7 @@ class Exchange:
         return out
 
 
-SURFACE_NAMES: tuple[str, ...] = tuple(_SHIPPED_SURFACES)
+SURFACE_NAMES: tuple[str, ...] = tuple(dict.fromkeys(surface.name for surface in REGISTRY))
 """The shipped surface names, for the probe's resolved-limits table."""
 
 MULTIPART_SCAN_BYTES = 64 * 1024
@@ -1868,6 +1896,42 @@ def _truthy(value: str | None) -> bool:
     return (value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _estimate_unmetered(surface: Any, result: Any, facts: Any) -> None:
+    """Fill a never-metered stream's usage from the request side (Phase D).
+
+    OpenAI's binary TTS carries no usage anywhere -- not in the body, not in
+    a header -- so the pump's `Usage` is all zeros when the stream ends. A
+    surface that knows what the request asked for (`usage_estimate`: the
+    characters sent to speak) supplies the floor; exactness stays False, so
+    accounting bills it `estimated`, which is honest, rather than zero,
+    which is a lie. Only zero fields are filled: a provider's own count
+    always wins. Never raises.
+    """
+    estimate = getattr(surface, "usage_estimate", None)
+    if estimate is None or facts is None:
+        return
+    pump = getattr(result, "pump", None)
+    usage = getattr(pump, "usage", None)
+    if usage is None:
+        return
+    metered = any(
+        getattr(usage, name, 0)
+        for name in ("input_tokens", "output_tokens", "characters", "seconds",
+                     "audio_input_tokens", "audio_output_tokens")
+    )
+    if metered:
+        return
+    try:
+        est = estimate(facts)
+    except Exception:  # noqa: BLE001 - billing never breaks serving
+        return
+    for name in ("characters", "seconds", "input_tokens", "output_tokens",
+                 "audio_output_tokens"):
+        value = getattr(est, name, 0)
+        if value and not getattr(usage, name, 0):
+            setattr(usage, name, value)
+
+
 def facts_for_body(
     surface: Surface, body: bytes, scope: Scope, *, content_type: str | None
 ) -> RequestFacts:
@@ -1883,6 +1947,11 @@ def facts_for_body(
     kind = getattr(surface, "body", "json")
     if kind == "json":
         return surface.parse_request(body)
+    fixed = getattr(surface, "fixed_model", None)
+    if fixed:
+        # A surface with one target and no model in the request (a token
+        # mint over GET): the catalog id is the surface's, not the client's.
+        return RequestFacts(model=str(fixed), stream=False)
     if kind == "multipart":
         boundary = multipart_boundary(content_type)
         if boundary is None:
@@ -1910,6 +1979,74 @@ def facts_for_body(
     raise errors.PolicyError(f"surface {surface.name!r} declares unknown body kind {kind!r}")
 
 
+class ModelsEndpoint:
+    """`GET /v1/models` and `/anthropic/v1/models`, from the catalog (Phase C1).
+
+    Never opens an upstream connection (CONTRACTS C18). The tenant is
+    resolved exactly as on the serving path, so an unknown token is a 401
+    and the listing is not an unauthenticated view of the catalog; admission
+    is not consulted, because the answer costs a dictionary walk. Counted
+    under `llmgw_requests_total{surface="models"}` once the metrics
+    vocabulary knows the name.
+    """
+
+    __slots__ = ("_gateway", "_surface", "_route", "_metric_surface")
+
+    def __init__(self, gateway: Gateway, *, surface: Any, route: str) -> None:
+        self._gateway = gateway
+        self._surface = surface
+        self._route = route
+        self._metric_surface: str | None = (
+            surface.name if surface.name in METRIC_SURFACES else None
+        )
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        gw = self._gateway
+        started = gw.clock.now()
+        snapshot = gw.policy.current()
+        derived = gw.derived(snapshot)
+        exchange = Exchange(
+            snapshot, catalog_id=derived.catalog_id, workload_id=snapshot.default_workload,
+        )
+        outcome, code = "completed", "none"
+        try:
+            try:
+                exchange.tenant = gw.resolve_tenant(scope)
+            except Unauthenticated as exc:
+                outcome, code = "failed", "unauthenticated"
+                await send_json_error(
+                    send, status=401, code="unauthenticated", message=str(exc),
+                    exchange=exchange, extra_headers=[(b"www-authenticate", b"Bearer")],
+                )
+                return
+            listing = self._surface.listing(
+                gw.config.catalog, route=self._route,
+                include_fakes=bool(gw.config.fake_upstreams),
+            )
+            payload = json.dumps(listing, separators=(",", ":")).encode("utf-8")
+            headers = [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(payload)).encode("ascii")),
+                *exchange.gw_headers(),
+            ]
+            await send({"type": "http.response.start", "status": 200, "headers": headers})
+            await send({"type": "http.response.body", "body": payload, "more_body": False})
+        finally:
+            collectors = gw.collectors
+            if collectors is not None and self._metric_surface is not None:
+                try:
+                    collectors.request(
+                        surface=self._metric_surface, outcome=outcome,
+                        code=code if code in ("none",) else "none",
+                    )
+                    collectors.request_duration(
+                        surface=self._metric_surface, outcome=outcome,
+                        seconds=max(0.0, gw.clock.now() - started),
+                    )
+                except ValueError:  # a label outside the closed vocabulary
+                    pass
+
+
 class PassthroughEndpoint:
     """One surface, one target, byte-for-byte. A raw ASGI app.
 
@@ -1919,12 +2056,15 @@ class PassthroughEndpoint:
     optional here.
     """
 
-    __slots__ = ("_gateway", "_surface", "_route", "_forward")
+    __slots__ = ("_gateway", "_surface", "_route", "_forward", "_metric_surface")
 
     def __init__(self, gateway: Gateway, *, surface: Surface, route: str) -> None:
         self._gateway = gateway
         self._surface = surface
         self._route = route
+        self._metric_surface: str | None = (
+            surface.name if surface.name in METRIC_SURFACES else None
+        )
         # Lower-cased and pre-encoded once at build time. ASGI hands us header
         # names as bytes, and re-decoding every one of them per request to
         # compare against a set of str is work done on the hot path to make a
@@ -1992,9 +2132,13 @@ class PassthroughEndpoint:
         # SAME two places (`stream_entered`/`stream_exited`), so the thing a
         # drain waits on and the thing a scrape reads can never disagree.
         collectors = gw.collectors
-        surface = self._surface.name
+        # The metrics label. A registry name the metrics vocabulary does not
+        # know yet (Phase C's surfaces until `metrics.SURFACES` widens) is
+        # not emitted rather than raised: label cardinality is closed, but a
+        # closed set must not make a route unservable.
+        surface = self._metric_surface
         gw.stream_entered()
-        if collectors is not None:
+        if collectors is not None and surface is not None:
             collectors.stream_open(surface=surface)
         try:
             # P6: shed NEW work while draining, as the first thing in the
@@ -2091,18 +2235,60 @@ class PassthroughEndpoint:
                 # non-JSON body is never edited at all. See surfaces/base.
                 body_kind = getattr(self._surface, "body", "json")
                 client_content_type = header_value(scope, b"content-type")
+                # A surface whose FRAMING depends on the request (OpenAI TTS:
+                # `stream_format: "sse"` or binary) answers `surface_for(body)`
+                # with the instance that reads that framing; everything else
+                # returns None and the registered instance serves. Chosen once,
+                # before the facts, and threaded through `_serve` so the pump,
+                # the sink and accounting all see the same dialect.
+                served_surface = self._surface
+                picker = getattr(served_surface, "surface_for", None)
+                if picker is not None:
+                    served_surface = picker(body) or served_surface
                 facts = facts_for_body(
-                    self._surface, body, scope, content_type=client_content_type
+                    served_surface, body, scope, content_type=client_content_type
                 )
+                exchange.request_facts = facts
+                # Phase E: a tenant's pinned Realtime model wins over the
+                # client's on a mint (C19); read once, before the plan.
+                pin = None
+                if getattr(self._surface, "mint_route", None) == self._route:
+                    pin = gw.realtime_pin(tenant)
+                pinned_model = (pin or {}).get("model") if pin else None
                 # The body's model pins the target ONLY when the caller named
                 # no workload; see the module docstring for why the other way
                 # round makes every candidate unreachable.
                 plan = snapshot.plan_for(
-                    workload_id, model=None if requested is not None else facts.model,
+                    workload_id,
+                    model=(str(pinned_model) if pinned_model
+                           else (None if requested is not None else facts.model)),
                     # The route's dialect, so a wire id shared across dialects
                     # (an alias, PLAN-2 A1) resolves to this surface's target.
-                    kind=self._surface.name.split("_", 1)[0],
+                    kind=surface_dialect(self._surface),
                 )
+                # Phase C: the upstream path for THIS route -- templates
+                # filled from the path params, the query forwarded when the
+                # surface says so, credential-looking keys refused always.
+                upstream_path, query, ttl = self._upstream_path(scope)
+                extra = dict(forwarded_request_headers(scope, self._forward))
+                prepare = getattr(self._surface, "prepare_mint", None)
+                if prepare is not None:
+                    mint = prepare(
+                        body, route=self._route, target=plan.primary, tenant=tenant,
+                        pin=pin, grace_s=config.drain_grace_seconds,
+                    )
+                    if mint is not None:
+                        body = mint.body
+                        extra.update(mint.extra_headers)
+                        ttl = mint.ttl_s
+                        exchange.pinned_keys = mint.pinned_keys
+                if ttl is not None:
+                    # A credential is about to be issued: count it against the
+                    # tenant's session cap for as long as it lives (E1/E2).
+                    gw.admission.reserve_session(tenant, ttl)
+                    exchange.mint = True
+                if query:
+                    upstream_path = f"{upstream_path}?{query}"
                 # `exchange.target` is deliberately NOT pre-set to
                 # `plan.primary` here. `X-Gw-Served-By` means "the target that
                 # answered", and on a walk where nobody did, naming the first
@@ -2115,7 +2301,10 @@ class PassthroughEndpoint:
                 await self._serve(
                     receive, send, exchange,
                     deadline=deadline, plan=plan, body=body, streaming=facts.stream,
-                    extra_headers=forwarded_request_headers(scope, self._forward),
+                    extra_headers=extra,
+                    surface=served_surface,
+                    upstream_path=upstream_path,
+                    method=str(scope.get("method") or "POST").upper(),
                     retry_policy=_retry_policy_for(
                         plan, derived.retry.get(workload_id),
                         no_retry=self._no_retry(scope),
@@ -2225,9 +2414,64 @@ class PassthroughEndpoint:
             # refusal, a disconnect or a raise exited through here.
             gw.stream_exited()
             if collectors is not None:
-                collectors.stream_close(surface=surface)
+                if surface is not None:
+                    collectors.stream_close(surface=surface)
 
     # ------------------------------------------------------------------ serve
+
+    _PARAM_OK = re.compile(r"^[A-Za-z0-9_.:@+-]{1,128}$")
+
+    def _upstream_path(self, scope: Scope) -> tuple[str, str, float | None]:
+        """(upstream path, forwarded query, session TTL) for this request.
+
+        The template is the surface's `upstream_path` (or its per-route
+        choice via `upstream_path_for`), with Starlette's path params
+        substituted after a character-class check -- a param is a path
+        segment and may not smuggle a slash, a space or a query. The query
+        string is forwarded only when the surface opts in, never with a
+        credential-looking key, and a mint surface may rewrite it
+        (`prepare_query`) and name the session length it authorised.
+        """
+        params = {k: str(v) for k, v in (scope.get("path_params") or {}).items()
+                  if k != "workload"}
+        chooser = getattr(self._surface, "upstream_path_for", None)
+        template = (chooser(self._route) if callable(chooser)
+                    else surface_upstream_path(self._surface))
+        validate = getattr(self._surface, "validate_params", None)
+        if callable(validate):
+            validate(params)
+        for name, value in params.items():
+            if not self._PARAM_OK.match(value):
+                raise errors.InvalidRequest(f"path parameter {name!r} has an unexpected value")
+        try:
+            path = template.format(**params)
+        except (KeyError, IndexError) as exc:
+            raise errors.PolicyError(
+                f"surface {self._surface.name!r} upstream path {template!r} needs "
+                f"a param the route did not carry: {exc}"
+            ) from exc
+        raw_query = (scope.get("query_string") or b"").decode("latin-1")
+        query = ""
+        ttl: float | None = None
+        if raw_query:
+            from urllib.parse import parse_qsl
+
+            keys = {k.lower() for k, _ in parse_qsl(raw_query, keep_blank_values=True)}
+            leaked = sorted(keys & CREDENTIAL_QUERY_KEYS)
+            if leaked:
+                raise errors.InvalidRequest(
+                    f"query parameter(s) {leaked} look like credentials and are not "
+                    f"forwarded; the gateway holds the provider key"
+                )
+            if surface_forward_query(self._surface):
+                query = raw_query
+        if surface_forward_query(self._surface):
+            prepare_query = getattr(self._surface, "prepare_query", None)
+            if callable(prepare_query):
+                query, ttl = prepare_query(
+                    query, grace_s=self._gateway.config.drain_grace_seconds
+                )
+        return path, query, ttl
 
     async def _serve(
         self,
@@ -2244,6 +2488,9 @@ class PassthroughEndpoint:
         body_kind: str = "json",
         content_type: str | None = None,
         max_response_bytes: int | None = None,
+        upstream_path: str | None = None,
+        method: str = "POST",
+        surface: Surface | None = None,
     ) -> None:
         """Run the plan, and start the client's response when a byte arrives.
 
@@ -2260,6 +2507,9 @@ class PassthroughEndpoint:
         anything that fails falls back; after it there is no plan, because
         HTTP has no second status.
         """
+        # The dialect serving THIS request: the registered surface, or the
+        # per-request instance `__call__` picked for a framing the body chose.
+        served = surface or self._surface
         gw = self._gateway
         config = gw.config
         tally = _AttemptTally(gw.upstream)
@@ -2284,7 +2534,7 @@ class PassthroughEndpoint:
                 # The buffered path sends its status from inside the sink,
                 # one write later, because that is where the length is known.
                 return BufferedSink(send, stream=stream, exchange=exchange,
-                                    surface=self._surface)
+                                    surface=served)
             headers = response_headers(stream, exchange=exchange, streaming=True)
             # Set BEFORE the await, for the same reason `pump.py` sets its own
             # commitment flag early: a send that raises may still have put the
@@ -2306,9 +2556,10 @@ class PassthroughEndpoint:
                 limiter=gw.limiter,
             ).execute(
                 plan=plan,
-                surface=self._surface,
+                surface=served,
                 body=body,
-                path=self._surface.path,
+                path=upstream_path or surface_upstream_path(self._surface),
+                method=method,
                 stream=streaming,
                 deadline=deadline,
                 sink_factory=start_response,
@@ -2409,8 +2660,9 @@ class PassthroughEndpoint:
         """
         gw = self._gateway
         collectors = gw.collectors
-        surface = self._surface.name
+        surface = self._metric_surface
         try:
+            _estimate_unmetered(self._surface, result, exchange.request_facts)
             rec = accounting.account(result, catalog=gw.config.catalog)
             provider, model = rec.provider, rec.model
             outcome = rec.outcome.value
@@ -2429,7 +2681,7 @@ class PassthroughEndpoint:
                 if ttfe < 0:  # a clock the executor and pump did not share
                     ttfe = None
 
-            if collectors is not None:
+            if collectors is not None and surface is not None:
                 collectors.request(surface=surface, outcome=outcome, code=rec.code)
                 collectors.request_duration(
                     surface=surface, outcome=outcome, seconds=duration_s
@@ -2479,7 +2731,8 @@ class PassthroughEndpoint:
                 # through `Usage` on the streaming path, through the body
                 # reader on the buffered one.
                 if stop_reason is not None:
-                    collectors.stop_reason(surface=surface, stop_reason=stop_reason)
+                    if surface is not None:
+                        collectors.stop_reason(surface=surface, stop_reason=stop_reason)
                 # Timeouts that fired while the provider was sending liveness
                 # and no content: a queue, not an outage (A4). The pump stamps
                 # `queued` on the clock error it raised -- a `StallTimeout`
@@ -2544,6 +2797,7 @@ class PassthroughEndpoint:
                     cost_usd=rec.cost_usd,
                     basis=rec.basis,
                     committed=rec.committed,
+                    kind="mint" if exchange.mint else "request",
                     first_event_latency=ttfe,
                     duration_s=duration_s,
                     error_code=None if rec.code == "none" else rec.code,
@@ -2970,20 +3224,25 @@ def build_app(
         )
 
     routes: list[Route] = []
-    for route, upstream_path in ROUTE_TO_UPSTREAM_PATH.items():
-        surface = for_path(upstream_path)
-        if surface is None:  # pragma: no cover - guarded at import by the registry
-            raise RuntimeError(f"no surface registered for {upstream_path!r}")
-        endpoint = PassthroughEndpoint(gateway, surface=surface, route=route)
-        routes.append(Route(route, endpoint, methods=["POST"], name=surface.name))
-        # The same endpoint OBJECT under the workload-prefixed path. One
-        # serving path, two ways to address it: a second endpoint instance
-        # would be a second place for the two forms to drift apart, and the
-        # only difference between them is a `path_params` entry.
-        routes.append(Route(
-            f"{WORKLOAD_ROUTE_PREFIX}{route}", endpoint, methods=["POST"],
-            name=f"{surface.name}_by_workload",
-        ))
+    for surface in REGISTRY:
+        methods = list(surface_methods(surface))
+        for route in surface_routes(surface):
+            endpoint: Any
+            if getattr(surface, "serves_locally", False):
+                # `/v1/models`: answered from the catalog, never upstream (C18).
+                endpoint = ModelsEndpoint(gateway, surface=surface, route=route)
+            else:
+                endpoint = PassthroughEndpoint(gateway, surface=surface, route=route)
+            routes.append(Route(route, endpoint, methods=methods, name=surface.name))
+            # The same endpoint OBJECT under the workload-prefixed path. One
+            # serving path, two ways to address it: a second endpoint
+            # instance would be a second place for the two forms to drift
+            # apart, and the only difference between them is a `path_params`
+            # entry.
+            routes.append(Route(
+                f"{WORKLOAD_ROUTE_PREFIX}{route}", endpoint, methods=methods,
+                name=f"{surface.name}_by_workload",
+            ))
     # `extra_surfaces`: client route -> Surface, mounted on the same
     # `PassthroughEndpoint` as the shipped routes (PLAN-2 B4). This is how the
     # contract tier exercises `body="multipart"` and `body="raw"` before any

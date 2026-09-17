@@ -353,6 +353,32 @@ class Surface(Protocol):
     none (Phase B6): a text-to-speech surface asks for `"tts"` (first event
     2 s, progress 5 s); None means the workload's own budgets."""
 
+    routes: tuple[str, ...]
+    """Client path templates this surface serves (Phase C route registry).
+    Starlette-style params are allowed (`/elevenlabs/v1/text-to-speech/
+    {voice_id}/stream`); every route is also mounted under
+    `/workloads/{workload}`. The server builds its route table from these."""
+
+    upstream_path: str
+    """The path sent to the provider, which may reference the same params as
+    `routes`. Equal to `path` for the two chat surfaces; kept as a separate
+    name because the two only coincide when there is one route per surface."""
+
+    methods: tuple[str, ...]
+    """HTTP methods the routes accept. `("POST",)` for every dialect that
+    carries a body; `("GET",)` for a listing or a token mint."""
+
+    forward_query: bool
+    """Forward the client's query string upstream verbatim. Credential-looking
+    keys (`token`, `key`, `api_key`, `xi-api-key`) are refused with a 400
+    whatever this says: a credential in a URL is a credential in a log."""
+
+    dialect: str
+    """`"openai"` or `"anthropic"`: the wire contract the CLIENT speaks on
+    this surface, used to break alias ties and to pick which providers a
+    listing shows. Was derived from `name.split("_")[0]`, which stops being
+    true for `count_tokens`."""
+
     def framer(self, max_frame_bytes: int) -> Framer: ...
 
     def parse_request(self, body: bytes) -> RequestFacts: ...
@@ -366,6 +392,17 @@ class Surface(Protocol):
         """The normalised stop reason of a complete, non-streamed response
         body, or None. The buffered path has no frames for `apply_usage` to
         see, so accounting asks the dialect directly. Never raises."""
+        ...
+
+    def usage_from_body(self, payload: dict[str, Any], usage: Usage) -> None:
+        """Fold a complete, non-streamed response body's usage into `usage`.
+
+        Until Phase C the buffered path recorded NO usage at all: accounting
+        read the pump's accumulator and a buffered response has no pump, so
+        every non-streamed chat call billed zero with `basis=estimated`
+        (finding 50). Never raises; a body without usage leaves `usage`
+        inexact, which is the honest report.
+        """
         ...
 
 
@@ -534,3 +571,178 @@ def read_max_tokens(raw: dict[str, Any], *keys: str) -> int | None:
         if value is not None and value > 0:
             return value
     return None
+
+
+# ==========================================================================
+# Route registry defaults (Phase C). A surface that predates these attributes
+# -- or a test stub -- gets values that mean "one POST route, the upstream
+# path is `path`, no query forwarding, dialect from the name".
+# ==========================================================================
+
+CREDENTIAL_QUERY_KEYS: frozenset[str] = frozenset({"token", "key", "api_key", "xi-api-key"})
+"""Query keys a client may not send through the gateway, because a credential
+in a URL is a credential in an access log. Refused with 400 before any
+upstream work, on every surface, whatever `forward_query` says."""
+
+DEFAULT_METHODS: tuple[str, ...] = ("POST",)
+
+
+def surface_routes(surface: Any) -> tuple[str, ...]:
+    """The client routes a surface serves; `(path,)` for a pre-registry one."""
+    routes = getattr(surface, "routes", None)
+    if routes:
+        return tuple(routes)
+    return (str(surface.path),)
+
+
+def surface_upstream_path(surface: Any) -> str:
+    """The path sent upstream; `path` for a pre-registry surface."""
+    return str(getattr(surface, "upstream_path", None) or surface.path)
+
+
+def surface_methods(surface: Any) -> tuple[str, ...]:
+    return tuple(getattr(surface, "methods", None) or DEFAULT_METHODS)
+
+
+def surface_dialect(surface: Any) -> str:
+    """`openai` / `anthropic`: explicit when the surface says so, otherwise the
+    first token of its name -- which is what the server did before Phase C
+    and is still right for `openai_chat` and `anthropic_messages`."""
+    explicit = getattr(surface, "dialect", None)
+    if explicit:
+        return str(explicit)
+    return str(surface.name).split("_", 1)[0]
+
+
+def surface_forward_query(surface: Any) -> bool:
+    return bool(getattr(surface, "forward_query", False))
+
+
+def usage_from_body(surface: Any, payload: dict[str, Any], usage: Usage) -> None:
+    """Call the surface's `usage_from_body` when it has one; otherwise fold
+    the body through `apply_usage` as if it were a single frame, which is
+    exactly right for the OpenAI dialect (a buffered chat body carries the
+    same top-level `usage` object as the final streamed chunk). Never raises."""
+    own = getattr(surface, "usage_from_body", None)
+    try:
+        if callable(own):
+            own(payload, usage)
+            return
+        from llmgw.sse import SSEEvent
+
+        surface.apply_usage(SSEEvent(data=json.dumps(payload).encode("utf-8")), usage)
+    except Exception:  # noqa: BLE001 - billing never breaks serving
+        usage.parse_failures += 1
+
+
+# ==========================================================================
+# BufferedSurface: JSON in, one JSON body out, never a stream (Phase C2).
+# `count_tokens`, `embeddings`, the realtime control plane and the token
+# mints are all this shape, and the voice phase's `assemblyai_sync` is too.
+# The streaming hooks exist because the pump's protocol asks for them; they
+# answer "nothing here is content", which is what a buffered body is to a
+# pump that never runs.
+# ==========================================================================
+
+
+class BufferedSurface:
+    """Base for surfaces that are one request, one JSON answer.
+
+    Subclasses set `name`, `dialect`, `routes`, `upstream_path`, and either
+    `model_key` (where the request body names its model) or `fixed_model`
+    (a catalog id used when the body names none -- a token mint has no model
+    in the client's sense, but the gateway still routes it to ONE provider
+    row and bills nothing). `usage_path` names the response field to read
+    usage from, when there is one.
+    """
+
+    name: str = "buffered"
+    dialect: str = "openai"
+    routes: tuple[str, ...] = ()
+    upstream_path: str = "/"
+    methods: tuple[str, ...] = DEFAULT_METHODS
+    forward_query: bool = False
+    framing: Literal["sse", "jsonl", "raw"] = "sse"
+    body: Literal["json", "multipart", "raw"] = "json"
+    default_profile: str | None = None
+
+    model_key: str | None = "model"
+    """Top-level body key naming the model, or None when the body never
+    carries one (then `fixed_model` is required)."""
+    fixed_model: str | None = None
+    """Catalog id to route to when the body names no model."""
+    accounts: bool = True
+    """False for surfaces whose response carries no billable usage
+    (`count_tokens`, the mints): the record is written with zero units and
+    `basis=estimated`, and `usage_from_body` is never consulted."""
+
+    @property
+    def path(self) -> str:
+        return self.upstream_path
+
+    def framer(self, max_frame_bytes: int) -> Framer:
+        from llmgw.framing import framer_for
+
+        return framer_for(self.framing, max_frame_bytes=max_frame_bytes)
+
+    # ------------------------------------------------------------- request
+
+    def model_from(self, raw: dict[str, Any]) -> str | None:
+        """Where this surface's request names its model. Overridable for
+        nested shapes (`session.model` on a Realtime client secret)."""
+        if self.model_key is None:
+            return None
+        value = raw.get(self.model_key)
+        return value if isinstance(value, str) and value else None
+
+    def parse_request(self, body: bytes) -> RequestFacts:
+        raw = parse_json_object(body) if body.strip() else {}
+        model = self.model_from(raw) or self.fixed_model
+        if not model:
+            raise errors.InvalidRequest(
+                f"{self.name}: the request names no model and the surface has no fixed one"
+            )
+        return RequestFacts(model=model, stream=False)
+
+    # ------------------------------------------------------------ streaming
+    # A buffered surface never streams; these exist so the object satisfies
+    # the pump's protocol if a misconfigured target ever answers SSE.
+
+    def classify(self, ev: SSEEvent) -> EventKind:
+        return EventKind.META
+
+    def text_delta(self, ev: SSEEvent) -> str | None:
+        return None
+
+    def apply_usage(self, ev: SSEEvent, usage: Usage) -> None:
+        return None
+
+    def error_from_event(self, ev: SSEEvent) -> errors.GatewayError | None:
+        return None
+
+    def native_ending(self, last_event: SSEEvent | None = None) -> bytes:
+        return b""
+
+    def stop_reason_from_body(self, payload: dict[str, Any]) -> str | None:
+        return None
+
+    # ------------------------------------------------------------- response
+
+    def usage_from_body(self, payload: dict[str, Any], usage: Usage) -> None:
+        """Default: an OpenAI-shaped `usage` object at the top level, input
+        tokens only (`prompt_tokens`), exact when present. Embeddings is the
+        canonical case; subclasses with no usage leave `accounts=False`."""
+        if not self.accounts:
+            return
+        block = payload.get("usage")
+        if not isinstance(block, dict):
+            return
+        prompt = as_int(block.get("prompt_tokens"))
+        if prompt is None:
+            prompt = as_int(block.get("input_tokens"))
+        if prompt is None:
+            return
+        usage.input_tokens = max(prompt, 0)
+        usage.output_tokens = 0
+        usage.input_exact = True
+        usage.output_exact = True

@@ -559,14 +559,40 @@ def test_stream_is_the_one_field_we_refuse_to_guess_at(surface):
 # ======================================================================
 
 
+PHASE_C_SURFACES = {"models", "count_tokens", "embeddings", "realtime_control",
+                    "assemblyai_token"}
+VOICE_SURFACE_NAMES = {"audio_speech", "audio_transcription", "inworld_tts",
+                       "elevenlabs_tts", "assemblyai_sync"}
+"""Phase C's surfaces. Their names join `metrics.SURFACES` in the same
+change that adds the voice names (Phase D, another file); until then the
+server emits no surface-labelled metric for them rather than raising."""
+
+
 def test_the_registry_is_a_closed_set_keyed_by_the_metrics_label():
     """`name` is a Prometheus label value. The registry is what keeps that
     label's cardinality finite and enumerable."""
-    assert set(SURFACES) == {"openai_chat", "anthropic_messages"}
+    from llmgw import metrics
+    from llmgw.surfaces import REGISTRY, VOICE_SURFACES
+
+    names = set(SURFACES)
+    voice = {s.name for s in VOICE_SURFACES}
+    assert names == {"openai_chat", "anthropic_messages"} | PHASE_C_SURFACES | voice
+    assert len(REGISTRY) >= len(names)  # voice registers one instance per route
     for name, surface in SURFACES.items():
         assert surface.name == name
-        assert for_path(surface.path) is surface
+        assert set(name) <= set("abcdefghijklmnopqrstuvwxyz_"), name
+    # The two chat surfaces are addressable by upstream path, as before.
+    for name in ("openai_chat", "anthropic_messages"):
+        assert for_path(SURFACES[name].path) is SURFACES[name]
     assert for_path("/v1/nope") is None
+    # Every registry name is either known to metrics or a Phase C/D name
+    # waiting on `metrics.SURFACES` to widen; and every metrics name that is
+    # not a registry name is one of the two kinds the vocabulary may carry
+    # ahead of its surface (the unbuilt Responses surface, the voice names
+    # that land with their own package).
+    assert names - set(metrics.SURFACES) <= PHASE_C_SURFACES | voice
+    ahead = set(metrics.SURFACES) - names
+    assert ahead <= {"openai_responses"} | VOICE_SURFACE_NAMES | PHASE_C_SURFACES, ahead
 
 
 # ============================================================ Phase B3 kinds

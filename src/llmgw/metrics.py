@@ -53,7 +53,27 @@ MetricKind = Literal["counter", "gauge", "histogram"]
 
 # Closed label vocabularies. Every label value used at runtime must come from
 # one of these, and the registration code in P5 asserts it.
-SURFACES: tuple[str, ...] = ("openai_chat", "openai_responses", "anthropic_messages")
+SURFACES: tuple[str, ...] = (
+    "openai_chat",
+    "openai_responses",
+    "anthropic_messages",
+    # PLAN-2 Phase C: text surfaces that are not chat.
+    "models",
+    "count_tokens",
+    "embeddings",
+    # PLAN-2 Phase E: token minting is a surface (it is a request the tenant
+    # is admitted for and a capture record), never a media path.
+    "realtime_control",
+    "assemblyai_token",
+    # PLAN-2 Phase D: voice over HTTP. One name per provider dialect, because
+    # the framing, the unit and the error body all differ per provider.
+    "audio_speech",
+    "audio_transcription",
+    "inworld_tts",
+    "elevenlabs_tts",
+    "elevenlabs_tts_timestamps",
+    "assemblyai_sync",
+)
 OUTCOMES: tuple[str, ...] = tuple(o.value for o in Outcome)
 ATTEMPT_RESULTS: tuple[str, ...] = (
     "success",
@@ -464,7 +484,7 @@ CARDINALITY_BUDGET = 60_000
 limit. Exceeding it means a label was added that should have been a capture
 field, and the test that guards it should fail loudly."""
 
-DESIGN_POINT = (10, 40)
+DESIGN_POINT = (16, 60)
 """(providers, models) ACTIVELY ROUTED TO, not catalog size.
 
 The distinction matters and it is easy to get wrong. A Prometheus client
@@ -477,6 +497,12 @@ need.
 Budgeting against ACTIVE targets is the honest bound -- with the caveat that
 "active" is a runtime property, so a routing change can quietly move you.
 That is precisely why the rule below exists rather than a bare number.
+
+Raised from (10, 40) on 18 Sep 2026 when PLAN-2 phases C to E added seven
+provider rows (three AssemblyAI bases, two DeepSeek bases, Inworld,
+ElevenLabs) and ten model rows, and the surface vocabulary grew from three
+names to thirteen: 47k series at this point against the 60k budget. The
+next widening should be a capture field, not a label.
 """
 
 HISTOGRAM_LABEL_LIMIT = 2

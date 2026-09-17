@@ -1072,3 +1072,49 @@ async def test_aclose_is_idempotent_and_survives_a_closed_client():
     await up.aclose()
     await up.aclose()
     assert up.stats() == {"p1": 0}
+
+
+# ------------------------------------------------- multipart model form field
+# 18 Sep 2026: the multipart body reached OpenAI byte-for-byte, so the catalog
+# id in the `model` form field produced a provider 404. The splice below is the
+# one edit a multipart body gets -- the same edit JSON bodies get.
+
+
+def _mp(fields: list[tuple[str, bytes]], boundary: str = "b0und") -> bytes:
+    parts = []
+    for name, value in fields:
+        head = f'Content-Disposition: form-data; name="{name}"'
+        if name == "file":
+            head += '; filename="a.wav"\r\nContent-Type: audio/wav'
+        parts.append(f"--{boundary}\r\n{head}\r\n\r\n".encode() + value + b"\r\n")
+    return b"".join(parts) + f"--{boundary}--\r\n".encode()
+
+
+def test_multipart_model_field_is_spliced_to_the_wire_id():
+    from llmgw.upstream import apply_api_model_multipart
+
+    body = _mp([("model", b"openai.gpt-transcribe"), ("stream", b"false"),
+                ("file", b"RIFF" + b"\x00" * 64)])
+    out, changed = apply_api_model_multipart(body, "gpt-transcribe")
+    assert changed
+    assert b'name="model"\r\n\r\ngpt-transcribe\r\n' in out
+    assert b"openai.gpt-transcribe" not in out
+    # Everything else is byte-identical: boundary, other fields, the file.
+    assert out.count(b"--b0und") == body.count(b"--b0und")
+    assert out.split(b"--b0und")[2:] == body.split(b"--b0und")[2:]
+
+
+def test_multipart_model_field_already_wire_id_is_untouched():
+    from llmgw.upstream import apply_api_model_multipart
+
+    body = _mp([("model", b"gpt-transcribe"), ("file", b"\x00" * 16)])
+    out, changed = apply_api_model_multipart(body, "gpt-transcribe")
+    assert not changed and out is body
+
+
+def test_multipart_splice_only_touches_the_named_key():
+    from llmgw.upstream import apply_api_model_multipart
+
+    body = _mp([("modelId", b"inworld.tts-2"), ("model", b"keep-me"), ("file", b"\x00")])
+    out, changed = apply_api_model_multipart(body, "inworld-tts-2", key="modelId")
+    assert changed and b'name="modelId"\r\n\r\ninworld-tts-2\r\n' in out and b"keep-me" in out

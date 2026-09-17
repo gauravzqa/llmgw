@@ -147,7 +147,10 @@ def test_a_one_hour_write_on_a_row_without_the_rate_falls_back_and_says_so():
 def test_audio_tokens_on_an_audio_priced_row_use_the_audio_rates():
     cat = voice_catalog()
     spec = cat.models["audio.chat"]
-    usage = usage_like(input_tokens=100, output_tokens=50,
+    # Audio tokens are a SUBSET of the base counts (OpenAI reports
+    # `audio_tokens` inside `prompt_tokens` / `completion_tokens`), so the
+    # base counts here include them: 100 text + 1000 audio in, 50 + 200 out.
+    usage = usage_like(input_tokens=1100, output_tokens=250,
                        audio_input_tokens=1000, audio_output_tokens=200,
                        cached_audio_input_tokens=400)
     rec = account(result_for(cat, "audio.chat", usage), catalog=cat)

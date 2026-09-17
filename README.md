@@ -31,6 +31,22 @@ Author: Gaurav Pal.
 - Drain on SIGTERM, `/healthz`, `/workloads/<w>/probe`, cancellation
 - Load harness, scenarios S1 to S8, measured results
 
+Since PLAN-2 Phases C, D and E (18 Sep 2026) the route table comes from a
+surface registry, and these surfaces sit beside the two chat ones:
+`GET /v1/models` (served from the catalog, no upstream call),
+`POST /anthropic/v1/messages/count_tokens`, `POST /v1/embeddings`,
+`POST /v1/realtime/client_secrets` and `GET /assemblyai/v3/token` (token
+minting with tenant-pinned session config and a per-tenant session cap),
+`POST /v1/audio/speech` (binary or SSE), `POST /v1/audio/transcriptions`
+and `/translations` (multipart in, SSE or JSON out),
+`POST /inworld/tts/v1/voice` and `:stream` (NDJSON, billed in characters),
+`POST /elevenlabs/v1/text-to-speech/{voice_id}`, `/stream` and
+`/stream/with-timestamps` (raw audio or NDJSON, billed from the
+`character-cost` header), and `POST /assemblyai/transcribe` (raw PCM in,
+billed in seconds). OpenAI and Inworld paths are exercised against the real
+providers; ElevenLabs and AssemblyAI are contract-tested against fakes built
+from their documented shapes only, because no keys for them exist here.
+
 Verified against real providers: streaming chat, streaming tool calls with a
 second-turn round trip, reasoning passthrough, vision, JSON mode, mid-stream
 cancellation, and error classification, on Anthropic, OpenAI and DeepSeek.
@@ -40,8 +56,8 @@ See [bench/results/live_smoke.md](bench/results/live_smoke.md).
 
 ```bash
 make venv      # uv venv + editable install
-make test      # tier 1: 1124 tests, no sockets, no sleeps.  ~1.9s
-make contract  # tier 2: 185 tests, real sockets + real uvicorn. ~58s
+make test      # tier 1: 1249 tests, no sockets, no sleeps.  ~2.2s
+make contract  # tier 2: 213 tests, real sockets + real uvicorn. ~65s
 make chaos     # tier 3:  22 tests, randomized faults + invariants. ~60s
 make live      # tier 4:  10 tests, REAL providers, real money (~$0.0002)
 make trace     # walk one real stream through every layer
@@ -135,6 +151,21 @@ shutdown artefact, fixed in the same change: on a forced exit (a second
 SIGTERM) the capture worker's cancellation surfaced as one ERROR traceback
 per process after uvicorn had finished; it was never a serving-path error.
 
+Re-run 18 Sep after Phases C, D and E (a clean EOF now ends jsonl and raw
+streams as complete; SSE unchanged), same laptop, load average 4.7 to 8. S3
+at four workers: 65.5 MB per process at 1,045 open streams, 3.37 tasks and
+one socket each way per stream, zero bytes buffered, calibrated to within
+0.05 ms of the direct arm; three of 3,533 requests were refused with a 502
+before any upstream contact during the ramp, a connect-phase event the fake
+never saw and the pump never handled. S5 at four workers: zero bytes buffered
+under 545 slow clients, 58.3 MB per process against 59.4 MB on 10 Sep, zero
+errors, calibrated. The per-stream slope figures moved in both directions
+while peaks did not; the slope is a fit over samples whose floor shifted, and
+the absolutes are the numbers to read. Live: 16 text cases and 6 voice cases
+pass against OpenAI, Anthropic, DeepSeek and Inworld, including a 10 MiB
+vision body, multipart transcription with duration usage, binary and SSE
+speech, and Inworld's NDJSON stream billed from its first line.
+
 | Report | What it holds |
 |---|---|
 | [load-S1-gw4-run.md](bench/results/load-S1-gw4-run.md) | 400 rps short calls: the per-request overhead floor (16 Sep, after Phase A: +0.37 ms p50) |
@@ -142,11 +173,13 @@ per process after uvicorn had finished; it was never a serving-path error.
 | [load-S2-cap150-gw4-run.md](bench/results/load-S2-cap150-gw4-run.md) | 2,500 typical streams with the cap at 150: shed before degrade (15 Sep) |
 | [load-S2-cap300-gw4-run.md](bench/results/load-S2-cap300-gw4-run.md) | the same at 300: the cap holds, the CPU does not (15 Sep) |
 | [load-S2-gw4-run-20260910-baseline.md](bench/results/load-S2-gw4-run-20260910-baseline.md) | 2,500 typical streams, no cap: the event-throughput ceiling (10 Sep) |
-| [load-S3-gw4-run.md](bench/results/load-S3-gw4-run.md) | 1,000 slow streams: memory, sockets and tasks per stream (17 Sep, after Phase B) |
+| [load-S3-gw4-run.md](bench/results/load-S3-gw4-run.md) | 1,000 slow streams: memory, sockets and tasks per stream (18 Sep, after Phases C, D, E) |
+| [load-S3-gw4-run-20260917.md](bench/results/load-S3-gw4-run-20260917.md) | the same on 17 Sep, after Phase B |
 | [load-S3-gw4-run-20260910-baseline.md](bench/results/load-S3-gw4-run-20260910-baseline.md) | the same on 10 Sep |
 | [load-S4-cap150-gw4-run.md](bench/results/load-S4-cap150-gw4-run.md) | push to 10,000 streams with the cap: the cap breaks first, admitted streams unaffected (15 Sep) |
 | [load-S4-gw4-run-20260910-baseline.md](bench/results/load-S4-gw4-run-20260910-baseline.md) | push to 10,000 streams: what breaks first (10 Sep, before the cap) |
-| [load-S5-gw4-run.md](bench/results/load-S5-gw4-run.md) | slow clients: backpressure (10 Sep, four workers) |
+| [load-S5-gw4-run.md](bench/results/load-S5-gw4-run.md) | slow clients: backpressure (18 Sep, four workers, after Phases C, D, E) |
+| [load-S5-gw4-run-20260910-baseline.md](bench/results/load-S5-gw4-run-20260910-baseline.md) | the same on 10 Sep |
 | [load-S5-gw2-run.md](bench/results/load-S5-gw2-run.md) | the same at two workers after Phase B (17 Sep): zero bytes buffered, 15.3 KiB per stream |
 | [load-S2-cap150-gw2-run.md](bench/results/load-S2-cap150-gw2-run.md) | 2,500 streams with the cap at 150, two workers, after Phase B (17 Sep): zero 504s |
 | [load-S6-gw4-run.md](bench/results/load-S6-gw4-run.md) | one hot tenant: isolation |

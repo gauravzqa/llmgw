@@ -145,7 +145,23 @@ class ProviderConn:
     """See `ForbiddenMeans`. Phase A read this with `getattr`; it is a real
     field now so a voice provider row can declare it."""
 
+    path_prefix: str | None = None
+    """A path segment inserted between `base_url` and the surface path
+    (PLAN-2 C4). DeepSeek serves strict tools and prefix completion under
+    `/beta` on the same host as its main API: `base_url` stays the host,
+    `path_prefix="/beta"`, and `upstream.join_url` emits
+    `/beta/v1/chat/completions`. None for every other row. Leading slash,
+    no trailing slash; validated at construction."""
+
     def __post_init__(self) -> None:
+        if self.path_prefix is not None and (
+            not self.path_prefix.startswith("/") or self.path_prefix.endswith("/")
+            or self.path_prefix == "/"
+        ):
+            raise ValueError(
+                f"provider {self.id!r}: path_prefix must look like '/beta' "
+                f"(leading slash, no trailing slash), got {self.path_prefix!r}"
+            )
         if self.auth_scheme == "header" and not self.auth_header:
             raise ValueError(
                 f"provider {self.id!r}: auth_scheme='header' needs auth_header"
@@ -332,6 +348,100 @@ PROVIDERS: dict[str, ProviderConn] = {
         api_key_env="OPENAI_API_KEY",
         max_concurrency=32,
     ),
+    # ---------------------------------------------------------------------
+    # PLAN-2 Phase C (C4): DeepSeek's other two doors on the same key. The
+    # Anthropic-compatible endpoint makes DeepSeek a same-dialect candidate
+    # for Anthropic workloads (the policy refuses cross-dialect plans); the
+    # `/beta` prefix is where strict tools and prefix completion live
+    # (capabilities/deepseek.md §1). Neither is exercised live yet.
+    # ---------------------------------------------------------------------
+    "deepseek-anthropic": ProviderConn(
+        id="deepseek-anthropic",
+        kind="anthropic",
+        base_url="https://api.deepseek.com/anthropic",
+        api_key_env="DEEPSEEK_API_KEY",
+        credential_id="deepseek",
+        auth_scheme="x-api-key",
+        max_concurrency=32,
+    ),
+    "deepseek-beta": ProviderConn(
+        id="deepseek-beta",
+        kind="openai",
+        base_url="https://api.deepseek.com",
+        path_prefix="/beta",
+        api_key_env="DEEPSEEK_API_KEY",
+        credential_id="deepseek",
+        max_concurrency=32,
+    ),
+    # ---------------------------------------------------------------------
+    # PLAN-2 Phase D/E: voice providers. `kind="openai"` means only "no
+    # Anthropic header ritual"; the credential style is `auth_scheme`, and
+    # the surfaces in `surfaces/voice/` own the framing and the unit. Facts
+    # per capabilities/voice-*.md (16 Sep 2026 sweep; Inworld and OpenAI
+    # audio verified live, AssemblyAI and ElevenLabs from documentation).
+    # ---------------------------------------------------------------------
+    "inworld": ProviderConn(
+        id="inworld",
+        kind="openai",
+        base_url="https://api.inworld.ai",
+        api_key_env="INWORLD_API_KEY",
+        # Bearer behaves identically to the documented Basic form (verified
+        # live 2026-09-16). The key is reversible base64 and the 403 body
+        # reflects its first four characters, so EVERY non-2xx body is
+        # replaced by the gateway's own (C11 widened, PLAN-2 B2).
+        scrub_error_bodies="all",
+        max_concurrency=16,
+    ),
+    "elevenlabs": ProviderConn(
+        id="elevenlabs",
+        kind="openai",
+        # India residency: nearest to the Fly `sin` region and to Layrs'
+        # users; the global host is api.elevenlabs.io.
+        base_url="https://api.in.residency.elevenlabs.io",
+        api_key_env="ELEVENLABS_API_KEY",
+        auth_scheme="header",
+        auth_header="xi-api-key",
+        # ElevenLabs' common 403s are plan, voice and model denials, never a
+        # bad key; they must not open the credential breaker.
+        forbidden_means="policy",
+        # Concurrency is a plan number (Pro 10, Scale 15; roughly 2x for the
+        # Flash models). Set below the smallest paid plan until the account's
+        # plan is known.
+        max_concurrency=8,
+    ),
+    # AssemblyAI: one key, three hosts. The REST host answers its rate limit
+    # with a 403 (20k requests / 5 min), the streaming host is WebSocket
+    # (Phase G), the sync host is the one HTTP product that fits a gateway.
+    # `auth_scheme="raw"`: the bare key in `Authorization`, no scheme word.
+    "assemblyai": ProviderConn(
+        id="assemblyai",
+        kind="openai",
+        base_url="https://api.assemblyai.com",
+        api_key_env="ASSEMBLYAI_API_KEY",
+        auth_scheme="raw",
+        forbidden_means="rate_limit",
+        max_concurrency=16,
+    ),
+    "assemblyai-streaming": ProviderConn(
+        id="assemblyai-streaming",
+        kind="openai",
+        base_url="https://streaming.assemblyai.com",
+        api_key_env="ASSEMBLYAI_API_KEY",
+        credential_id="assemblyai",
+        auth_scheme="raw",
+        forbidden_means="rate_limit",
+        max_concurrency=16,
+    ),
+    "assemblyai-sync": ProviderConn(
+        id="assemblyai-sync",
+        kind="openai",
+        base_url="https://sync.assemblyai.com",
+        api_key_env="ASSEMBLYAI_API_KEY",
+        credential_id="assemblyai",
+        auth_scheme="raw",
+        forbidden_means="rate_limit",
+        max_concurrency=16,
+    ),
     # The fake upstreams from fakes/upstream.py, wired in by tests and by the
     # local dev config. Present in the shipped catalog on purpose: a test
     # target that needs a special code path is a test target that proves
@@ -500,6 +610,25 @@ MODELS: dict[str, ModelSpec] = {
             priced_at="2026-09-16",
             aliases=("deepseek-v4-flash",),
         ),
+        # The same model behind DeepSeek's Anthropic-compatible endpoint
+        # (PLAN-2 C4): a same-dialect candidate for Anthropic workloads, so the
+        # cross-dialect rule no longer stands between the cheap candidate and
+        # a Claude incumbent. Same wire id as the OpenAI-dialect row; the
+        # route's dialect hint disambiguates (Phase A). No alias: the short
+        # alias is claimed by the row above.
+        ModelSpec(
+            id="deepseek-anthropic.deepseek-v4-flash",
+            provider="deepseek-anthropic",
+            api_model="deepseek-flash",
+            input_per_m=0.30,
+            cached_input_per_m=0.006,
+            output_per_m=1.20,
+            context_window=1_048_576,
+            max_output=393_216,
+            can_reason=True,
+            reasoning="off",
+            priced_at="2026-09-16",
+        ),
         # CORRECTED 2026-09-10 against OpenRouter's live /api/v1/models.
         #
         # This block used to say OpenRouter's per-token rates MATCH direct,
@@ -585,6 +714,197 @@ MODELS: dict[str, ModelSpec] = {
             output_per_m=0.6525,
             context_window=1_048_576,
             max_output=115_200,
+            priced_at="2026-09-16",
+        ),
+        # -----------------------------------------------------------------
+        # PLAN-2 Phase C/E rows agent CE routes to.
+        # -----------------------------------------------------------------
+        ModelSpec(
+            # OpenAI list price, developers.openai.com/api/docs/pricing,
+            # read 2026-09-18. Embeddings bill input tokens only.
+            id="openai.text-embedding-3-small",
+            provider="openai",
+            api_model="text-embedding-3-small",
+            input_per_m=0.02,
+            output_per_m=0.0,
+            context_window=8_191,
+            max_output=0,
+            priced_at="2026-09-18",
+        ),
+        ModelSpec(
+            # gpt-realtime-mini: text $0.60 / $0.06 cached / $2.40 out per 1M;
+            # audio in $10 / cached $0.30 / out $20 per 1M
+            # (capabilities/voice-openai.md §6, pricing page read 2026-09-16).
+            # Routed only through the client-secret mint (Phase E); media
+            # never transits the gateway, so the rates price the mint's
+            # capture record, not a stream.
+            id="openai.gpt-realtime-mini",
+            provider="openai",
+            api_model="gpt-realtime-mini",
+            input_per_m=0.60,
+            cached_input_per_m=0.06,
+            output_per_m=2.40,
+            audio_input_per_m=10.0,
+            cached_audio_input_per_m=0.30,
+            audio_output_per_m=20.0,
+            context_window=32_000,
+            max_output=4_096,
+            priced_at="2026-09-16",
+        ),
+        # -----------------------------------------------------------------
+        # PLAN-2 Phase D: voice rows. Units per `ModelSpec.unit`; every rate
+        # cites the sweep file it came from. No provider here exposes a model
+        # list, so `make probe` cannot reconcile these ids -- the live smoke
+        # (`live/smoke_voice.py`) is the check.
+        # -----------------------------------------------------------------
+        ModelSpec(
+            # $0.60 per 1M text input tokens + $12 per 1M audio output tokens;
+            # usage arrives only in SSE mode (`speech.audio.done.usage`), the
+            # binary default has no meter (capabilities/voice-openai.md §6,
+            # verified live 2026-09-16).
+            id="openai.gpt-4o-mini-tts",
+            provider="openai",
+            api_model="gpt-4o-mini-tts",
+            input_per_m=0.60,
+            output_per_m=12.0,
+            audio_output_per_m=12.0,
+            context_window=2_000,
+            max_output=0,
+            priced_at="2026-09-16",
+            default_profile="tts",
+        ),
+        ModelSpec(
+            # $0.0045 per minute, `usage: {type: "duration", seconds}` rounded
+            # up to whole seconds (capabilities/voice-openai.md §6, live).
+            id="openai.gpt-transcribe",
+            provider="openai",
+            api_model="gpt-transcribe",
+            input_per_m=0.0,
+            output_per_m=0.0,
+            unit="seconds",
+            per_minute=0.0045,
+            context_window=0,
+            max_output=0,
+            priced_at="2026-09-16",
+        ),
+        ModelSpec(
+            # $0.006 per minute; the only translation model; no `stream: true`.
+            id="openai.whisper-1",
+            provider="openai",
+            api_model="whisper-1",
+            input_per_m=0.0,
+            output_per_m=0.0,
+            unit="seconds",
+            per_minute=0.006,
+            context_window=0,
+            max_output=0,
+            priced_at="2026-09-16",
+        ),
+        ModelSpec(
+            # $25 per 1M characters on-demand ($12.50 Growth, "as low as $5"
+            # Enterprise): plan-dependent, the on-demand rate is the upper
+            # bound (capabilities/voice-inworld.md §6, pricing page
+            # 2026-09-16). `processedCharactersCount` is the exact meter.
+            id="inworld.tts-2",
+            provider="inworld",
+            api_model="inworld-tts-2",
+            input_per_m=25.0,
+            output_per_m=0.0,
+            unit="characters",
+            context_window=2_000,
+            max_output=0,
+            priced_at="2026-09-16",
+            default_profile="tts",
+        ),
+        ModelSpec(
+            # $15 per 1M characters on-demand ($7 Growth); 20 ms TTFB tier.
+            id="inworld.tts-2-flash",
+            provider="inworld",
+            api_model="inworld-tts-2-flash",
+            input_per_m=15.0,
+            output_per_m=0.0,
+            unit="characters",
+            context_window=2_000,
+            max_output=0,
+            priced_at="2026-09-16",
+            default_profile="tts",
+        ),
+        ModelSpec(
+            # $0.05 per 1k characters = $50 per 1M on the API price list; the
+            # ~75 ms realtime tier (capabilities/voice-elevenlabs.md §6,
+            # elevenlabs.io/pricing/api 2026-09-16). `character-cost` header
+            # is the exact meter; 40k characters per request.
+            id="elevenlabs.flash-v2-5",
+            provider="elevenlabs",
+            api_model="eleven_flash_v2_5",
+            input_per_m=50.0,
+            output_per_m=0.0,
+            unit="characters",
+            context_window=40_000,
+            max_output=0,
+            priced_at="2026-09-16",
+            default_profile="tts",
+        ),
+        ModelSpec(
+            # $0.05 per 1k characters; the ~280 ms conversational v3 tier,
+            # WebSocket-first but served over HTTP too.
+            id="elevenlabs.v3-conversational",
+            provider="elevenlabs",
+            api_model="eleven_v3_conversational",
+            input_per_m=50.0,
+            output_per_m=0.0,
+            unit="characters",
+            context_window=10_000,
+            max_output=0,
+            priced_at="2026-09-16",
+            default_profile="tts",
+        ),
+        ModelSpec(
+            # $0.45 per hour of audio = $0.0075 per minute; `audio_duration_ms`
+            # in the response (capabilities/voice-assemblyai.md §6, pricing
+            # page 2026-09-16). The sync endpoint takes no model parameter;
+            # the id exists so the gateway has a row to price against.
+            id="assemblyai.sync",
+            provider="assemblyai-sync",
+            api_model="universal-3-5-pro",
+            input_per_m=0.0,
+            output_per_m=0.0,
+            unit="seconds",
+            per_minute=0.0075,
+            context_window=0,
+            max_output=0,
+            priced_at="2026-09-16",
+        ),
+        ModelSpec(
+            # AssemblyAI Universal-Streaming (English): $0.15/h of session
+            # wall time, i.e. $0.0025/min (capabilities/voice-assemblyai.md
+            # §6, 2026-09-16). The row Phase E's `GET /assemblyai/v3/token`
+            # prices a minted session against; no aliases -- the
+            # multilingual model is a different product at a different rate.
+            id="assemblyai.streaming",
+            provider="assemblyai-streaming",
+            api_model="universal-streaming-english",
+            input_per_m=0.0,
+            output_per_m=0.0,
+            unit="seconds",
+            per_minute=0.0025,
+            context_window=0,
+            max_output=0,
+            priced_at="2026-09-16",
+        ),
+        ModelSpec(
+            # Universal-3.5 Pro over the streaming socket: $0.45/h =
+            # $0.0075/min (capabilities/voice-assemblyai.md §6, 2026-09-16).
+            # The Layrs skeleton's default STT model, so the mint can price it.
+            id="assemblyai.universal-3-5-pro-realtime",
+            provider="assemblyai-streaming",
+            api_model="universal-3-5-pro",
+            input_per_m=0.0,
+            output_per_m=0.0,
+            unit="seconds",
+            per_minute=0.0075,
+            context_window=0,
+            max_output=0,
             priced_at="2026-09-16",
         ),
         ModelSpec(

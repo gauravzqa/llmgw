@@ -85,6 +85,23 @@ token_env = "LLMGW_TENANT_LAYRS_TOKEN"
 rate_per_second = 50.0
 burst = 100
 max_concurrency = 96
+# Phase E: credentials the gateway will mint for this tenant that may be
+# alive at once (Realtime client secrets, AssemblyAI streaming tokens). Each
+# reservation lasts the credential's TTL; the (N+1)th mint is a 429 whose
+# Retry-After is the earliest expiry. Omit for no cap.
+max_sessions = 8
+
+# Phase E1: fields pinned over the client's `session` on a Realtime client
+# secret mint. `model` is a catalog id; `expires_after_seconds_cap` bounds the
+# credential's TTL (the drain grace bounds it too). Allowed keys: model, voice,
+# tools, turn_detection, max_output_tokens, instructions,
+# expires_after_seconds_cap.
+[tenants.layrs.realtime]
+model = "openai.gpt-realtime-mini"
+voice = "cedar"
+tools = []
+max_output_tokens = 1024
+expires_after_seconds_cap = 600
 
 # A local-development tenant with literal tokens. Fine here because this is
 # an EXAMPLE file; a real deployment's file has no `tokens` key at all.

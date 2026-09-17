@@ -104,6 +104,10 @@ class CaptureRecord:
     bill that cannot tell the two apart is a bill you cannot defend."""
 
     committed: bool = False
+    kind: str = "request"
+    """`request` for a served call; `mint` for a credential the gateway
+    issued on a tenant's behalf (Phase E) -- the only cost attribution
+    possible for media that never transits the gateway."""
     """Did a byte reach the client? The commitment flag the pump owns. Carried
     here because 'failed' and 'interrupted' are the same outcome to a metric
     but a different story to whoever is reading the one request that broke."""

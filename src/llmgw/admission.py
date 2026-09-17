@@ -144,6 +144,14 @@ class TenantLimits:
     max_concurrency: int
     """In-flight permits. The limit that protects memory and connections."""
 
+    max_sessions: int | None = None
+    """Credentials the gateway will mint for this tenant that are alive at
+    once (Phase E): a Realtime client secret or an AssemblyAI streaming token
+    is a session the tenant may open outside the gateway, and this is the
+    only place the gateway can bound how many. A reservation is held for the
+    credential's TTL and released by expiry, never by a request ending --
+    the gateway does not see the session end. None means no cap."""
+
     def validate(self) -> TenantLimits:
         if not math.isfinite(self.rate_per_second) or self.rate_per_second <= 0:
             # A zero rate would make `retry_after` infinite -- a denial with
@@ -155,6 +163,10 @@ class TenantLimits:
             raise ValueError("burst must be an integer >= 1")
         if type(self.max_concurrency) is not int or self.max_concurrency < 1:
             raise ValueError("max_concurrency must be an integer >= 1")
+        if self.max_sessions is not None and (
+            type(self.max_sessions) is not int or self.max_sessions < 1
+        ):
+            raise ValueError("max_sessions must be an integer >= 1, or None for no cap")
         return self
 
 
@@ -232,13 +244,15 @@ class _TenantState:
     deciding tenant A's admission is a single dictionary lookup that never
     touches tenant B. Isolation is a data-layout property here, not a policy."""
 
-    __slots__ = ("limits", "tokens", "updated", "in_use", "denied")
+    __slots__ = ("limits", "tokens", "updated", "in_use", "denied", "sessions")
 
     def __init__(self, limits: TenantLimits, now: float) -> None:
         self.limits = limits
         self.tokens = float(limits.burst)
         self.updated = now
         self.in_use = 0
+        self.sessions: list[float] = []
+        """Expiry instants of minted credentials still alive (Phase E)."""
         self.denied: dict[str, int] = {
             REASON_TENANT_CONCURRENCY: 0,
             REASON_TENANT_RATE: 0,
@@ -387,6 +401,52 @@ class AdmissionController:
             raise ValueError(f"tenant {tenant!r} has no permits in use to release")
         state.in_use -= 1
 
+    # ---- minted sessions (Phase E) --------------------------------------------
+
+    def reserve_session(self, tenant: str, ttl_s: float) -> None:
+        """Count one minted credential against the tenant's `max_sessions`.
+
+        A reservation lives for `ttl_s` and is released by the clock, never
+        by a call: the session it authorises is opened directly with the
+        provider and the gateway never sees it end. Expired reservations are
+        pruned on every call, so the list is bounded by the cap. Denial is an
+        `AdmissionRejected` with `retry_after` = the earliest expiry, which is
+        an honest number (a slot WILL free then) where a bare 429 would not
+        be. The rate bucket is the request's own concern (`admit()`), so a
+        mint is charged twice: once as a request, once as a session.
+        """
+        state = self._tenants.get(tenant)
+        if state is None:
+            if self._default is None:
+                self._denials[REASON_TENANT_RATE] += 1
+                raise AdmissionRejected(
+                    f"unknown tenant {tenant!r}: no limits configured and no default"
+                )
+            state = self._tenants[tenant] = _TenantState(self._default, self._clock.now())
+        cap = state.limits.max_sessions
+        if cap is None:
+            return
+        now = self._clock.now()
+        state.sessions = [t for t in state.sessions if t > now]
+        if len(state.sessions) >= cap:
+            soonest = min(state.sessions)
+            state.denied[REASON_TENANT_CONCURRENCY] += 1
+            self._denials[REASON_TENANT_CONCURRENCY] += 1
+            raise AdmissionRejected(
+                f"tenant {tenant!r} at its session cap "
+                f"({len(state.sessions)}/{cap} credentials alive)",
+                retry_after=max(0.0, soonest - now),
+            )
+        state.sessions.append(now + max(0.0, float(ttl_s)))
+
+    def live_sessions(self, tenant: str) -> int:
+        """Minted credentials still inside their TTL. Observation only."""
+        state = self._tenants.get(tenant)
+        if state is None:
+            return 0
+        now = self._clock.now()
+        return sum(1 for t in state.sessions if t > now)
+
     # ---- observation -------------------------------------------------------
 
     def in_use(self, tenant: str) -> int:
@@ -415,6 +475,7 @@ class AdmissionController:
         return {
             tenant: {
                 "in_use": state.in_use,
+                "sessions": sum(1 for t in state.sessions if t > now),
                 "tokens": state.projected_tokens(now),
                 "limits": state.limits,
                 "denied": dict(state.denied),

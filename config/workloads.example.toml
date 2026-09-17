@@ -242,6 +242,17 @@ profile = "long_context"
   first_event = 90.0
 
 
+# Phase C4: DeepSeek behind Anthropic's wire contract. The `deepseek-anthropic`
+# provider row speaks the Anthropic dialect at `api.deepseek.com/anthropic`,
+# so a workload on the Anthropic surface can try DeepSeek first and fall back
+# to Claude without a dialect change -- which the cross-dialect rule would
+# otherwise refuse at load. The `/beta` row (`deepseek-beta`, strict tools,
+# prefix completion) is the same idea on the OpenAI surface.
+[workloads.anthropic-with-cheap-candidate]
+candidate = "deepseek-anthropic.deepseek-v4-flash"
+incumbent = "anthropic.haiku-4-5"
+
+
 # --------------------------------------------------------------------------
 # What this file deliberately cannot express
 # --------------------------------------------------------------------------

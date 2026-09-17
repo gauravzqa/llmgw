@@ -1,4 +1,4 @@
-"""Hostile upstreams. One process, two ports, fifteen ways to break a proxy.
+"""Hostile upstreams. One process, four ports, thirty-odd ways to break a proxy.
 
 You cannot test a proxy without an upstream you control. A proxy's entire job
 is what it does when the thing behind it misbehaves, and the one thing a real
@@ -127,7 +127,11 @@ from starlette.routing import Route
 
 from fakes import wire
 
-Surface = Literal["openai", "anthropic"]
+Surface = Literal["openai", "anthropic", "assemblyai", "audio"]
+"""One PORT each. `assemblyai` (8803) and `audio` (8804) landed with PLAN-2
+phase D; the OpenAI port also carries every voice route so a catalog
+redirected to the fakes (`fake_catalog`) keeps working for local dev.
+"""
 
 MODES: tuple[str, ...] = (
     "ok",
@@ -164,12 +168,75 @@ MODES: tuple[str, ...] = (
     "wrong-content-type",
     "multipart-echo",
     "big-vision",
+    # PLAN-2 phases C and E: the non-chat text routes and the token mints.
+    "embeddings",
+    "client-secrets",
+    "realtime-calls",
+    "count-tokens",
+    "assemblyai-token",
+    "assemblyai-sync",
+    # PLAN-2 phase D: voice bodies in the shapes measured on 16 Sep 2026
+    # (capabilities/voice-*.md appendices). Bodies live in fakes/voice.py.
+    "openai-tts-sse",
+    "openai-tts-raw",
+    "openai-stt-sse",
+    "openai-stt-json",
+    "inworld-ndjson",
+    "inworld-sync",
+    "elevenlabs-raw",
+    "elevenlabs-ndjson",
+    "inworld-400-code3",
+    "inworld-404-code5",
+    "elevenlabs-403-voice",
+    "assemblyai-403-ratelimit",
 )
 
 PATHS: dict[Surface, str] = {
     "openai": "/v1/chat/completions",
     "anthropic": "/v1/messages",
+    "assemblyai": "/transcribe",
+    "audio": "/v1/audio/speech",
 }
+
+# The voice routes, as (route template, default mode). Mounted on the `audio`
+# port AND on the `openai` port: the shipped catalog's voice provider rows are
+# `kind="openai"`, so `Catalog.redirect_to_fakes(kind="openai")` sends them to
+# the OpenAI fake, and a `make run` against the fakes must not 404 them.
+_VOICE_ROUTES: tuple[tuple[str, str], ...] = (
+    ("/v1/audio/speech", "openai-tts-raw"),
+    ("/v1/audio/transcriptions", "openai-stt-json"),
+    ("/v1/audio/translations", "openai-stt-json"),
+    ("/tts/v1/voice", "inworld-sync"),
+    ("/tts/v1/voice:stream", "inworld-ndjson"),
+    ("/v1/text-to-speech/{voice_id}", "elevenlabs-raw"),
+    ("/v1/text-to-speech/{voice_id}/stream", "elevenlabs-raw"),
+    ("/v1/text-to-speech/{voice_id}/stream/with-timestamps", "elevenlabs-ndjson"),
+    ("/transcribe", "assemblyai-sync"),
+)
+
+EXTRA_ROUTES: dict[Surface, tuple[tuple[str, str], ...]] = {
+    "openai": (
+        ("/v1/embeddings", "embeddings"),
+        ("/v1/realtime/client_secrets", "client-secrets"),
+        ("/v1/realtime/calls/{call_id}/{action}", "realtime-calls"),
+        *_VOICE_ROUTES,
+    ),
+    "anthropic": (("/v1/messages/count_tokens", "count-tokens"),),
+    "assemblyai": (("/v3/token", "assemblyai-token"),),
+    "audio": tuple(r for r in _VOICE_ROUTES if r[0] != PATHS["audio"]),
+}
+"""Routes beyond each port's primary one, with the mode a request gets when
+it names none. `X-Fake-Mode` still overrides, so an error variant can be
+served on any route."""
+
+GET_ROUTES: frozenset[str] = frozenset({"/v3/token"})
+"""Routes served with GET rather than POST."""
+
+ALL_PATHS: tuple[str, ...] = tuple(dict.fromkeys(
+    [*PATHS.values(), *(route for routes in EXTRA_ROUTES.values() for route, _ in routes)]
+))
+"""Every route template the counters know. Templated routes are counted under
+the template, not the concrete path, so the vocabulary stays closed."""
 
 # One 64 KiB block of filler, allocated once at import and re-yielded. See
 # `_huge_event_chunks` for why this matters: an 8 MiB `data:` line built as a
@@ -195,11 +262,11 @@ _MAX_STALL_SECONDS = 300.0
 # is what makes a fixed layout possible. Single-process, the slot is a local
 # bytearray and nothing else changes.
 _MODE_INDEX: dict[str, int] = {m: i for i, m in enumerate(MODES)}
-_PATH_INDEX: dict[str, int] = {p: i for i, p in enumerate(PATHS.values())}
+_PATH_INDEX: dict[str, int] = {p: i for i, p in enumerate(ALL_PATHS)}
 _F_TOTAL, _F_OPEN, _F_PEAK = 0, 1, 2
 _F_MODE = 3
 _F_PATH = _F_MODE + len(MODES)
-_F_WRITES = _F_PATH + len(PATHS)
+_F_WRITES = _F_PATH + len(ALL_PATHS)
 _SLOT_FIELDS = _F_WRITES + len(MODES)
 _SLOT_BYTES = _SLOT_FIELDS * 8
 _ZERO_SLOT = memoryview(bytes(_SLOT_BYTES)).cast("q")
@@ -287,7 +354,7 @@ class Stats:
         with self._lock:
             by_mode = {m: n for m in MODES if (n := self._sum(_F_MODE + _MODE_INDEX[m]))}
             by_path = {
-                p: n for p in PATHS.values() if (n := self._sum(_F_PATH + _PATH_INDEX[p]))
+                p: n for p in ALL_PATHS if (n := self._sum(_F_PATH + _PATH_INDEX[p]))
             }
             writes = {m: n for m in MODES if (n := self._sum(_F_WRITES + _MODE_INDEX[m]))}
             return {
@@ -338,6 +405,12 @@ class Params:
 _MODE_DEFAULTS: dict[str, dict[str, float | int]] = {
     "ndjson-stream": {"events": 20},
     "raw-stream": {"events": 16},
+    "inworld-ndjson": {"events": 20, "bytes": 4096},
+    "openai-tts-sse": {"events": 12},
+    "openai-tts-raw": {"events": 16},
+    "openai-stt-sse": {"events": 8},
+    "elevenlabs-raw": {"events": 16},
+    "elevenlabs-ndjson": {"events": 12},
     "slow-drip": {"interval": 2.0, "events": 150},
     "ping-forever": {"interval": 1.0, "events": 100_000},
     "huge-event": {"events": 1},
@@ -848,10 +921,13 @@ def _split_multipart(body: bytes, content_type: str) -> dict[str, object]:
         if piece.lower().startswith("boundary="):
             boundary = piece[len("boundary="):].strip('"')
     if not boundary:
-        return {"boundary": None, "fields": [], "sizes": {}}
+        return {"boundary": None, "fields": [], "sizes": {}, "values": {}}
     delim = b"--" + boundary.encode("latin-1")
     fields: list[str] = []
     sizes: dict[str, int] = {}
+    # Small text parts echoed by value, so a contract test can see what the
+    # gateway put in the `model` field (the one multipart edit it makes).
+    values: dict[str, str] = {}
     for part in body.split(delim)[1:]:
         if part.startswith(b"--"):
             break
@@ -870,7 +946,9 @@ def _split_multipart(body: bytes, content_type: str) -> dict[str, object]:
             continue
         fields.append(name)
         sizes[name] = len(payload)
-    return {"boundary": boundary, "fields": fields, "sizes": sizes}
+        if len(payload) <= 4096 and b"filename=" not in head.lower():
+            values[name] = payload.decode("latin-1")
+    return {"boundary": boundary, "fields": fields, "sizes": sizes, "values": values}
 
 
 async def _multipart_echo(request: Request, p: Params) -> Response:
@@ -928,7 +1006,87 @@ def _stream(surface: Surface, p: Params) -> StreamingResponse:
     )
 
 
-def _handler(surface: Surface, default_mode: str) -> Callable[[Request], Awaitable[Response]]:
+async def _voice_or_utility_mode(request: Request, p: Params, hdr: dict[str, str]):
+    """The PLAN-2 C/D/E modes, served from `fakes/voice.py`. Returns None
+    for every mode this function does not own, so the chat dispatch below is
+    untouched. Streaming modes count their writes like the chat modes do."""
+    from fakes import voice as V
+
+    m = p.mode
+    if m == "embeddings":
+        return await V.embeddings(request, hdr)
+    if m == "client-secrets":
+        return await V.client_secrets(request, hdr)
+    if m == "realtime-calls":
+        return await V.realtime_calls(request, hdr)
+    if m == "count-tokens":
+        return await V.count_tokens(request, hdr)
+    if m == "assemblyai-token":
+        return await V.assemblyai_token(request, hdr)
+    if m == "assemblyai-sync":
+        return await V.assemblyai_sync(request, hdr)
+    if m == "assemblyai-403-ratelimit":
+        return V.assemblyai_403_ratelimit(hdr)
+    if m == "inworld-400-code3":
+        return V.inworld_400_code3(hdr)
+    if m == "inworld-404-code5":
+        return V.inworld_404_code5(hdr)
+    if m == "elevenlabs-403-voice":
+        return V.elevenlabs_403_voice(hdr)
+    if m == "openai-stt-json":
+        return await V.openai_stt_json(request, hdr)
+    if m == "inworld-sync":
+        return await V.inworld_sync(request, hdr)
+
+    async def frames_body(frames: list[bytes]) -> AsyncIterator[bytes]:
+        for frame in frames:
+            await _pace(p.interval)
+            yield frame
+
+    if m == "openai-tts-sse":
+        await request.body()
+        return StreamingResponse(
+            _counted(m, frames_body(V.openai_tts_sse_frames(p.events))), status_code=200,
+            media_type="text/event-stream", headers={**_SSE_HEADERS, **hdr},
+        )
+    if m == "openai-stt-sse":
+        await request.body()
+        return StreamingResponse(
+            _counted(m, frames_body(V.openai_stt_sse_frames(p.events))), status_code=200,
+            media_type="text/event-stream", headers={**_SSE_HEADERS, **hdr},
+        )
+    if m == "openai-tts-raw":
+        await request.body()
+        return StreamingResponse(
+            _counted(m, frames_body(V.raw_chunks(p.events))), status_code=200,
+            media_type="audio/pcm", headers={**_SSE_HEADERS, **hdr},
+        )
+    if m == "inworld-ndjson":
+        resp = await V.inworld_ndjson(
+            request, hdr, events=p.events, interval=p.interval,
+            # `X-Fake-Bytes` sizes a line; the 8 MiB default belongs to huge-event.
+            line_bytes=(p.nbytes if p.nbytes != 8 * 1024 * 1024
+                        else V.INWORLD_LINE_BYTES_DEFAULT),
+            pace=_pace,
+        )
+        resp.body_iterator = _counted(m, resp.body_iterator)  # type: ignore[attr-defined]
+        return resp
+    if m == "elevenlabs-raw":
+        resp = await V.elevenlabs_raw(request, hdr, events=p.events, interval=p.interval,
+                                      pace=_pace)
+        resp.body_iterator = _counted(m, resp.body_iterator)  # type: ignore[attr-defined]
+        return resp
+    if m == "elevenlabs-ndjson":
+        resp = await V.elevenlabs_ndjson(request, hdr, events=p.events, interval=p.interval,
+                                         pace=_pace)
+        resp.body_iterator = _counted(m, resp.body_iterator)  # type: ignore[attr-defined]
+        return resp
+    return None
+
+
+def _handler(
+    surface: Surface, default_mode: str, *, stats_path: str | None = None,
+) -> Callable[[Request], Awaitable[Response]]:
     async def handle(request: Request) -> Response:
         try:
             p = parse_params(request, default_mode)
@@ -938,8 +1096,14 @@ def _handler(surface: Surface, default_mode: str) -> Callable[[Request], Awaitab
                 status_code=400,
             )
 
-        STATS.record_request(p.mode, request.url.path)
+        # Templated routes count under their template (`stats_path`), so a
+        # `{voice_id}` cannot widen the closed path vocabulary.
+        STATS.record_request(p.mode, stats_path or request.url.path)
         hdr = {"x-fake-mode": p.mode}
+
+        voice = await _voice_or_utility_mode(request, p, hdr)
+        if voice is not None:
+            return voice
 
         if p.mode == "schema-400":
             return _raw(surface, 400, "invalid_request_error", "bad schema", hdr)
@@ -1065,16 +1229,33 @@ async def _stats_reset(_: Request) -> Response:
 
 
 def build_app(surface: Surface, *, default_mode: str = "ok") -> Starlette:
-    """One Starlette app per surface. Both share the module-global counters."""
+    """One Starlette app per PORT. All four share the module-global counters.
+
+    The primary route gets `default_mode`; the port's `EXTRA_ROUTES` each
+    carry their own default (an embeddings route that defaulted to a chat
+    stream would be a fake that lies), and `X-Fake-Mode` overrides on any
+    route.
+    """
     if default_mode not in MODES:
         raise ValueError(f"default_mode {default_mode!r} not in {list(MODES)}")
-    return Starlette(
-        routes=[
-            Route(PATHS[surface], _handler(surface, default_mode), methods=["POST"]),
-            Route("/__stats", _stats, methods=["GET"]),
-            Route("/__stats/reset", _stats_reset, methods=["POST"]),
-        ]
-    )
+    primary = PATHS[surface]
+    primary_default = default_mode
+    if surface in ("assemblyai", "audio") and default_mode == "ok":
+        primary_default = {"assemblyai": "assemblyai-sync", "audio": "openai-tts-raw"}[surface]
+    routes = [
+        Route(primary, _handler(surface, primary_default, stats_path=primary),
+              methods=["GET" if primary in GET_ROUTES else "POST"]),
+    ]
+    for route, mode_default in EXTRA_ROUTES.get(surface, ()):
+        routes.append(Route(
+            route, _handler(surface, mode_default, stats_path=route),
+            methods=["GET" if route in GET_ROUTES else "POST"],
+        ))
+    routes += [
+        Route("/__stats", _stats, methods=["GET"]),
+        Route("/__stats/reset", _stats_reset, methods=["POST"]),
+    ]
+    return Starlette(routes=routes)
 
 
 # --------------------------------------------------------------------------
@@ -1243,8 +1424,10 @@ def _serve_pair(
     apps = [
         build_app("openai", default_mode=args.openai_mode),
         build_app("anthropic", default_mode=args.anthropic_mode),
+        build_app("assemblyai", default_mode=args.assemblyai_mode),
+        build_app("audio", default_mode=args.audio_mode),
     ]
-    ports = [args.openai_port, args.anthropic_port]
+    ports = [args.openai_port, args.anthropic_port, args.assemblyai_port, args.audio_port]
     return [
         serve_in_thread(
             app, host=args.host, port=port, log_level=args.log_level,
@@ -1269,11 +1452,16 @@ def _print_summary(label: str, servers: list[RunningServer]) -> None:
     )
 
 
-def _banner(args: argparse.Namespace, ports: tuple[int, int], workers: int) -> None:
+def _banner(args: argparse.Namespace, ports: tuple[int, ...], workers: int) -> None:
     print(f"openai     http://{args.host}:{ports[0]}{PATHS['openai']}"
           f"  (default mode: {args.openai_mode})", flush=True)
     print(f"anthropic  http://{args.host}:{ports[1]}{PATHS['anthropic']}"
           f"  (default mode: {args.anthropic_mode})", flush=True)
+    if len(ports) > 2:
+        print(f"assemblyai http://{args.host}:{ports[2]}{PATHS['assemblyai']}"
+              f"  (default mode: {args.assemblyai_mode})", flush=True)
+        print(f"audio      http://{args.host}:{ports[3]}{PATHS['audio']}"
+              f"  (default mode: {args.audio_mode})", flush=True)
     print(f"stats      http://{args.host}:{ports[0]}/__stats", flush=True)
     print(f"modes      {' '.join(MODES)}", flush=True)
     if workers > 1:
@@ -1285,7 +1473,7 @@ def _run_single(args: argparse.Namespace) -> int:
     stop = threading.Event()
     _install_stop_signals(stop)
     servers = _serve_pair(args)
-    _banner(args, (servers[0].port, servers[1].port), workers=1)
+    _banner(args, tuple(s.port for s in servers), workers=1)
     try:
         _wait_until_stopped(servers, stop)
     finally:
@@ -1313,8 +1501,9 @@ def _run_worker(args: argparse.Namespace) -> int:
 
 def _run_parent(args: argparse.Namespace) -> int:
     """Bind, re-exec N workers that inherit the sockets, forward signals, reap."""
-    socks = [listen(args.host, args.openai_port), listen(args.host, args.anthropic_port)]
-    ports = (socks[0].getsockname()[1], socks[1].getsockname()[1])
+    socks = [listen(args.host, port) for port in
+             (args.openai_port, args.anthropic_port, args.assemblyai_port, args.audio_port)]
+    ports = tuple(sock.getsockname()[1] for sock in socks)
     fds = [s.fileno() for s in socks]
     stats_path = STATS.create_shared(args.workers)
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1327,7 +1516,9 @@ def _run_parent(args: argparse.Namespace) -> int:
             sys.executable, "-m", "fakes.upstream",
             "--host", args.host,
             "--openai-port", str(ports[0]), "--anthropic-port", str(ports[1]),
+            "--assemblyai-port", str(ports[2]), "--audio-port", str(ports[3]),
             "--openai-mode", args.openai_mode, "--anthropic-mode", args.anthropic_mode,
+            "--assemblyai-mode", args.assemblyai_mode, "--audio-mode", args.audio_mode,
             "--log-level", args.log_level,
             "--_worker-slot", f"{i}/{args.workers}",
             "--_worker-fds", ",".join(map(str, fds)),
@@ -1381,8 +1572,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--openai-port", type=int, default=8801)
     parser.add_argument("--anthropic-port", type=int, default=8802)
+    parser.add_argument("--assemblyai-port", type=int, default=8803)
+    parser.add_argument("--audio-port", type=int, default=8804)
     parser.add_argument("--openai-mode", default="ok", choices=MODES)
     parser.add_argument("--anthropic-mode", default="ok", choices=MODES)
+    parser.add_argument("--assemblyai-mode", default="assemblyai-sync", choices=MODES)
+    parser.add_argument("--audio-mode", default="openai-tts-raw", choices=MODES)
     parser.add_argument("--log-level", default="info")
     parser.add_argument(
         "--workers", type=int, default=1,

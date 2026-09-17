@@ -840,7 +840,10 @@ async def test_a_buffered_response_is_read_in_full_before_the_status_is_sent():
 
     assert codes(result) == ["upstream_server_error", "success"]
     assert rig.factory.sink.body == payload
-    assert result.pump is None, "there is no pump on the buffered path"
+    # Phase C (finding 50): the buffered path now carries its usage in a
+    # PumpResult-shaped record so a non-streamed call is billed.
+    assert result.pump is not None and result.pump.bytes_out > 0
+    # (The fixture body carries no `usage` object, so exactness is not asserted.)
     assert result.committed is True
 
 

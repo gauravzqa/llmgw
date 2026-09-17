@@ -65,6 +65,12 @@ class OpenAIChatSurface:
 
     name = "openai_chat"
     path = "/v1/chat/completions"
+    # Phase C route registry: one client route, same path upstream.
+    dialect = "openai"
+    routes = ("/v1/chat/completions",)
+    upstream_path = "/v1/chat/completions"
+    methods = ("POST",)
+    forward_query = False
 
     # Phase B1/B4/B6: the dialect is SSE over a JSON request with no budget
     # profile of its own -- i.e. exactly what it was before these existed.

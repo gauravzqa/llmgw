@@ -956,16 +956,15 @@ async def test_a_jsonl_surface_commits_progresses_and_ends_on_close():
     parser: FirstEventTimeout at the first-event budget, FrameTooLarge at
     1 MiB, $0 accounted (measured against Inworld, 16 Sep 2026). Through the
     JSONL framer every line is a frame, the first is the first event, and
-    EOF is the terminal -- but the surface above declares no TERMINAL kind,
-    so the pump reports IncompleteStream, exactly as an SSE stream without
-    `[DONE]` would. A real JSONL surface (Phase D) marks its last line or
-    treats close as its terminal; the pump's rule is unchanged."""
+    the close of the connection IS the terminal (Phase D, `Pump._eof_is_
+    terminal`): no JSONL or raw provider has a marker to withhold, so a clean
+    EOF completes the stream rather than reporting IncompleteStream the way
+    an SSE body without `[DONE]` must."""
     body = _jsonl_body()
     sink = RecordingSink()
     pump = make_pump(sink=sink, surface=_JsonlSurface())
-    with pytest.raises(E.IncompleteStream):
-        await pump.run(ScriptedSource(chunked(body, 700)))
-    res = pump.result
+    res = await pump.run(ScriptedSource(chunked(body, 700)))
+    assert res.terminal_seen is True
     assert sink.data == body  # byte-for-byte, chunk boundaries and all
     assert res.committed is True
     assert res.content_events == 6 and res.events == 6
@@ -985,11 +984,57 @@ async def test_a_raw_surface_treats_every_chunk_as_progress():
     source = ScriptedSource(chunked(body, 4096), clock=clock, gap=2.0)
     task = asyncio.create_task(pump.run(source))
     await drive(clock, task, step=1.0, limit=40)
-    with pytest.raises(E.IncompleteStream):  # no terminal kind on the stub
-        await task
+    res = await task  # close-ended framing: EOF completes it (Phase D)
+    assert res.terminal_seen is True
     assert sink.data == body
     assert pump.result.content_events == 4
     assert pump.result.committed is True
+
+
+async def test_an_sse_body_that_stops_without_its_marker_is_still_incomplete():
+    """The EOF rule is per framing. SSE keeps C2: a body that ends without
+    `data: [DONE]` truncated the answer, whatever the JSONL and raw framings
+    do with a close."""
+    sink = RecordingSink()
+    pump = make_pump(sink=sink)
+    body = b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
+    with pytest.raises(E.IncompleteStream):
+        await pump.run(ScriptedSource(chunked(body, 16)))
+    assert pump.result.terminal_seen is False
+
+
+async def test_a_jsonl_in_band_error_still_wins_over_the_close():
+    """An error line before the close is the provider's own classification;
+    the close must not launder it into a completion."""
+    sink = RecordingSink()
+    pump = make_pump(sink=sink, surface=_JsonlErrorSurface())
+    body = _jsonl_body(2) + b'{"error": {"code": 8, "message": "exhausted"}}\n'
+    with pytest.raises(E.UpstreamOverloaded):
+        await pump.run(ScriptedSource(chunked(body, 300)))
+
+
+class _JsonlErrorSurface(_JsonlSurface):
+    def classify(self, ev):
+        import json as _json
+
+        try:
+            obj = _json.loads(ev.data)
+        except ValueError:
+            return E_KIND.META
+        if isinstance(obj, dict) and "error" in obj:
+            return E_KIND.ERROR
+        return super().classify(ev)
+
+    def error_from_event(self, ev):
+        import json as _json
+
+        try:
+            obj = _json.loads(ev.data)
+        except ValueError:
+            return None
+        if isinstance(obj, dict) and "error" in obj:
+            return E.UpstreamOverloaded(str(obj["error"].get("message")))
+        return None
 
 
 async def test_an_sse_surface_refuses_a_non_sse_content_type_before_any_byte():

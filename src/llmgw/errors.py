@@ -906,7 +906,13 @@ def _is_api_error_body(body: bytes | None) -> bool:
         return False
     if not isinstance(parsed, dict):
         return False
-    return "error" in parsed or ("code" in parsed and "message" in parsed)
+    # OpenAI/Anthropic: `error`; gRPC-transcoded (Inworld): `code`+`message`;
+    # ElevenLabs: `detail` (an object, or a list on 422 validation errors).
+    return (
+        "error" in parsed
+        or ("code" in parsed and "message" in parsed)
+        or isinstance(parsed.get("detail"), (dict, list))
+    )
 
 
 def _error_hints(body: bytes | None) -> tuple[str, str]:
@@ -926,7 +932,23 @@ def _error_hints(body: bytes | None) -> tuple[str, str]:
         return ("", "")
     err = parsed.get("error")
     if not isinstance(err, dict):
-        err = parsed
+        detail_block = parsed.get("detail")
+        if isinstance(detail_block, dict):
+            # ElevenLabs: `{"detail": {"status": ..., "message": ...}}` (legacy)
+            # or `{"detail": {"type": ..., "code": ..., "message": ...}}`.
+            # `status` is the legacy spelling of the machine-readable code.
+            err = dict(detail_block)
+            if "code" not in err and err.get("status"):
+                err["code"] = err["status"]
+        elif isinstance(detail_block, list):
+            # ElevenLabs 422 validation: `[{loc, msg, type}]`. The first
+            # message is as good a haystack as any; the status already says
+            # "invalid request".
+            first = (detail_block[0]
+                     if detail_block and isinstance(detail_block[0], dict) else {})
+            err = {"type": first.get("type"), "message": first.get("msg")}
+        else:
+            err = parsed
     etype = str(err.get("type") or "").lower()
     # `param` is deliberately NOT folded in. It names the offending FIELD, and
     # a field name is not a description of what went wrong. OpenAI answers an
@@ -980,6 +1002,7 @@ _UNKNOWN_MODEL_HINTS = (
     "invalid model",
     "no such model",
     "supported api model names",   # DeepSeek's phrasing, verified live
+    "model_id:",                   # Inworld: "model_id: X is not supported." (live, 16 Sep)
 )
 
 

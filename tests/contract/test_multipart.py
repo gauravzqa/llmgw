@@ -92,10 +92,16 @@ async def test_multipart_body_and_boundary_reach_the_fake_intact(
     assert echoed["boundary"] == "gwB0undary"
     # The client's content-type must be forwarded verbatim (the boundary is in it).
     assert echoed["content_type"] == ctype
-    assert echoed["received_bytes"] == len(body), "no edit of a non-JSON body"
+    # The ONE edit a multipart body gets is the model form field, spliced to
+    # the target's wire id (18 Sep 2026: OpenAI 404'd on the catalog id that
+    # reached it verbatim). `fake.echo` -> `fake-echo` happens to keep the
+    # length; boundary, the other fields and the file bytes are untouched.
+    assert echoed["values"]["model"] == "fake-echo"
+    assert echoed["values"]["stream"] == "false"
+    assert echoed["received_bytes"] == len(body)
     assert echoed["fields"] == ["model", "stream", "file"]
     assert echoed["sizes"]["file"] == len(audio)
-    assert "x-gw-body-modified" not in r.headers
+    assert r.headers["x-gw-body-modified"] == "1"
     assert r.headers["x-gw-served-by"].endswith("fake.echo")
     assert fakes.stats()["total"] == before + 1
 
@@ -166,3 +172,19 @@ async def client():
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as c:
         yield c
+
+
+async def test_multipart_that_already_names_the_wire_id_is_forwarded_untouched(
+    gateway, fakes: Fakes, client
+):
+    body = _multipart([("model", b"fake-echo"), ("file", b"\x01" * 512)])
+    ctype = "multipart/form-data; boundary=gwB0undary"
+    r = await client.post(
+        f"{gateway.base_url}/v1/_test/multipart", content=body,
+        headers={"content-type": ctype, "x-fake-mode": "multipart-echo"},
+    )
+    assert r.status_code == 200, r.text[:300]
+    echoed = r.json()
+    assert echoed["values"]["model"] == "fake-echo"
+    assert echoed["received_bytes"] == len(body)
+    assert "x-gw-body-modified" not in r.headers, "a wire id needs no edit"

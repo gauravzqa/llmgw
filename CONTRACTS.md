@@ -380,3 +380,69 @@ must name its `model` in the first 64 KiB of form fields and a `raw` body in
 is contacted. Non-JSON bodies are forwarded byte-for-byte with the client's
 own `content-type` and are buffered up to the surface cap so a pre-commit
 retry can resend them.
+
+## C18. `/v1/models` is answered from the catalog and never calls upstream
+
+`GET /v1/models` and `GET /anthropic/v1/models` list the catalog ids the
+explicit-model path can route on that surface's dialect -- every non-fake
+row whose provider speaks the dialect (fakes are listed only on a gateway
+pointed at the fakes) -- with each row's wire id and declared aliases
+alongside. No upstream connection is opened; the fake's request counter does
+not move (`tests/contract/test_text_surfaces.py`). The tenant is resolved
+exactly as on the serving path, so the listing is never an unauthenticated
+view of the catalog. With a policy document the set is the same, because a
+client that names a model gets that model (see `plan_for`).
+
+## C19. A mint never widens the pinned session and never outlives the cap
+
+`POST /v1/realtime/client_secrets` and `GET /assemblyai/v3/token` issue
+short-lived provider credentials on the tenant's behalf. Three promises:
+
+* the tenant's pinned fields (`[tenants.<id>.realtime]`: model, voice, tools,
+  turn detection, `max_output_tokens`, instructions) are written OVER the
+  client's `session`, never under it; the `model` is resolved through the
+  policy like any request and sent upstream as the wire id;
+* the credential's lifetime is `min(client ask, tenant cap, drain grace)`
+  and never above the provider's own maximum (7,200 s OpenAI; 600 s token /
+  10,800 s session AssemblyAI); a client that asks for nothing gets the cap,
+  not the provider default;
+* the mint is charged against the tenant's rate bucket AND its
+  `max_sessions`: a reservation held for the credential's TTL and released
+  only by the clock, because the session it authorises never transits the
+  gateway. The (N+1)th live credential is a 429 whose `Retry-After` is the
+  earliest expiry. The upstream request carries `OpenAI-Safety-Identifier:
+  <tenant>`; the capture record is written with `kind="mint"`.
+
+The provider's response is returned unchanged.
+
+## C20. A close-ended stream ends by close, and the gateway never fabricates a frame
+
+For surfaces framed `jsonl` or `raw` (Inworld NDJSON, ElevenLabs and OpenAI
+binary audio, AssemblyAI's JSON answer) the provider has no terminator: the
+connection closing IS the end. The pump treats a clean EOF as TERMINAL for
+those framings unless an in-stream error was already seen; SSE keeps C2
+exactly (`[DONE]` or the dialect's terminal event, or `IncompleteStream`).
+
+When a close-ended stream is cut by the gateway (budget, drain, client gone)
+the client sees the connection close and nothing else: no synthetic trailer,
+no padding, no JSON error appended to an audio body. A frame the provider did
+not send is a lie in the client's audio buffer.
+
+**Stated cost:** a jsonl or raw stream that a middlebox closes cleanly is
+indistinguishable from a complete one, and is billed as complete on whatever
+meter had arrived (Inworld and ElevenLabs deliver theirs before the first
+audio byte; OpenAI binary TTS is estimated from the bytes forwarded, which is
+also what the client received). `terminal_seen` is still recorded, so a
+downstream that knows the expected length can tell.
+
+## C21. Character and second usage is exact when the provider reports it, estimated otherwise
+
+`Usage.characters` and `Usage.seconds` carry the provider's own meter when
+one exists -- `processedCharactersCount` (Inworld), the `character-cost`
+header (ElevenLabs), `usage.seconds` rounded up (OpenAI transcription),
+`audio_duration_ms` (AssemblyAI) -- and the record says `exact`. Where no
+meter exists (OpenAI binary TTS) the surface's `usage_estimate(facts)` fills
+the record from the request and the bytes forwarded and the record says
+`estimated`; `cost_notes` names the estimate. A voice request never records
+zero with a confident basis: an empty Inworld result (`usage: null`) is an
+exact zero because Inworld said so, not because nothing was parsed.

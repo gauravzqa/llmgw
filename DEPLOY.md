@@ -214,3 +214,16 @@ event rate.
 - The drain inequality is now checked against the largest total in the policy
   file, not only `LLMGW_BUDGET_TOTAL`: a `[profiles.long_context]` above the
   grace refuses to start unless `LLMGW_DRAIN_ALLOW_SHORT=1`.
+
+## Token minting (Phase E)
+
+`POST /v1/realtime/client_secrets` and `GET /assemblyai/v3/token` hand a
+browser or device a short-lived provider credential without it ever holding
+the account key. Two knobs, both in `config/tenants.toml`, shipped in the
+image: `max_sessions` (credentials alive at once per tenant) and
+`[tenants.<id>.realtime]` (the session fields pinned over the client's on
+every mint). Every credential's lifetime is capped at `LLMGW_DRAIN_GRACE`;
+raise the grace (and `kill_timeout`) knowingly if a tenant needs longer
+sessions. The AssemblyAI mint needs a catalog row `assemblyai.streaming` on
+the `assemblyai-streaming` provider; without it the route answers 400
+`unknown model`.

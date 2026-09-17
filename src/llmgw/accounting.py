@@ -379,6 +379,13 @@ def _billed_output_tokens(usage: Usage, pump: PumpResult | None) -> int:
     """
     if usage.output_exact:
         return usage.output_tokens
+    # Bytes are a proxy for TEXT tokens only. A stream carrying a media unit
+    # (audio tokens, characters, seconds -- a voice surface's own meter or its
+    # request-side estimate) is audio on the wire: 131 KB of PCM is not 32k
+    # output tokens. Bill what the surface said, still `estimated`.
+    if (getattr(usage, "audio_output_tokens", 0) or getattr(usage, "characters", 0)
+            or getattr(usage, "seconds", 0)):
+        return usage.output_tokens
     byte_estimate = 0
     if pump is not None and pump.bytes_out > 0:
         byte_estimate = round(pump.bytes_out / _OUTPUT_BYTES_PER_TOKEN)
@@ -407,6 +414,8 @@ def _cost_usd(
         output              x output_per_m
         audio_input         x audio_input_per_m      (falls back to input_per_m, NOTED)
         audio_output        x audio_output_per_m     (falls back to output_per_m, NOTED)
+        -- both are SUBSETS of input/output_tokens and are subtracted from
+        the text share first (OpenAI reports audio inside the base counts)
         cached_audio_input  x cached_audio_input_per_m (falls back to cache-read rate, NOTED)
         reasoning           priced NOWHERE: already inside output
 
@@ -438,11 +447,22 @@ def _cost_usd(
         spec.cache_write_1h_per_m if spec.cache_write_1h_per_m is not None
         else cache_write_rate
     )
+    # Audio tokens are a SUBSET of the base counts, not a fifth bucket beside
+    # them: OpenAI's `prompt_tokens_details.audio_tokens` sits inside
+    # `prompt_tokens`, `completion_tokens_details.audio_tokens` inside
+    # `completion_tokens`, and a speech model's whole output is audio. So the
+    # text rate applies to what is left after the audio share is taken out,
+    # and the audio rate to the share. Pricing both columns in full billed
+    # every TTS call twice (Phase D integration, 18 Sep 2026).
+    audio_in = extra.get("audio_input_tokens", 0) or 0
+    audio_out = extra.get("audio_output_tokens", 0) or 0
+    text_in = max(usage.input_tokens - audio_in, 0)
+    text_out = max(output_tokens - audio_out, 0)
     per_million = (
-        usage.input_tokens * input_rate
+        text_in * input_rate
         + usage.cache_read_tokens * cache_read_rate
         + usage.cache_write_tokens * cache_write_rate
-        + output_tokens * spec.output_per_m
+        + text_out * spec.output_per_m
     )
 
     n = extra.get("cache_write_1h_tokens", 0)
@@ -451,21 +471,19 @@ def _cost_usd(
             notes.append("cache_write_1h priced at the 5-minute write rate")
         per_million += n * cache_write_1h_rate
 
-    n = extra.get("audio_input_tokens", 0)
-    if n:
+    if audio_in:
         rate = spec.audio_input_per_m
         if rate is None:
             rate = input_rate
             notes.append("audio_input priced at the text input rate")
-        per_million += n * rate
+        per_million += audio_in * rate
 
-    n = extra.get("audio_output_tokens", 0)
-    if n:
+    if audio_out:
         rate = spec.audio_output_per_m
         if rate is None:
             rate = spec.output_per_m
             notes.append("audio_output priced at the text output rate")
-        per_million += n * rate
+        per_million += audio_out * rate
 
     n = extra.get("cached_audio_input_tokens", 0)
     if n:

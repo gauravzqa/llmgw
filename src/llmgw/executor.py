@@ -110,6 +110,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import json
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import nullcontext
@@ -137,7 +138,7 @@ from .metrics import normalize_stop_reason
 from .policy import ExecutionPlan
 from .pump import Pump, PumpResult, Sink
 from .retry import RetryBudget, RetryPolicy
-from .surfaces.base import Surface, surface_framing
+from .surfaces.base import Surface, Usage, surface_framing, usage_from_body
 from .upstream import Upstream, UpstreamRequest, UpstreamStream
 
 log = logging.getLogger(__name__)
@@ -516,6 +517,7 @@ class Executor:
         body: bytes,
         path: str,
         stream: bool,
+        method: str = "POST",
         deadline: Deadline,
         sink_factory: SinkFactory,
         retry_policy: RetryPolicy | None = None,
@@ -700,6 +702,7 @@ class Executor:
                         request_defaults=_defaults_for(plan, target),
                         path=path,
                         stream=stream,
+                        method=method,
                         deadline=deadline,
                         budgets=budgets,
                         retry_budget=budget,
@@ -993,6 +996,7 @@ class Executor:
         body: bytes,
         path: str,
         stream: bool,
+        method: str = "POST",
         deadline: Deadline,
         budgets: Budgets,
         retry_budget: RetryBudget,
@@ -1069,10 +1073,13 @@ class Executor:
             body=body,
             path=path,
             stream=stream,
+            method=method,
             extra_headers=dict(extra_headers or {}),
             body_kind=body_kind,
             content_type=content_type,
             request_defaults=request_defaults,
+            model_key=getattr(surface, "model_key", "model") or "model",
+            include_usage_injectable=bool(getattr(surface, "include_usage_injectable", True)),
         )
         ctx = {
             "provider": target.provider.id,
@@ -1107,9 +1114,21 @@ class Executor:
                     # turns out to be oversized or truncated is still a
                     # fallback rather than a half-written JSON object.
                     payload = await _read_body(first, source, max_response_bytes, ctx)
+                    # Usage BEFORE commitment too (Phase C, finding 50):
+                    # until now the buffered path had no pump and therefore
+                    # no usage, and every non-streamed call billed zero. The
+                    # dialect reads the complete body; the result rides in a
+                    # PumpResult so accounting sees one shape for both paths.
+                    buffered_usage = _buffered_usage(surface, payload, upstream.status)
+                    _fold_header_usage(surface, upstream, buffered_usage)
+                    state.pump = _BufferedResult(
+                        buffered_usage,
+                        bytes_out=len(payload),
+                        first_event_at=self._clock.now(),
+                    )
                     sink = await commitment.open(upstream, target=target)
                     await _send(sink, payload)
-                    return None
+                    return state.pump.result if state.pump is not None else None
 
                 # The framing check BEFORE commitment (PLAN-2 B1): a body
                 # whose content type the surface's framer cannot read is a
@@ -1132,6 +1151,10 @@ class Executor:
                     content_type=getattr(upstream, "content_type", None),
                 )
                 state.pump = pump
+                # A header-borne meter (ElevenLabs' `character-cost`) is
+                # known before any frame; fold it in now so even a stream cut
+                # after commitment bills the provider's own count (C21).
+                _fold_header_usage(surface, upstream, pump.usage)
                 return await pump.run(_ReheadedSource(first, source))
 
     # ------------------------------------------------------------------ delay
@@ -1351,6 +1374,72 @@ async def _next_chunk(source: AsyncIterator[bytes]) -> bytes | None:
         return await source.__anext__()
     except StopAsyncIteration:
         return None
+
+
+def _fold_header_usage(surface: Surface, upstream: Any, usage: Usage) -> None:
+    """`Surface.usage_from_headers`, when the dialect has one (Phase D).
+
+    Never raises: a meter the surface cannot read leaves the usage as it was,
+    and the accounting layer's exactness flags say so.
+    """
+    hook = getattr(surface, "usage_from_headers", None)
+    if hook is None:
+        return
+    headers = getattr(upstream, "headers", None)
+    if headers is None:
+        return
+    try:
+        hook(headers, usage)
+    except Exception:  # noqa: BLE001 - billing never breaks serving
+        usage.parse_failures += 1
+
+
+def _buffered_usage(surface: Surface, payload: bytes, status: int) -> Usage:
+    """The usage a complete JSON body reports, via the surface (Phase C).
+
+    Only a 2xx body is a usage report; an error body's `usage`, if any, is not
+    a bill. Never raises: a body that is not JSON leaves the usage inexact.
+    """
+    usage = Usage()
+    if not (200 <= status < 300):
+        return usage
+    try:
+        parsed = json.loads(payload)
+    except (ValueError, UnicodeDecodeError):
+        return usage
+    if isinstance(parsed, dict):
+        usage_from_body(surface, parsed, usage)
+    return usage
+
+
+class _BufferedResult:
+    """A `PumpResult`-shaped record for a response that never had a pump.
+
+    Exposes exactly the attributes accounting and the record path read:
+    `usage`, `bytes_out`, `committed`, `terminal_seen`, `first_event_at`,
+    `events`, `content_events`, `in_stream_error`,
+    `liveness_before_first_event`. A buffered body that was fully read is by
+    definition complete, so `terminal_seen` is True.
+    """
+
+    __slots__ = ("usage", "bytes_out", "first_event_at", "committed", "terminal_seen",
+                 "events", "content_events", "in_stream_error",
+                 "liveness_before_first_event")
+
+    def __init__(self, usage: Usage, *, bytes_out: int, first_event_at: float) -> None:
+        self.usage = usage
+        self.bytes_out = bytes_out
+        self.first_event_at = first_event_at
+        self.committed = True
+        self.terminal_seen = True
+        self.events = 1
+        self.content_events = 1
+        self.in_stream_error = None
+        self.liveness_before_first_event = False
+
+    @property
+    def result(self) -> _BufferedResult:
+        return self
 
 
 async def _read_body(

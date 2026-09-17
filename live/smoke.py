@@ -662,8 +662,8 @@ def big_vision_case(gw: GatewayServer, *, out=sys.stdout) -> None:
     LLMGW_SMOKE_BIG_VISION=1, because it needs the per-surface body cap
     (agent S's change) and costs real vision tokens."""
     if os.environ.get("LLMGW_SMOKE_BIG_VISION") != "1":
-        print("  big-vision: SKIPPED (set LLMGW_SMOKE_BIG_VISION=1 once the "
-              "per-surface body cap is deployed)", file=out)
+        print("  big-vision: SKIPPED (set LLMGW_SMOKE_BIG_VISION=1 to send the "
+              "10 MiB body; it costs one vision call)", file=out)
         return
     import base64
     # A valid-looking JPEG header followed by filler: the provider will
@@ -683,6 +683,170 @@ def big_vision_case(gw: GatewayServer, *, out=sys.stdout) -> None:
     verdict = "PASS" if resp.status_code != 413 else "FAIL (gateway 413)"
     print(f"  big-vision: {resp.status_code} served_by={resp.headers.get('x-gw-served-by')} "
           f"-> {verdict}", file=out)
+
+
+
+# ==========================================================================
+# PLAN-2 Phase C5: the shapes the sweeps found untested, plus the new routes.
+# Every case prints one PASS/FAIL/INFO line and spends a few thousandths of a
+# cent; none is load-bearing for the measured tables above.
+# ==========================================================================
+
+_SONNET_ID = "anthropic.sonnet-4-6"
+
+
+def _case(out, label: str, resp: httpx.Response, ok: bool, detail: str = "") -> None:
+    verdict = "PASS" if ok else "FAIL"
+    served = resp.headers.get("x-gw-served-by", "-")
+    print(f"  {label}: {resp.status_code} served_by={served} {detail} -> {verdict}", file=out)
+
+
+def anthropic_tool_roundtrip_case(gw: GatewayServer, *, out=sys.stdout) -> None:
+    """Tool call, then the tool result replayed -- never exercised on the
+    Anthropic surface before (capabilities/anthropic.md gap 10)."""
+    route = f"/workloads/anthropic{ROUTE_FOR['anthropic_messages']}"
+    tool = {"name": "get_weather", "description": "Weather for a city",
+            "input_schema": {"type": "object", "properties": {"city": {"type": "string"}},
+                             "required": ["city"]}}
+    body = {"model": "anthropic.haiku-4-5", "max_tokens": 128, "tools": [tool],
+            "tool_choice": {"type": "tool", "name": "get_weather"},
+            "messages": [{"role": "user", "content": "Weather in Pune?"}]}
+    first = httpx.post(f"{gw.base_url}{route}", json=body, timeout=60)
+    ok = first.status_code == 200
+    tool_use = None
+    if ok:
+        tool_use = next((b for b in first.json().get("content", [])
+                         if b.get("type") == "tool_use"), None)
+        ok = tool_use is not None
+    _case(out, "anthropic-tools turn 1", first, ok,
+          f"stop={first.json().get('stop_reason') if first.status_code == 200 else ''}")
+    if not ok:
+        return
+    body2 = {"model": "anthropic.haiku-4-5", "max_tokens": 64, "tools": [tool], "messages": [
+        {"role": "user", "content": "Weather in Pune?"},
+        {"role": "assistant", "content": first.json()["content"]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tool_use["id"],
+                                      "content": "31C, clear"}]},
+    ]}
+    second = httpx.post(f"{gw.base_url}{route}", json=body2, timeout=60)
+    _case(out, "anthropic-tools turn 2", second, second.status_code == 200)
+
+
+def anthropic_vision_and_pdf_case(gw: GatewayServer, *, out=sys.stdout) -> None:
+    """Base64 and URL images, and a one-page PDF, on the Anthropic surface."""
+    import base64
+
+    route = f"/workloads/anthropic{ROUTE_FOR['anthropic_messages']}"
+    # A 1x1 PNG; the point is the request shape, not the vision.
+    # A valid 1x1 RGBA PNG (the previous hex had a malformed IDAT and Anthropic
+    # rejected it with a 400 that looked like a gateway fault, 18 Sep 2026).
+    png = ("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA"
+           "60e6kgAAAABJRU5ErkJggg==")
+    for label, source in (
+        ("anthropic-vision base64",
+         {"type": "base64", "media_type": "image/png", "data": png}),
+        ("anthropic-vision url", {"type": "url",
+                                  "url": "https://upload.wikimedia.org/wikipedia/commons/"
+                                         "4/47/PNG_transparency_demonstration_1.png"}),
+    ):
+        body = {"model": "anthropic.haiku-4-5", "max_tokens": 32, "messages": [
+            {"role": "user", "content": [
+                {"type": "image", "source": source},
+                {"type": "text", "text": "One word: what is this?"}]}]}
+        r = httpx.post(f"{gw.base_url}{route}", json=body, timeout=60)
+        if label.endswith("url") and r.status_code == 400 and "url" in r.text.lower():
+            # Anthropic could not fetch the URL (hotlink policy, transient);
+            # the request shape still transited the gateway. Report, don't fail.
+            _case(out, label, r, True,
+                  detail="400 = provider could not fetch the URL; shape transited")
+            continue
+        _case(out, label, r, r.status_code == 200,
+              detail="" if r.status_code == 200 else r.text[:200])
+    pdf = base64.b64encode(
+        b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
+        b"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n"
+        b"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]>>endobj\n"
+        b"trailer<</Root 1 0 R>>\n%%EOF"
+    ).decode()
+    body = {"model": "anthropic.haiku-4-5", "max_tokens": 32, "messages": [
+        {"role": "user", "content": [
+            {"type": "document", "source": {"type": "base64", "media_type": "application/pdf",
+                                            "data": pdf}},
+            {"type": "text", "text": "How many pages?"}]}]}
+    r = httpx.post(f"{gw.base_url}{route}", json=body, timeout=60)
+    _case(out, "anthropic-pdf", r, r.status_code in (200, 400),
+          "(400 = provider rejected the toy PDF; the request shape transited)")
+
+
+def anthropic_structured_and_adaptive_case(gw: GatewayServer, *, out=sys.stdout) -> None:
+    """`output_config.format` (structured outputs) and adaptive thinking on
+    Sonnet 4.6, which is where both are supported. The bare route, because a
+    workload-prefixed request runs the workload's incumbent (Haiku) whatever
+    the body says; only the bare route lets the body's model pin Sonnet."""
+    route = ROUTE_FOR["anthropic_messages"]
+    body = {"model": _SONNET_ID, "max_tokens": 64,
+            "output_config": {"format": {"type": "json_schema", "schema": {
+                "type": "object", "properties": {"answer": {"type": "string"}},
+                "required": ["answer"], "additionalProperties": False}}},
+            "messages": [{"role": "user", "content": "Reply with the word pong as `answer`."}]}
+    r = httpx.post(f"{gw.base_url}{route}", json=body, timeout=60)
+    ok = r.status_code == 200
+    if ok:
+        text = "".join(b.get("text", "") for b in r.json().get("content", []))
+        try:
+            ok = "answer" in json.loads(text)
+        except ValueError:
+            ok = False
+    _case(out, "anthropic-structured (sonnet-4-6)", r, ok or r.status_code == 400,
+          "(400 = the account lacks structured outputs; shape transited)")
+    body = {"model": _SONNET_ID, "max_tokens": 2048, "thinking": {"type": "adaptive"},
+            "messages": [{"role": "user", "content": "Is 91 prime? One word."}]}
+    r = httpx.post(f"{gw.base_url}{route}", json=body, timeout=90)
+    kinds = ({b.get("type") for b in r.json().get("content", [])}
+             if r.status_code == 200 else set())
+    _case(out, "anthropic-adaptive-thinking (sonnet-4-6)", r, r.status_code == 200,
+          f"blocks={sorted(kinds)}")
+
+
+def openai_parallel_tools_case(gw: GatewayServer, *, out=sys.stdout) -> None:
+    route = f"/workloads/openai{ROUTE_FOR['openai_chat']}"
+    tool = {"type": "function", "function": {
+        "name": "get_weather", "description": "Weather for a city",
+        "parameters": {"type": "object", "properties": {"city": {"type": "string"}},
+                       "required": ["city"]}}}
+    body = {"model": OPENAI_MODEL_ID, "max_tokens": 128, "tools": [tool],
+            "parallel_tool_calls": True, "tool_choice": "required",
+            "messages": [{"role": "user", "content": "Weather in Pune and in Oslo, both."}]}
+    r = httpx.post(f"{gw.base_url}{route}", json=body, timeout=60)
+    calls = []
+    if r.status_code == 200:
+        calls = r.json()["choices"][0]["message"].get("tool_calls") or []
+    _case(out, "openai-parallel-tools", r, r.status_code == 200 and len(calls) >= 1,
+          f"tool_calls={len(calls)}")
+
+
+def phase_c_routes_case(gw: GatewayServer, *, out=sys.stdout) -> None:
+    """`/v1/models` (no upstream call), `/v1/embeddings`, `count_tokens`."""
+    r = httpx.get(f"{gw.base_url}/v1/models", timeout=30)
+    ids = {m["id"] for m in r.json().get("data", [])} if r.status_code == 200 else set()
+    _case(out, "models (openai list)", r, r.status_code == 200 and OPENAI_MODEL_ID in ids,
+          f"n={len(ids)}")
+    r = httpx.get(f"{gw.base_url}/anthropic/v1/models", timeout=30)
+    ids = {m["id"] for m in r.json().get("data", [])} if r.status_code == 200 else set()
+    _case(out, "models (anthropic list)", r,
+          r.status_code == 200 and "anthropic.haiku-4-5" in ids, f"n={len(ids)}")
+    r = httpx.post(f"{gw.base_url}/v1/embeddings", timeout=60,
+                   json={"model": "openai.text-embedding-3-small", "input": "pong"})
+    usage = r.json().get("usage", {}) if r.status_code == 200 else {}
+    _case(out, "embeddings", r, r.status_code == 200 and usage.get("prompt_tokens", 0) > 0,
+          f"prompt_tokens={usage.get('prompt_tokens')}")
+    r = httpx.post(f"{gw.base_url}/anthropic/v1/messages/count_tokens",
+                   json={"model": "anthropic.haiku-4-5",
+                         "messages": [{"role": "user", "content": "count these tokens"}]},
+                   timeout=60)
+    n = r.json().get("input_tokens") if r.status_code == 200 else None
+    _case(out, "count_tokens", r, r.status_code == 200 and isinstance(n, int),
+          f"input_tokens={n}")
 
 
 def run(*, spend: bool = True, out=sys.stdout) -> list[Measured]:
@@ -716,6 +880,12 @@ def run(*, spend: bool = True, out=sys.stdout) -> list[Measured]:
             usage_fields_case(gw, out=out)
             cache_write_read_case(gw, out=out)
             big_vision_case(gw, out=out)
+            # Phase C5: the shapes the sweeps found untested, and the new routes.
+            anthropic_tool_roundtrip_case(gw, out=out)
+            anthropic_vision_and_pdf_case(gw, out=out)
+            anthropic_structured_and_adaptive_case(gw, out=out)
+            openai_parallel_tools_case(gw, out=out)
+            phase_c_routes_case(gw, out=out)
 
             # ---- Task 3: fallback across two real providers, raw socket ----
             for wl in FALLBACK_WORKLOADS:

@@ -84,6 +84,7 @@ client already named the target's wire model.
 from __future__ import annotations
 
 import json
+import re
 import ssl
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
@@ -131,6 +132,9 @@ class UpstreamRequest:
     path: str
     stream: bool
     extra_headers: Mapping[str, str] = field(default_factory=dict)
+    method: str = "POST"
+    """The HTTP method (Phase C): `GET` for a listing-shaped or token-mint
+    route (`/v3/token`), `POST` for everything that carries a body."""
     body_kind: str = "json"
     """`Surface.body` (PLAN-2 B4): `json` bodies are the ones the gateway may
     edit (`apply_api_model`, `apply_extra_body`, `apply_include_usage`,
@@ -146,6 +150,17 @@ class UpstreamRequest:
     (target)`: model row under workload, workload wins), supplied by the
     executor because a `Target` alone has no workload context. `None` means
     "ask the target/model row", which is the pre-policy fallback."""
+    model_key: str = "model"
+    """The top-level key the dialect spells its model under (Phase D
+    integration): `model` for every chat and text surface, `modelId` for
+    Inworld, `model_id` for ElevenLabs. `apply_api_model` rewrites THIS key;
+    rewriting `model` into an Inworld body would leave the catalog id under
+    `modelId` and add a stray key the provider rejects."""
+    include_usage_injectable: bool = True
+    """Whether `stream_options.include_usage` may be injected into this body
+    (finding 27). True for the OpenAI chat dialect; False for every voice
+    surface, whose bodies have no `stream_options` and whose providers 400
+    on unknown keys."""
 
     def __repr__(self) -> str:
         # Length, never content. The body is the customer's prompt, and the
@@ -283,8 +298,17 @@ class UpstreamStream:
 # ==========================================================================
 
 
-def join_url(base_url: str | None, path: str) -> str:
+def join_url(base_url: str | None, path: str, *, prefix: str | None = None) -> str:
     """Join a provider base URL to a surface path without doubling the version.
+
+    `prefix` (Phase C4, `ProviderConn.path_prefix`) is a path segment the
+    provider mounts a second API under: DeepSeek serves its beta features at
+    `https://api.deepseek.com/beta` with the OpenAI SDK's usual
+    `/chat/completions` after it. The SDK reaches that by being given the
+    `/beta` base, which means the surface path's leading `/v1` is NOT sent;
+    so when a prefix is set the `/v1` segment is dropped and the result is
+    `<base><prefix>/chat/completions`. Whether DeepSeek also accepts
+    `/beta/v1/...` is the live test to run before relying on this rule.
 
     OpenAI-compatible base URLs conventionally already carry `/v1`
     (`https://openrouter.ai/api/v1`), and the surface path also carries it
@@ -298,6 +322,15 @@ def join_url(base_url: str | None, path: str) -> str:
         raise errors.PolicyError("provider has no base_url configured")
     base = base_url.rstrip("/")
     tail = "/" + path.lstrip("/")
+    if prefix:
+        segment = "/" + prefix.strip("/")
+        if tail.startswith("/v1/"):
+            tail = tail[3:]
+        elif tail == "/v1":
+            tail = "/"
+        if not base.endswith(segment):
+            base = base + segment
+        return base + tail
     last = base.rsplit("/", 1)[-1]
     first = tail.lstrip("/").split("/", 1)[0]
     if last and last == first:
@@ -444,7 +477,7 @@ def apply_extra_body(body: bytes, extra_body: Mapping[str, object]) -> tuple[byt
     return rendered.encode("utf-8"), True
 
 
-def apply_api_model(body: bytes, api_model: str) -> tuple[bytes, bool]:
+def apply_api_model(body: bytes, api_model: str, key: str = "model") -> tuple[bytes, bool]:
     """The client's `model` becomes the model THIS target's API answers to.
 
     The second place byte-for-byte passthrough stops being true, and the one
@@ -484,9 +517,9 @@ def apply_api_model(body: bytes, api_model: str) -> tuple[bytes, bool]:
     reason, as `build_headers` merging provider extras last.
     """
     parsed = parse_json_object(body)  # raises errors.InvalidRequest
-    if parsed.get("model") == api_model:
+    if parsed.get(key) == api_model:
         return body, False
-    merged: dict[str, Any] = {**parsed, "model": api_model}
+    merged: dict[str, Any] = {**parsed, key: api_model}
     try:
         rendered = json.dumps(merged, ensure_ascii=False, separators=(",", ":"))
     except (TypeError, ValueError, RecursionError) as exc:
@@ -502,6 +535,44 @@ def apply_api_model(body: bytes, api_model: str) -> tuple[bytes, bool]:
 # ==========================================================================
 # Exception mapping
 # ==========================================================================
+
+
+MULTIPART_MODEL_SCAN_BYTES = 64 * 1024
+"""How far into a multipart body the `model` form field is looked for. Text
+fields precede the file part in every SDK's encoding (and the server's own
+`facts_for_body` already requires it), so 64 KiB is generous."""
+
+_MULTIPART_MODEL_FIELD = re.compile(
+    rb'(Content-Disposition:\s*form-data;[^\r\n]*\bname="(?P<name>[^"]+)"[^\r\n]*\r\n'
+    rb'(?:[^\r\n]+\r\n)*\r\n)(?P<value>[^\r\n]*)(?=\r\n)',
+    re.IGNORECASE,
+)
+
+
+def apply_api_model_multipart(
+    body: bytes, api_model: str, key: str = "model",
+) -> tuple[bytes, bool]:
+    """The multipart twin of `apply_api_model`: splice the `key` form field.
+
+    A multipart body is otherwise forwarded byte-for-byte (B4); this is the
+    ONE edit, and it is the same edit JSON bodies get, so a caller may name
+    the catalog id on `/v1/audio/transcriptions` exactly as on chat. Only the
+    field's value bytes change, inside the first `MULTIPART_MODEL_SCAN_BYTES`;
+    the boundary, every other part and the file bytes are untouched. A body
+    that already names the wire id, or has no such field in the window, is
+    returned as-is with `False` -- the server's own scan will have refused the
+    latter before any upstream work. Found live on 18 Sep 2026: the smoke
+    sent `openai.gpt-transcribe` in the form field and OpenAI answered 404.
+    """
+    window = body[:MULTIPART_MODEL_SCAN_BYTES]
+    for m in _MULTIPART_MODEL_FIELD.finditer(window):
+        if m.group("name").decode("latin-1") != key:
+            continue
+        if m.group("value") == api_model.encode("utf-8"):
+            return body, False
+        start, end = m.start("value"), m.end("value")
+        return body[:start] + api_model.encode("utf-8") + body[end:], True
+    return body, False
 
 
 def apply_include_usage(body: bytes) -> tuple[bytes, bool]:
@@ -847,7 +918,8 @@ class Upstream:
         # Refuse before spending a socket. Ordering matters: the checks that
         # cost a dictionary lookup come before the one that costs a handshake.
         deadline.check(**ctx)
-        url = join_url(provider.base_url, req.path)
+        url = join_url(provider.base_url, req.path,
+                       prefix=getattr(provider, "path_prefix", None))
         headers = build_headers(
             target, stream=req.stream, extra=req.extra_headers,
             content_type=req.content_type if req.body_kind != "json" else None,
@@ -865,19 +937,30 @@ class Upstream:
         body_modified = False
         defaulted: tuple[str, ...] = ()
         if req.body_kind == "json":
-            body, renamed = apply_api_model(body, target.model.api_model)
+            model_key = getattr(req, "model_key", "model") or "model"
+            body, renamed = apply_api_model(body, target.model.api_model, key=model_key)
             defaults = (req.request_defaults if req.request_defaults is not None
                         else _request_defaults_of(target))
             body, defaulted = apply_request_defaults(body, defaults)
             body, merged = apply_extra_body(body, provider.extra_body)
             injected = False
-            if self._inject_include_usage and req.stream and provider.kind == "openai":
+            if (self._inject_include_usage and req.stream and provider.kind == "openai"
+                    and getattr(req, "include_usage_injectable", True)):
                 body, injected = apply_include_usage(body)
             body_modified = renamed or bool(defaulted) or merged or injected
+        elif req.body_kind == "multipart":
+            # The one edit a multipart body gets: the model form field, so a
+            # catalog id names the same target it does on the JSON surfaces.
+            body, body_modified = apply_api_model_multipart(
+                body, target.model.api_model, key=req.model_key,
+            )
 
         try:
             client = self._client_for(provider)
-            request = client.build_request("POST", url, content=body, headers=headers)
+            request = client.build_request(
+                getattr(req, "method", "POST") or "POST", url,
+                content=body if body else None, headers=headers,
+            )
             # The connect budget, as an httpx CONNECT timeout on this one
             # request: httpx raises `ConnectTimeout` only while establishing
             # the connection, which is the one place a retry is provably

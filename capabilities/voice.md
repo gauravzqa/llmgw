@@ -17,6 +17,21 @@ WebSocket, WebRTC or SIP; not possible in the current HTTP-only ASGI app.
 seconds or audio tokens, which the catalog and cost model cannot express.
 **Control**: not a data-plane concern.
 
+## Status after PLAN-2 Phase D (18 Sep 2026)
+
+The HTTP half of the table below has moved. Rows marked **Framing** or
+**Accounting** on 16 Sep are **Supported** as of Phase D: `audio_speech`
+(OpenAI binary TTS), `audio_transcription` (OpenAI STT and translation,
+multipart, SSE or JSON), `inworld_tts` (sync and `:stream` NDJSON),
+`elevenlabs_tts` (`{voice_id}` and `/stream`, query forwarded, raw auth
+header) and `assemblyai_sync` (raw-key auth, raw PCM in) are registered
+surfaces with `jsonl` and `raw` framers, `characters` and `seconds` units,
+per-provider 403 meaning, and the `detail.*` and gRPC-status body readers.
+See `docs/18-voice-surfaces.md`. Still not supported: everything marked
+**Transport** (the WebSocket data plane), OpenAI TTS SSE mode and ElevenLabs
+`with-timestamps` as registered routes (per-request framing selection), and
+ElevenLabs / AssemblyAI live verification (no keys provisioned).
+
 ## The verdict
 
 **Nothing the Layrs voice agent runs in production can pass through llmgw
@@ -50,10 +65,10 @@ style, non-token units, and eventually a second data plane.
 | Product | AssemblyAI | ElevenLabs | Inworld | OpenAI | llmgw fit |
 |---|---|---|---|---|---|
 | Streaming STT | WebSocket, binary in / JSON out | WebSocket (Scribe v2 Realtime), base64 in / JSON out | WebSocket `:streamBidirectional`, base64 in / JSON out | WebSocket (Realtime transcription session) | Transport |
-| Batch / sync STT | HTTP raw PCM in, JSON out (Sync, ≤120 s, ≤40 MB); async REST + poll/webhook | multipart in (or `source_url` JSON), JSON out | HTTP JSON, audio inline (≤16 MB) | multipart in, JSON or SSE out (≤25 MB) | Proxyable with per-surface body cap and multipart forwarding; the `source_url` and inline-JSON variants are closest |
-| TTS streaming over HTTP | – | chunked binary (`/stream`); NDJSON (`/stream/with-timestamps`) | NDJSON (`:stream`) | chunked binary, or SSE with `stream_format: "sse"` | Framing (raw and NDJSON); OpenAI SSE mode parses today but the chat surface classifies its events as heartbeats, so it still needs its own surface |
+| Batch / sync STT | HTTP raw PCM in, JSON out (Sync, ≤120 s, ≤40 MB); async REST + poll/webhook | multipart in (or `source_url` JSON), JSON out | HTTP JSON, audio inline (≤16 MB) | multipart in, JSON or SSE out (≤25 MB) | **Supported** (Phase D) for AssemblyAI sync (`assemblyai_sync`, raw PCM) and OpenAI (`audio_transcription`, multipart); ElevenLabs and Inworld batch STT not built |
+| TTS streaming over HTTP | – | chunked binary (`/stream`); NDJSON (`/stream/with-timestamps`) | NDJSON (`:stream`) | chunked binary, or SSE with `stream_format: "sse"` | **Supported** (Phase D): `elevenlabs_tts`, `inworld_tts`, `audio_speech` binary; OpenAI SSE mode and `with-timestamps` have surfaces but are not yet registered routes |
 | TTS streaming over WebSocket | – | `stream-input`, multi-context | `:streamBidirectional`, ≤5 contexts per socket | – | Transport |
-| TTS buffered | – | HTTP JSON in, whole audio out | HTTP JSON in, JSON with base64 out | HTTP JSON in, whole audio out | Proxyable with per-surface response cap |
+| TTS buffered | – | HTTP JSON in, whole audio out | HTTP JSON in, JSON with base64 out | HTTP JSON in, whole audio out | **Supported** (Phase D): Inworld sync is the `inworld_tts` surface as a one-frame stream; OpenAI buffered is the binary `audio_speech`; ElevenLabs non-stream is the same `elevenlabs_tts` route |
 | Speech-to-speech / realtime agent | Voice Agent API (product) | Agents Platform (WS/WebRTC) | Realtime API (OpenAI-protocol WS/WebRTC) | Realtime API (WS/WebRTC/SIP) | Transport; arguably Control (competing runtimes) |
 | Session token minting for browsers | `GET /v3/token` (one-time, ≤600 s, session cap) | single-use tokens, signed URLs | one-time bearer tokens | `POST /v1/realtime/client_secrets` (session config pinned) | Proxyable today as a buffered JSON route, and the one voice piece a gateway should own |
 | LLM gateway of their own | LLM Gateway (OpenAI-compatible) | – | Router at `api.inworld.ai/v1` (OpenAI/Anthropic-compatible, fallback array) | – | Proxyable today as a `ProviderConn(kind="openai")` row; double-gatewaying, one layer must own retries |

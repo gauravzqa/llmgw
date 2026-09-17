@@ -263,6 +263,13 @@ class Pump:
         return self._buffer.size
 
     @property
+    def usage(self) -> Usage:
+        """The usage accumulating for this stream. Exposed so the executor can
+        fold a header-borne meter into it (ElevenLabs' `character-cost`) the
+        moment the upstream headers are known, ahead of any frame."""
+        return self._usage
+
+    @property
     def result(self) -> PumpResult:
         """A snapshot, readable at any time -- including from an `except`.
 
@@ -401,6 +408,8 @@ class Pump:
                     for event in self._framer.flush():
                         self._observe(event)
                     self._source_ended = True
+                    if self._eof_is_terminal():
+                        self._terminal_seen = True
                     return
                 if not chunk:
                     # httpx hands out empty chunks. Feeding one to a framer
@@ -442,6 +451,24 @@ class Pump:
                 err.queued = True  # type: ignore[attr-defined]
             except AttributeError:  # pragma: no cover - slots on a future class
                 pass
+
+    def _eof_is_terminal(self) -> bool:
+        """Is a clean end of body this surface's ending?
+
+        For SSE, no: the dialects end with a marker (`data: [DONE]`,
+        `message_stop`) and a body that stops without one has truncated the
+        answer (`IncompleteStream`, C2). For the JSONL and raw framings there
+        is no marker to withhold -- Inworld's stream, ElevenLabs' audio and
+        OpenAI's binary TTS all end when the connection closes (measured,
+        capabilities/voice-*.md) -- so the close IS the terminal, unless the
+        provider said otherwise in-band first. The cost of this rule is
+        stated in C20: a provider that dies mid-stream on such a framing is
+        indistinguishable from one that finished, and the bill is whatever the
+        meter said (the first line, a header, or an estimate).
+        """
+        if surface_framing(self._surface) == "sse":
+            return False
+        return self._in_stream_error is None
 
     def _read_budget(self) -> float:
         """How long the next upstream read may take before we blame upstream.

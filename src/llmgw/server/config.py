@@ -81,6 +81,8 @@ import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from types import MappingProxyType
+from typing import Any
 
 from llmgw.admission import TenantLimits
 from llmgw.breaker import BreakerPolicy
@@ -121,6 +123,8 @@ DEFAULT_SURFACE_LIMITS: dict[str, SurfaceLimits] = {
     # pins 32 MiB explicitly because that is the provider's own ceiling, so
     # an operator lowering the global does not silently cut Anthropic vision.
     "anthropic_messages": SurfaceLimits(max_request_bytes=32 * 1024 * 1024),
+    # A token count is a prompt, not a PDF (Phase C2): its own smaller cap.
+    "count_tokens": SurfaceLimits(max_request_bytes=4 * 1024 * 1024),
 }
 
 _HEADERS_DEFAULT: dict[str, float] = (
@@ -181,6 +185,16 @@ SOME cap, so a runaway local loop gets a 429 rather than an OOM, while a
 developer who fires twenty parallel curls never meets it."""
 
 
+REALTIME_PIN_KEYS: frozenset[str] = frozenset({
+    "model", "voice", "tools", "turn_detection", "max_output_tokens",
+    "instructions", "expires_after_seconds_cap",
+})
+"""`[tenants.<id>.realtime]` keys (Phase E1). Every one of them is written
+OVER the client's `session` on a client-secret mint (pinned wins); `model` is
+a catalog id resolved through the policy like any other request; and
+`expires_after_seconds_cap` bounds the credential's TTL for this tenant."""
+
+
 @dataclass(frozen=True, slots=True)
 class TenantTable:
     """Tenant ids, their limits, and the tokens that name them. Frozen: a
@@ -196,6 +210,9 @@ class TenantTable:
 
     limits: Mapping[str, TenantLimits]
     _tokens: Mapping[str, str]
+    realtime: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+    """Per-tenant pinned Realtime session fields (Phase E1), keyed by tenant
+    id; absent for tenants that pinned nothing."""
 
     @classmethod
     def from_toml(cls, text: str, *, env: Mapping[str, str] | None = None) -> TenantTable:
@@ -246,8 +263,10 @@ class TenantTable:
 
         limits: dict[str, TenantLimits] = {}
         tokens: dict[str, str] = {}
+        realtime: dict[str, Mapping[str, Any]] = {}
         allowed = {"tokens", "token_env", "token_envs",
-                   "rate_per_second", "burst", "max_concurrency"}
+                   "rate_per_second", "burst", "max_concurrency",
+                   "max_sessions", "realtime"}
         for tenant, entry in table.items():
             if not isinstance(entry, dict):
                 raise ValueError(f"[tenants.{tenant}] must be a table")
@@ -262,9 +281,30 @@ class TenantTable:
                     rate_per_second=float(entry["rate_per_second"]),
                     burst=entry["burst"],
                     max_concurrency=entry["max_concurrency"],
+                    max_sessions=entry.get("max_sessions"),
                 ).validate()
             except (TypeError, ValueError) as exc:
                 raise ValueError(f"[tenants.{tenant}]: {exc}") from exc
+            pin = entry.get("realtime")
+            if pin is not None:
+                if not isinstance(pin, dict):
+                    raise ValueError(f"[tenants.{tenant}.realtime] must be a table")
+                bad = set(pin) - REALTIME_PIN_KEYS
+                if bad:
+                    raise ValueError(
+                        f"[tenants.{tenant}.realtime]: unknown keys {sorted(bad)}; "
+                        f"allowed {sorted(REALTIME_PIN_KEYS)}"
+                    )
+                cap = pin.get("expires_after_seconds_cap")
+                if cap is not None and (type(cap) is not int or cap < 10):
+                    raise ValueError(
+                        f"[tenants.{tenant}.realtime]: expires_after_seconds_cap must be "
+                        f"an integer >= 10"
+                    )
+                model = pin.get("model")
+                if model is not None and (not isinstance(model, str) or not model):
+                    raise ValueError(f"[tenants.{tenant}.realtime]: model must be a string")
+                realtime[tenant] = MappingProxyType(dict(pin))
 
             names: list[str] = []
             if "token_env" in entry:
@@ -309,7 +349,7 @@ class TenantTable:
                     f"[tenants.{tenant}]: no tokens; give it `tokens` or `token_env` "
                     f"(only [tenants.{ANONYMOUS_TENANT}] may have none)"
                 )
-        return cls(limits=limits, _tokens=tokens)
+        return cls(limits=limits, _tokens=tokens, realtime=realtime)
 
     @property
     def authenticated_tenants(self) -> int:
@@ -333,6 +373,10 @@ class TenantTable:
 
     def __contains__(self, tenant: str) -> bool:
         return tenant in self.limits
+
+    def realtime_pin(self, tenant: str) -> Mapping[str, Any] | None:
+        """The tenant's pinned Realtime session fields, or None."""
+        return self.realtime.get(tenant)
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid; never the tokens
         return f"<TenantTable tenants={sorted(self.limits)} tokens={len(self._tokens)}>"
