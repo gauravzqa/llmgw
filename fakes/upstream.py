@@ -104,6 +104,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import mmap
 import os
 import random
@@ -152,6 +153,17 @@ MODES: tuple[str, ...] = (
     "429-billing-anthropic",
     "413",
     "queue-then-serve",
+    # PLAN-2 phase B. Bodies that are not SSE, in the shapes measured on 16
+    # Sep 2026 (capabilities/voice-*.md): Inworld's newline-delimited JSON
+    # (`ndjson-stream`), a chunked binary audio body (`raw-stream`), a correct
+    # SSE stream mislabelled as JSON (`wrong-content-type`), and two request
+    # shapes the gateway could not carry before B4: a multipart upload
+    # (`multipart-echo`) and a JSON body far above 4 MiB (`big-vision`).
+    "ndjson-stream",
+    "raw-stream",
+    "wrong-content-type",
+    "multipart-echo",
+    "big-vision",
 )
 
 PATHS: dict[Surface, str] = {
@@ -324,6 +336,8 @@ class Params:
 # would be absurd for it to inherit the zero-interval default that keeps the
 # `ok` tests fast.
 _MODE_DEFAULTS: dict[str, dict[str, float | int]] = {
+    "ndjson-stream": {"events": 20},
+    "raw-stream": {"events": 16},
     "slow-drip": {"interval": 2.0, "events": 150},
     "ping-forever": {"interval": 1.0, "events": 100_000},
     "huge-event": {"events": 1},
@@ -759,6 +773,142 @@ async def _stall_before_headers(request: Request, surface: Surface, p: Params) -
 
 
 # --------------------------------------------------------------------------
+# Phase B bodies: not SSE, on purpose
+# --------------------------------------------------------------------------
+
+NDJSON_AUDIO_BYTES = 4096
+"""Decoded audio bytes per `ndjson-stream` line. Inworld's real LINEAR16 lines
+are 48,044 bytes (one second of 24 kHz audio); 4 KB keeps the contract tier
+fast while preserving the shape that matters: base64 in JSON, one object per
+`\n`, no blank lines, no terminator."""
+
+NDJSON_CHARACTERS = 19
+"""`processedCharactersCount` on the FIRST line, `0` after -- Inworld reports
+the whole count once, up front (capabilities/voice-inworld.md §6)."""
+
+RAW_CHUNK_BYTES = 8192
+"""`raw-stream` writes: OpenAI's binary TTS arrives in <= 8 KiB HTTP/2 data
+frames (capabilities/voice-openai.md)."""
+
+
+def ndjson_lines(n: int) -> list[bytes]:
+    """The `ndjson-stream` body, line by line, deterministic."""
+    import base64
+
+    out = []
+    for i in range(n):
+        audio = base64.b64encode(bytes([(i * 7 + j) % 256 for j in range(NDJSON_AUDIO_BYTES)]))
+        obj = {
+            "result": {
+                "audioContent": audio.decode("ascii"),
+                "usage": {"processedCharactersCount": NDJSON_CHARACTERS if i == 0 else 0},
+            }
+        }
+        out.append(json.dumps(obj, separators=(",", ":")).encode("ascii") + b"\n")
+    return out
+
+
+def raw_chunks(n: int) -> list[bytes]:
+    """The `raw-stream` body: `n` chunks of `RAW_CHUNK_BYTES`, deterministic."""
+    return [bytes([(i + j) % 256 for j in range(RAW_CHUNK_BYTES)]) for i in range(n)]
+
+
+async def _ndjson_body(p: Params) -> AsyncIterator[bytes]:
+    for line in ndjson_lines(p.events):
+        await _pace(p.interval)
+        yield line
+
+
+async def _raw_body(p: Params) -> AsyncIterator[bytes]:
+    for chunk in raw_chunks(p.events):
+        await _pace(p.interval)
+        yield chunk
+
+
+def _counted(mode: str, gen: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
+    async def wrapped() -> AsyncIterator[bytes]:
+        STATS.stream_opened()
+        try:
+            async for chunk in gen:
+                STATS.record_write(mode)
+                yield chunk
+        finally:
+            STATS.stream_closed()
+
+    return wrapped()
+
+
+def _split_multipart(body: bytes, content_type: str) -> dict[str, object]:
+    """A deliberately small multipart reader: field names, the byte length of
+    each part's payload, and the boundary seen. No decoding of anything,
+    which is the whole point -- the fake proves the bytes arrived intact."""
+    boundary = None
+    for piece in content_type.split(";"):
+        piece = piece.strip()
+        if piece.lower().startswith("boundary="):
+            boundary = piece[len("boundary="):].strip('"')
+    if not boundary:
+        return {"boundary": None, "fields": [], "sizes": {}}
+    delim = b"--" + boundary.encode("latin-1")
+    fields: list[str] = []
+    sizes: dict[str, int] = {}
+    for part in body.split(delim)[1:]:
+        if part.startswith(b"--"):
+            break
+        head, sep, payload = part.partition(b"\r\n\r\n")
+        if not sep:
+            continue
+        if payload.endswith(b"\r\n"):
+            payload = payload[:-2]
+        name = None
+        for line in head.split(b"\r\n"):
+            low = line.lower()
+            if low.startswith(b"content-disposition:") and b"name=" in low:
+                after = line[low.index(b"name=") + 5:]
+                name = after.split(b";")[0].strip().strip(b'"').decode("latin-1")
+        if name is None:
+            continue
+        fields.append(name)
+        sizes[name] = len(payload)
+    return {"boundary": boundary, "fields": fields, "sizes": sizes}
+
+
+async def _multipart_echo(request: Request, p: Params) -> Response:
+    body = await request.body()
+    ctype = request.headers.get("content-type", "")
+    parsed = _split_multipart(body, ctype)
+    return JSONResponse(
+        {
+            "received_bytes": len(body),
+            "content_type": ctype,
+            **parsed,
+            "model_field": None,
+        },
+        headers={"x-fake-mode": p.mode},
+    )
+
+
+async def _big_vision(request: Request, p: Params) -> Response:
+    body = await request.body()
+    parsed: object = None
+    try:
+        parsed = json.loads(body)
+        keys = sorted(parsed.keys()) if isinstance(parsed, dict) else []
+    except (ValueError, UnicodeDecodeError):
+        keys = []
+    echo = parsed if (isinstance(parsed, dict) and len(body) <= 65_536) else None
+    return JSONResponse(
+        {"received_bytes": len(body), "keys": keys, "model": (
+            parsed.get("model") if isinstance(parsed, dict) else None),
+         # The whole body back when it is small: how a contract test sees
+         # which keys the gateway added (request defaults, B5) and which it
+         # left alone.
+         "body": echo},
+        headers={"x-fake-mode": p.mode},
+    )
+
+
+# --------------------------------------------------------------------------
 # Routing
 # --------------------------------------------------------------------------
 
@@ -862,6 +1012,31 @@ def _handler(surface: Surface, default_mode: str) -> Callable[[Request], Awaitab
                         "Request exceeds the maximum size of 32 MB", hdr)
         if p.mode == "stall-before-headers":
             return await _stall_before_headers(request, surface, p)
+        if p.mode == "ndjson-stream":
+            return StreamingResponse(
+                _counted(p.mode, _ndjson_body(p)), status_code=200,
+                media_type="application/json",
+                headers={**_SSE_HEADERS, "x-fake-mode": p.mode},
+            )
+        if p.mode == "raw-stream":
+            return StreamingResponse(
+                _counted(p.mode, _raw_body(p)), status_code=200,
+                media_type="audio/pcm",
+                headers={**_SSE_HEADERS, "x-fake-mode": p.mode},
+            )
+        if p.mode == "wrong-content-type":
+            # A correct SSE stream with the wrong label: what a proxy or a
+            # misconfigured provider does, and what the framing check (B1)
+            # must refuse BEFORE the client's status is committed.
+            return StreamingResponse(
+                _tracked(surface, p), status_code=200,
+                media_type="application/json",
+                headers={**_SSE_HEADERS, "x-fake-mode": p.mode},
+            )
+        if p.mode == "multipart-echo":
+            return await _multipart_echo(request, p)
+        if p.mode == "big-vision":
+            return await _big_vision(request, p)
 
         if p.mode == "huge-event":
             # Validate the size up front: a 400 raised inside the body

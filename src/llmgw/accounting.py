@@ -81,7 +81,8 @@ provider's number is used verbatim and the bytes are ignored.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 
 from .catalog import Catalog, ModelSpec, Target, price_of
 from .errors import Outcome
@@ -90,12 +91,48 @@ from .metrics import normalize_stop_reason
 from .pump import PumpResult
 from .surfaces.base import Usage
 
-__all__ = ["AccountingRecord", "account", "TOKEN_KINDS"]
+__all__ = ["AccountingRecord", "account", "TOKEN_KINDS", "UNITS"]
 
 # Mirrors `metrics.TOKEN_KINDS`. Duplicated rather than imported so accounting
 # has no dependency on the metrics module (which the wiring layer owns): the
 # two are pinned equal by a test instead, so a drift fails loudly.
-TOKEN_KINDS: tuple[str, ...] = ("input", "output", "cache_read", "cache_write")
+TOKEN_KINDS: tuple[str, ...] = (
+    "input", "output", "cache_read", "cache_write",
+    "audio_input", "audio_output", "cached_audio_input", "cache_write_1h",
+    "reasoning",
+)
+UNITS: tuple[str, ...] = ("characters", "seconds")
+"""Mirrors `metrics.UNITS`; pinned equal by the same test."""
+
+_USAGE_INT_FIELDS = (
+    "characters", "seconds", "audio_input_tokens", "audio_output_tokens",
+    "cached_audio_input_tokens", "cache_write_1h_tokens", "reasoning_tokens",
+)
+"""The PLAN-2 B3 fields on `surfaces.base.Usage`, read with `getattr` and a
+zero default so a `Usage` that predates them still accounts."""
+
+
+def _usage_int(usage: object, name: str) -> int:
+    value = getattr(usage, name, 0)
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _usage_tool_calls(usage: object) -> dict[str, int]:
+    raw = getattr(usage, "server_tool_calls", None)
+    if not isinstance(raw, Mapping):
+        return {}
+    out: dict[str, int] = {}
+    for key, value in raw.items():
+        try:
+            n = int(value or 0)
+        except (TypeError, ValueError):
+            continue
+        if n > 0:
+            out[str(key)] = n
+    return out
 
 _OUTPUT_BYTES_PER_TOKEN = 4
 """Bytes of streamed output per output token, for the interrupted-stream
@@ -173,17 +210,58 @@ class AccountingRecord:
     Read off `Usage.stop_reason` with `getattr` so a surface that predates the
     field still accounts cleanly (PLAN-2 A3)."""
 
+    # ---- PLAN-2 B3: kinds beyond the four text buckets ---------------------
+
+    audio_input_tokens: int = 0
+    audio_output_tokens: int = 0
+    cached_audio_input_tokens: int = 0
+    """Audio token kinds providers report inside token usage, priced at the
+    spec's audio rates (falling back to the text rates, with a note)."""
+
+    cache_write_1h_tokens: int = 0
+    """Anthropic 1-hour-TTL cache writes, priced at `cache_write_1h_per_m`."""
+
+    reasoning_tokens: int = 0
+    """Informational: already inside `output_tokens`, never priced twice. The
+    number that shows a "cheap" candidate spending its budget on thinking."""
+
+    characters: int = 0
+    seconds: int = 0
+    """Non-token units (`metrics.UNITS`), for rows whose `unit` is not
+    tokens. Zero on text models."""
+
+    unit: str = "tokens"
+    """The billed row's `ModelSpec.unit`; says which of the counts above the
+    cost was computed from."""
+
+    server_tool_calls: dict[str, int] = field(default_factory=dict)
+    """Provider-side tool calls by usage key, priced at `tool_rates`."""
+
+    cost_notes: tuple[str, ...] = ()
+    """Why a cost is less exact than `basis` says (a kind priced at a fallback
+    rate). Empty when every kind found its own price."""
+
     @property
     def tokens_by_kind(self) -> dict[str, int]:
-        """The four buckets keyed by `metrics.TOKEN_KINDS`, so the metrics wiring
-        can `for kind in TOKEN_KINDS: counter.labels(..., kind).inc(rec.tokens_by_kind[kind])`
-        without knowing which field maps to which label."""
+        """Every token bucket keyed by `metrics.TOKEN_KINDS`, so the metrics
+        wiring can `for kind, n in rec.tokens_by_kind.items(): ...` without
+        knowing which field maps to which label."""
         return {
             "input": self.input_tokens,
             "output": self.output_tokens,
             "cache_read": self.cache_read_tokens,
             "cache_write": self.cache_write_tokens,
+            "audio_input": self.audio_input_tokens,
+            "audio_output": self.audio_output_tokens,
+            "cached_audio_input": self.cached_audio_input_tokens,
+            "cache_write_1h": self.cache_write_1h_tokens,
+            "reasoning": self.reasoning_tokens,
         }
+
+    @property
+    def units_by_kind(self) -> dict[str, int]:
+        """The non-token units keyed by `metrics.UNITS`."""
+        return {"characters": self.characters, "seconds": self.seconds}
 
 
 def account(result: ExecutionResult, *, catalog: Catalog) -> AccountingRecord:
@@ -208,6 +286,9 @@ def _account(result: ExecutionResult, *, catalog: Catalog) -> AccountingRecord:
     usage = _usage_of(result.pump)
     output_tokens = _billed_output_tokens(usage, result.pump)
 
+    extra = {name: _usage_int(usage, name) for name in _USAGE_INT_FIELDS}
+    tool_calls = _usage_tool_calls(usage)
+
     if target is None:
         # Requirement 5: nobody delivered bytes. Zero tokens, zero cost, but a
         # valid record -- the outcome and attempt count still describe what
@@ -215,15 +296,18 @@ def _account(result: ExecutionResult, *, catalog: Catalog) -> AccountingRecord:
         provider = model = None
         in_tok = out_tok = cr_tok = cw_tok = 0
         cost = 0.0
+        unit = "tokens"
+        notes: tuple[str, ...] = ()
     else:
         spec = _spec_for(target, catalog)
         provider = target.provider.id
         model = spec.id
+        unit = spec.unit
         in_tok = usage.input_tokens
         out_tok = output_tokens
         cr_tok = usage.cache_read_tokens
         cw_tok = usage.cache_write_tokens
-        cost = _cost_usd(usage, spec, out_tok)
+        cost, notes = _cost_usd(usage, spec, out_tok, extra=extra, tool_calls=tool_calls)
 
     return AccountingRecord(
         workload_id=plan.workload_id,
@@ -242,6 +326,16 @@ def _account(result: ExecutionResult, *, catalog: Catalog) -> AccountingRecord:
         parse_failures=usage.parse_failures,
         code=result.error.code if result.error is not None else "none",
         stop_reason=normalize_stop_reason(getattr(usage, "stop_reason", None)),
+        audio_input_tokens=extra["audio_input_tokens"],
+        audio_output_tokens=extra["audio_output_tokens"],
+        cached_audio_input_tokens=extra["cached_audio_input_tokens"],
+        cache_write_1h_tokens=extra["cache_write_1h_tokens"],
+        reasoning_tokens=extra["reasoning_tokens"],
+        characters=extra["characters"],
+        seconds=extra["seconds"],
+        unit=unit,
+        server_tool_calls=tool_calls,
+        cost_notes=notes,
     )
 
 
@@ -291,28 +385,58 @@ def _billed_output_tokens(usage: Usage, pump: PumpResult | None) -> int:
     return max(usage.output_tokens, byte_estimate)
 
 
-def _cost_usd(usage: Usage, spec: ModelSpec, output_tokens: int) -> float:
-    """USD for one request: a dot product over the four DISJOINT buckets.
+def _cost_usd(
+    usage: Usage,
+    spec: ModelSpec,
+    output_tokens: int,
+    *,
+    extra: Mapping[str, int] | None = None,
+    tool_calls: Mapping[str, int] | None = None,
+) -> tuple[float, tuple[str, ...]]:
+    """USD for one request, and the notes explaining any fallback rate.
 
-    Each bucket is priced by its own per-million rate and summed, then divided
-    by 1e6. Cache is never folded into input (the `Usage` convention keeps them
-    disjoint precisely so this stays a sum and not a subtraction someone
-    forgets):
+    A dot product over DISJOINT buckets, each priced by its own per-million
+    rate, summed, divided by 1e6. Cache is never folded into input (the
+    `Usage` convention keeps them disjoint precisely so this stays a sum and
+    not a subtraction someone forgets). For `unit="tokens"`:
 
-        input        x input_per_m
-        cache_read   x cached_input_per_m   (falls back to input_per_m)
-        cache_write  x cache_write_per_m    (falls back to input_per_m)
-        output       x output_per_m
+        input               x input_per_m
+        cache_read          x cached_input_per_m     (falls back to input_per_m)
+        cache_write         x cache_write_per_m      (falls back to input_per_m)
+        cache_write_1h      x cache_write_1h_per_m   (falls back to cache_write, then input)
+        output              x output_per_m
+        audio_input         x audio_input_per_m      (falls back to input_per_m, NOTED)
+        audio_output        x audio_output_per_m     (falls back to output_per_m, NOTED)
+        cached_audio_input  x cached_audio_input_per_m (falls back to cache-read rate, NOTED)
+        reasoning           priced NOWHERE: already inside output
 
-    Both cache fallbacks go to `input_per_m`, never to zero -- the same rule
-    `catalog.price_of` states for cache reads. Falling back to zero would make
-    an uncached provider look free and misprice every cache-bearing request on
-    a model whose write rate the table does not carry.
+    For `unit="characters"`: `characters x input_per_m` (the meter is the
+    text sent; TTS rows carry their per-million-character price there). For
+    `unit="seconds"`: `seconds / 60 x per_minute`. Token buckets still add
+    in either case, so a model that reports both (OpenAI TTS in SSE mode
+    reports tokens) is not double-counted by the unit it does not use.
+
+    Server tools: `calls x tool_rates[key] / 1000`; a key with no rate is
+    counted on the record and NOTED, not priced.
+
+    Every fallback goes to a real rate, never to zero -- the same rule
+    `catalog.price_of` states for cache reads. Falling back to zero would
+    make an uncached provider look free. The notes exist because a fallback
+    that is silently correct-looking is how audio tokens were billed at the
+    text rate for a quarter (capabilities/voice-openai.md §6).
     """
+    extra = extra or {}
+    tool_calls = tool_calls or {}
+    notes: list[str] = []
+
     input_rate = spec.input_per_m
     cache_read_rate = price_of(spec, cached=True)
     cache_write_rate = (
         spec.cache_write_per_m if spec.cache_write_per_m is not None else spec.input_per_m
+    )
+    cache_write_1h_rate = (
+        spec.cache_write_1h_per_m if spec.cache_write_1h_per_m is not None
+        else cache_write_rate
     )
     per_million = (
         usage.input_tokens * input_rate
@@ -320,7 +444,55 @@ def _cost_usd(usage: Usage, spec: ModelSpec, output_tokens: int) -> float:
         + usage.cache_write_tokens * cache_write_rate
         + output_tokens * spec.output_per_m
     )
-    return per_million / 1_000_000
+
+    n = extra.get("cache_write_1h_tokens", 0)
+    if n:
+        if spec.cache_write_1h_per_m is None:
+            notes.append("cache_write_1h priced at the 5-minute write rate")
+        per_million += n * cache_write_1h_rate
+
+    n = extra.get("audio_input_tokens", 0)
+    if n:
+        rate = spec.audio_input_per_m
+        if rate is None:
+            rate = input_rate
+            notes.append("audio_input priced at the text input rate")
+        per_million += n * rate
+
+    n = extra.get("audio_output_tokens", 0)
+    if n:
+        rate = spec.audio_output_per_m
+        if rate is None:
+            rate = spec.output_per_m
+            notes.append("audio_output priced at the text output rate")
+        per_million += n * rate
+
+    n = extra.get("cached_audio_input_tokens", 0)
+    if n:
+        rate = spec.cached_audio_input_per_m
+        if rate is None:
+            rate = cache_read_rate
+            notes.append("cached_audio_input priced at the text cache-read rate")
+        per_million += n * rate
+
+    if spec.unit == "characters":
+        per_million += extra.get("characters", 0) * input_rate
+    elif spec.unit == "seconds" and extra.get("seconds", 0):
+        if spec.per_minute is None:
+            notes.append("seconds reported but the row has no per_minute rate")
+        else:
+            per_million += extra["seconds"] / 60.0 * spec.per_minute * 1_000_000
+
+    cost = per_million / 1_000_000
+
+    for key, calls in tool_calls.items():
+        rate = spec.tool_rates.get(key)
+        if rate is None:
+            notes.append(f"{calls} {key} call(s) with no rate on the row")
+            continue
+        cost += calls * rate / 1_000.0
+
+    return cost, tuple(notes)
 
 
 def _spec_for(target: Target, catalog: Catalog) -> ModelSpec:
@@ -378,4 +550,5 @@ def _fallback_record(result: object) -> AccountingRecord:
         parse_failures=0,
         code=code,
         stop_reason=None,
+        cost_notes=("accounting fell back: result was not the expected shape",),
     )

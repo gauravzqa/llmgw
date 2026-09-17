@@ -226,7 +226,9 @@ async def test_a_stall_before_headers_breaches_the_headers_budget_not_the_wall_c
                       **{"X-Fake-Mode": "stall-before-headers", "X-Fake-Delay": "5"})
     started = asyncio.get_running_loop().time()
     with pytest.raises(E.HeadersTimeout) as ei:
-        await drain(up, req, total=5.0, connect=0.3)
+        # `headers` is the status-line budget since PLAN-2 B6; `connect` is
+        # TCP+TLS only and never fires against a listening fake.
+        await drain(up, req, total=5.0, connect=0.3, headers=0.3)
     elapsed = asyncio.get_running_loop().time() - started
     assert elapsed < 2.0, f"gave up after {elapsed:.2f}s, budget was 0.3s"
     assert ei.value.provider == f"fake-{surface}"

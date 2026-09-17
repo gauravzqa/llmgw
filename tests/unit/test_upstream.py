@@ -819,7 +819,10 @@ async def test_a_stall_before_headers_is_a_headers_timeout_not_a_connect_timeout
     up, req, _ = rig(conn(), handler=handle)
     dl = Deadline(clock, total=100.0)
 
-    task = asyncio.create_task(drain(up, req, dl, budgets(100.0, connect=2.0)))
+    # PLAN-2 B6: the status-line wait is the HEADERS budget; `connect` is the
+    # TCP+TLS timeout handed to httpx. Both at 2 s here keeps the pre-B6 shape
+    # of this test; `test_phase_b_server` covers the two moving apart.
+    task = asyncio.create_task(drain(up, req, dl, budgets(100.0, connect=2.0, headers=2.0)))
     await clock.advance(3.0)
     with pytest.raises(E.HeadersTimeout) as ei:
         await task

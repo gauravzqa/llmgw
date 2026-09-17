@@ -60,7 +60,7 @@ sent back, and out-of-money 429s that are retried.
 | Tools, tool_choice, strict | P (works) | P | P (`strict` needs `/beta`: U) | Tool round trip live-tested on OpenAI and DeepSeek only; Anthropic round trip untested (?) |
 | Parallel tool calls | ? | P | ? | Contract test against a two-index fake settles it |
 | Structured outputs / JSON | P (works) | P | P (`json_object` only) | OpenAI deprecates `json_object` for `json_schema` |
-| Vision by URL / base64 / file id | P (works) / P / P (needs Files API) | P / P / P | P / P / P | Gateway body cap 4 MiB vs provider 512 MB / 32 MB / 48 MiB: large base64 gets the gateway's 413 first |
+| Vision by URL / base64 / file id | P (works) / P / P (needs Files API) | P / P / P | P / P / P | Gateway body cap 32 MiB per surface since Phase B (was 4 MiB); providers allow 512 MB / 32 MB / 48 MiB |
 | PDF / documents | P | P | – | Same body cap |
 | Audio in/out | P, accounting blind | – | – | Audio tokens priced differently; mis-costed if used |
 | Reasoning: request params | P | P (`enabled`, `adaptive`, `effort`) | P | Catalog `reasoning` vocabulary is `off/low/high/xhigh`; APIs use `none/minimal/low/medium/high/xhigh/max` (OpenAI) and `none/low/high/max` (DeepSeek) |
@@ -77,7 +77,7 @@ sent back, and out-of-money 429s that are retried.
 | Prediction, verbosity, moderation, metadata, store, logprobs, seed, stop, sampling params | P | P | P | `store` stores under the provider project with the rewritten model |
 | Fine-tuned model ids | U | – | – | Need a catalog row with a price |
 | Body model rewrite | S | S | S | `X-Gw-Body-Modified: 1`; response `model` is the provider's wire id, see gap 1 |
-| Request body cap | 4 MiB | 4 MiB | 4 MiB | `LLMGW_MAX_REQUEST_BYTES`, global not per surface |
+| Request body cap | 32 MiB | 32 MiB | 32 MiB | `LLMGW_MAX_REQUEST_BYTES` global default, per-surface override `LLMGW_MAX_REQUEST_BYTES__<SURFACE>` (Phase B) |
 
 ## 3. Streaming protocol
 
@@ -193,7 +193,7 @@ multi-turn, vision, JSON, DeepSeek as the cheap candidate).
    provider-blamed and five of them open the breaker. Fix: NEUTRAL health when
    liveness was observed during the wait, and a `queued_at_provider` counter.
    Small.
-8. **Body cap is global.** 4 MiB against 32 MB (Anthropic), 48 MiB (DeepSeek),
+8. **Body cap is global.** (Closed in Phase B: 32 MiB default, per-surface overrides.) Was 4 MiB against 32 MB (Anthropic), 48 MiB (DeepSeek),
    512 MB (OpenAI) means base64 vision and PDFs get the gateway's 413 first.
    Make it per surface or per workload. Small.
 9. **Nothing from the provider's response headers survives.** Upstream request

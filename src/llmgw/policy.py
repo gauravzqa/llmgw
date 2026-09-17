@@ -126,8 +126,12 @@ life) the birthday bound is not close.
 """
 
 _BUDGET_KEYS = frozenset(f.name for f in dataclasses.fields(Budgets))
-_WORKLOAD_KEYS = frozenset({"incumbent", "candidate", "budgets", "retry"})
-_TOP_LEVEL_KEYS = frozenset({"default_workload", "defaults", "workloads"})
+_WORKLOAD_KEYS = frozenset({
+    "incumbent", "candidate", "budgets", "retry", "profile", "request_defaults",
+})
+_TOP_LEVEL_KEYS = frozenset({"default_workload", "defaults", "workloads", "profiles"})
+_PROFILE_KEYS = frozenset({"budgets"})
+_EMPTY: Mapping[str, Any] = MappingProxyType({})
 
 
 # ==========================================================================
@@ -201,8 +205,28 @@ class Workload:
     `_freeze`) so the intermediate state cannot be mutated mid-request either.
     """
 
+    profile: str | None = None
+    """The `[profiles.<name>]` this workload's budgets started from, if any.
+    Informational once resolved: `budgets` already carries the outcome of
+    workload-explicit > profile > defaults (PLAN-2 B6). Kept so `/probe` and
+    a reviewer can see WHY a workload has a 2 s first-event budget."""
+
+    request_defaults: Mapping[str, Any] = dataclasses.field(default_factory=lambda: _EMPTY)
+    """JSON-shaped fields applied to the client's body for keys it did not
+    send (PLAN-2 B5). Merged OVER the target model's own `request_defaults`
+    by `ExecutionPlan.request_defaults_for`, so the workload decides and the
+    model supplies what is true of it regardless. This is where "the cheap
+    candidate must not think" lives: `thinking = {type = "disabled"}` on the
+    workload that uses DeepSeek as a candidate, not on the DeepSeek row."""
+
     def __post_init__(self) -> None:
         object.__setattr__(self, "retry", _freeze(self.retry))
+        if not isinstance(self.request_defaults, Mapping):
+            raise PolicyError(
+                f"workload {self.id!r}: request_defaults must be a table, got "
+                f"{type(self.request_defaults).__name__}"
+            )
+        object.__setattr__(self, "request_defaults", _freeze(self.request_defaults))
 
     def validate(self, catalog: Catalog) -> Workload:
         """Resolve every reference and reject the traps. Returns self.
@@ -328,6 +352,10 @@ class Workload:
             "candidate": self.candidate,
             "budgets": dataclasses.asdict(self.budgets),
             "retry": _plain(self.retry),
+            # The profile NAME is deliberately absent: budgets above are the
+            # resolved outcome, and two files that resolve to the same numbers
+            # -- one via a profile, one spelled out -- must share an id.
+            "request_defaults": _plain(self.request_defaults),
         }
 
 
@@ -362,6 +390,25 @@ class ExecutionPlan:
     budgets: Budgets
     retry: object | None
     """See `Workload.retry` -- loosely typed while `retry.py` is in flight."""
+
+    request_defaults: Mapping[str, Any] = dataclasses.field(default_factory=lambda: _EMPTY)
+    """The WORKLOAD's request defaults (frozen). Per-target defaults, which
+    also fold in the model's own, come from `request_defaults_for`."""
+
+    def request_defaults_for(self, target: Target) -> Mapping[str, Any]:
+        """Body fields to supply when the client omitted them, for one target.
+
+        merge(model.request_defaults, workload.request_defaults), workload
+        winning: the model says what is true of it however it is used, the
+        workload says how it is being used here. Shallow merge on top-level
+        keys -- a client that sent `thinking` at all keeps its whole
+        `thinking` object; the gateway never reaches inside a key the client
+        wrote (PLAN-2 B5; the application is `server/app.py`'s, at the same
+        rewrite point as `model`, and reported under `X-Gw-Body-Modified`).
+        """
+        merged: dict[str, Any] = dict(_plain(target.model.request_defaults))
+        merged.update(_plain(self.request_defaults))
+        return MappingProxyType(merged)
 
     def __len__(self) -> int:
         return len(self.targets)
@@ -420,13 +467,32 @@ class PolicySnapshot:
     """The full hex digest `id` is a prefix of. Present so that a collision in
     the short form is diagnosable rather than merely deniable."""
 
+    profiles: Mapping[str, Budgets] = dataclasses.field(default_factory=lambda: _EMPTY)
+    """Named budget sets from `[profiles.<name>.budgets]` (PLAN-2 B6), each
+    already resolved over `[defaults.budgets]`. A workload names one with
+    `profile = "..."`. Kept on the snapshot so `largest_total()` can see a
+    profile no workload uses yet -- the operator who adds a `tts` workload
+    tomorrow should not be the first to learn the drain grace is too short."""
+
     def __post_init__(self) -> None:
         """Freeze, then validate. In that order, so that a snapshot which
         raises never leaves a half-usable object behind for anyone holding a
         reference to it."""
         object.__setattr__(self, "workloads", MappingProxyType(dict(self.workloads)))
+        object.__setattr__(self, "profiles", MappingProxyType(dict(self.profiles)))
         if not self.workloads:
             raise PolicyError("a policy snapshot needs at least one workload")
+        for name, budgets in self.profiles.items():
+            try:
+                budgets.validate()
+            except ValueError as exc:
+                raise PolicyError(f"[profiles.{name}.budgets]: {exc}", cause=exc) from exc
+        for workload in self.workloads.values():
+            if workload.profile is not None and workload.profile not in self.profiles:
+                raise PolicyError(
+                    f"workload {workload.id!r} names profile {workload.profile!r}, "
+                    f"which is not defined; known: {sorted(self.profiles)}"
+                )
         for wid, workload in self.workloads.items():
             if wid != workload.id:
                 raise PolicyError(
@@ -495,7 +561,21 @@ class PolicySnapshot:
             targets=targets,
             budgets=workload.budgets,
             retry=workload.retry,
+            request_defaults=workload.request_defaults,
         )
+
+    def largest_total(self) -> float:
+        """The longest `total` budget anything in this snapshot can grant.
+
+        Over the workloads AND the profiles, because the deploy arithmetic
+        (`ServerConfig.validated`: `total <= drain_grace`) must hold for
+        every stream this policy can start, including one under a profile
+        nobody has attached to a workload yet. `server/config.py` validates
+        the drain grace against this number, not only the global default.
+        """
+        totals = [w.budgets.total for w in self.workloads.values()]
+        totals.extend(b.total for b in self.profiles.values())
+        return max(totals) if totals else 0.0
 
     # ------------------------------------------------------------------ age
 
@@ -594,6 +674,21 @@ class PolicySnapshot:
         )
         base_retry = _table(defaults, "retry", default=None)
 
+        # [profiles.<name>.budgets]: a named budget set resolved over the
+        # defaults, so a profile that sets three numbers inherits the other
+        # four exactly as a workload would (PLAN-2 B6).
+        profiles: dict[str, Budgets] = {}
+        raw_profiles = _table(raw, "profiles", default={}) or {}
+        for name, body in raw_profiles.items():
+            if not isinstance(body, dict):
+                raise PolicyError(
+                    f"[profiles.{name}] must be a table, got {type(body).__name__}"
+                )
+            _reject_unknown(body, _PROFILE_KEYS, f"[profiles.{name}]")
+            profiles[name] = _budgets_from(
+                _table(body, "budgets", default={}), base_budgets, f"profiles.{name}"
+            )
+
         raw_workloads = _table(raw, "workloads", default=None)
         if not raw_workloads:
             raise PolicyError(
@@ -613,8 +708,19 @@ class PolicySnapshot:
                     f"[workloads.{wid}] is missing 'incumbent'; it is required "
                     "because it is the target every fallback ends at"
                 )
+            profile = body.get("profile")
+            if profile is not None:
+                profile = _string(body, "profile", f"[workloads.{wid}]")
+                if profile not in profiles:
+                    raise PolicyError(
+                        f"[workloads.{wid}] profile={profile!r} is not defined "
+                        f"under [profiles]; known: {sorted(profiles)}"
+                    )
+            # Resolution order: workload-explicit > profile > defaults.
+            start = profiles[profile] if profile is not None else base_budgets
             overrides = _table(body, "budgets", default={})
             retry = body.get("retry", base_retry)
+            request_defaults = _table(body, "request_defaults", default={}) or {}
             workloads[wid] = Workload(
                 id=wid,
                 incumbent=_string(body, "incumbent", f"[workloads.{wid}]"),
@@ -623,8 +729,10 @@ class PolicySnapshot:
                     if body.get("candidate") is not None
                     else None
                 ),
-                budgets=_budgets_from(overrides, base_budgets, f"workloads.{wid}"),
+                budgets=_budgets_from(overrides, start, f"workloads.{wid}"),
                 retry=retry,
+                profile=profile,
+                request_defaults=request_defaults,
             )
 
         default_workload = raw.get("default_workload")
@@ -635,7 +743,9 @@ class PolicySnapshot:
                 "guessing 'the first one in the file' makes routing depend on "
                 f"key order. Known workloads: {sorted(workloads)}"
             )
-        return cls._build(workloads, default_workload, catalog=catalog, clock=clock)
+        return cls._build(
+            workloads, default_workload, catalog=catalog, clock=clock, profiles=profiles,
+        )
 
     @classmethod
     def single_target(
@@ -670,8 +780,10 @@ class PolicySnapshot:
         *,
         catalog: Catalog,
         clock: Clock | None,
+        profiles: Mapping[str, Budgets] | None = None,
     ) -> PolicySnapshot:
-        digest = _digest(_canonical_policy(default_workload, workloads))
+        profiles = dict(profiles or {})
+        digest = _digest(_canonical_policy(default_workload, workloads, profiles))
         clock = clock or SystemClock()
         return cls(
             id=_ID_PREFIX + digest[:_ID_CHARS],
@@ -680,6 +792,7 @@ class PolicySnapshot:
             catalog=catalog,
             default_workload=default_workload,
             content_digest=digest,
+            profiles=profiles,
         )
 
 
@@ -887,7 +1000,9 @@ def _dump(doc: Any) -> str:
 
 
 def _canonical_policy(
-    default_workload: str, workloads: Mapping[str, Workload]
+    default_workload: str,
+    workloads: Mapping[str, Workload],
+    profiles: Mapping[str, Budgets] | None = None,
 ) -> str:
     """The policy's meaning, as a string.
 
@@ -896,11 +1011,21 @@ def _canonical_policy(
     routing therefore produce identical ids even if one spells out what the
     other inherits, which is the property that makes the id survive a config
     refactor. It also means comments, whitespace and key order do not move it.
+
+    Profiles ARE hashed, by resolved value: an unused profile still changes
+    what `largest_total()` says and therefore what the deploy arithmetic
+    admits, so two files that differ only in a profile are two policies.
+    A snapshot with no profiles hashes exactly as before B6.
     """
-    return _dump({
+    doc: dict[str, Any] = {
         "default_workload": default_workload,
         "workloads": {wid: w._canonical() for wid, w in workloads.items()},
-    })
+    }
+    if profiles:
+        doc["profiles"] = {
+            name: dataclasses.asdict(b) for name, b in sorted(profiles.items())
+        }
+    return _dump(doc)
 
 
 def _canonical_catalog(catalog: Catalog) -> str:
@@ -920,6 +1045,18 @@ def _canonical_catalog(catalog: Catalog) -> str:
                 "max_output": m.max_output,
                 "priced_at": m.priced_at,
                 "aliases": list(m.aliases),
+                # PLAN-2 B3/B5: anything that changes what a call costs or
+                # what body reaches the provider moves the catalog id.
+                **_nondefault({
+                    "unit": (m.unit, "tokens"),
+                    "per_minute": (m.per_minute, None),
+                    "audio_input_per_m": (m.audio_input_per_m, None),
+                    "audio_output_per_m": (m.audio_output_per_m, None),
+                    "cached_audio_input_per_m": (m.cached_audio_input_per_m, None),
+                    "cache_write_1h_per_m": (m.cache_write_1h_per_m, None),
+                    "tool_rates": (dict(m.tool_rates), {}),
+                    "request_defaults": (_plain(m.request_defaults), {}),
+                }),
             }
             for mid, m in catalog.models.items()
         },
@@ -932,10 +1069,22 @@ def _canonical_catalog(catalog: Catalog) -> str:
                 "max_concurrency": p.max_concurrency,
                 "extra_headers": dict(p.extra_headers),
                 "extra_body": _plain(p.extra_body),
+                **_nondefault({
+                    "auth_scheme": (p.auth_scheme, "bearer"),
+                    "auth_header": (p.auth_header, None),
+                }),
             }
             for pid, p in catalog.providers.items()
         },
     })
+
+
+def _nondefault(fields: Mapping[str, tuple[Any, Any]]) -> dict[str, Any]:
+    """Only the fields that differ from their default, so a catalog that
+    predates B3 hashes to the id it always had. (`auth_scheme="x-api-key"` on
+    the Anthropic rows does move it once, deliberately: the credential now
+    travels under a declared scheme rather than an implied one.)"""
+    return {k: v for k, (v, default) in fields.items() if v != default}
 
 
 __all__ = [

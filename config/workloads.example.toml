@@ -92,6 +92,36 @@ respect_retry_after = true
 
 
 # --------------------------------------------------------------------------
+# [profiles] -- named budget sets a workload can start from (PLAN-2 B6).
+#
+# Each profile is resolved over [defaults.budgets] the same way a workload
+# is, so a profile that sets three numbers inherits the rest. A workload
+# says `profile = "tts"` and may still override single keys on top; the
+# order is workload-explicit > profile > defaults. Profiles are hashed into
+# the policy id and counted by `largest_total()`, so an unused one still
+# has to fit the deploy arithmetic (`total <= LLMGW_DRAIN_GRACE`).
+# --------------------------------------------------------------------------
+
+[profiles.tts.budgets]
+# Speech: a model that has not produced audio in 2 s is already wrong
+# (Inworld TTS-2's server-side P90 first byte is 100 ms), and a 2,000
+# character utterance streams for at most ~2 min. Used by the voice
+# surfaces (PLAN-2 D); defined here so the numbers are reviewed once.
+headers = 2.0
+first_event = 2.0
+progress = 5.0
+total = 150.0
+
+[profiles.long_context]
+[profiles.long_context.budgets]
+# A 1M-token prompt on Sonnet 4.6 / 5 can take the better part of a minute
+# to first token. `total` here is the number the drain grace must exceed if
+# any workload adopts this profile.
+first_event = 60.0
+total = 600.0
+
+
+# --------------------------------------------------------------------------
 # Workloads.
 #
 # `incumbent` is required, `candidate` is not. That asymmetry is the point:
@@ -181,6 +211,35 @@ incumbent = "fake.echo"
   [workloads.local.budgets]
   total = 30.0
   first_event = 5.0
+
+
+# 5. The cheap candidate that must not think. DeepSeek turns thinking ON by
+#    default at `high` on every model (capabilities/deepseek.md), so a
+#    candidate meant to be cheap pays reasoning rates and, at a small
+#    max_tokens, can return empty content that still counts as a committed
+#    success -- the incumbent never runs. `request_defaults` supplies body
+#    fields the CLIENT did not send (a client that sent `thinking` keeps its
+#    own); the gateway reports the edit under X-Gw-Body-Modified. It lives on
+#    the workload, not the DeepSeek catalog row, because whether to think is
+#    a decision about how the model is used here, not a fact about the model.
+[workloads.cheap-candidate]
+incumbent = "deepseek.deepseek-v4-pro"
+candidate = "openrouter.deepseek-v4-flash"
+
+  [workloads.cheap-candidate.request_defaults]
+  thinking = { type = "disabled" }
+
+
+# 6. A profile in use. `profile` names a [profiles.*] table; the two keys
+#    below it override that profile's numbers for this workload only, so the
+#    resolved budgets are: total 600 (profile), first_event 90 (here),
+#    everything else from [defaults.budgets].
+[workloads.longform]
+incumbent = "anthropic.sonnet-5"
+profile = "long_context"
+
+  [workloads.longform.budgets]
+  first_event = 90.0
 
 
 # --------------------------------------------------------------------------

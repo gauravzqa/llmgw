@@ -224,6 +224,27 @@ class Collectors:
             kind=self._one_of(kind, M.TOKEN_KINDS, "kind", m),
         ).inc(n)
 
+    def units(self, *, provider: str, model: str, unit: str, n: int) -> None:
+        """`llmgw_units_total`: characters or seconds billed (PLAN-2 B3)."""
+        if n <= 0:
+            return
+        m = "llmgw_units_total"
+        self._by_name[m].labels(  # type: ignore[attr-defined]
+            provider=provider, model=model,
+            unit=self._one_of(unit, M.UNITS, "unit", m),
+        ).inc(n)
+
+    def server_tool_calls(self, *, provider: str, model: str, tool: str, n: int) -> None:
+        """`llmgw_server_tool_calls_total`. A tool kind outside `TOOL_KINDS`
+        is dropped from the metric (the capture record still has it); the
+        closed set is the point."""
+        if n <= 0 or tool not in M.TOOL_KINDS:
+            return
+        m = "llmgw_server_tool_calls_total"
+        self._by_name[m].labels(  # type: ignore[attr-defined]
+            provider=provider, model=model, tool=tool,
+        ).inc(n)
+
     def cost(self, *, provider: str, model: str, basis: str, usd: float) -> None:
         """`llmgw_cost_usd_total`, split by exact/estimated basis."""
         if usd <= 0:

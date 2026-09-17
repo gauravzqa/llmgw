@@ -248,6 +248,29 @@ class Budgets:
 
     total: float
     connect: float = 2.0
+    """TCP + TLS only, since PLAN-2 B4: the time to a connected socket. A
+    breach here is the safest retry in the system -- nothing was accepted
+    upstream, so no side effect can exist -- which is why it is kept tight
+    and kept separate from the wait below."""
+
+    headers: float = 10.0
+    """Request written; waiting for the response STATUS LINE.
+
+    Until 17 Sep 2026 this wait lived inside `connect` (finding 10: "the
+    connect clock secretly also covers connected-but-slow"), and the default
+    2 s produced a 504 on a healthy provider in the cross-machine live bench:
+    OpenAI sends its headers together with the first token (finding 28), so
+    on a 1.5k-token context the status line legitimately takes longer than a
+    TCP handshake. A breach here is `HeadersTimeout`: the request WAS accepted,
+    so it is `retry_same=False` and only the next target may be tried.
+
+    Enforced by `upstream.py` between the request write and the status line
+    (`LLMGW_BUDGET_HEADERS`). Sized for a long prompt's status line, not a
+    handshake: 10 s default, under the 20 s first-event budget. The two are
+    consecutive phases, not nested, so no ordering between them is required
+    beyond each fitting inside `total`.
+    """
+
     first_event: float = 20.0
     """Headers arrived; waiting for the first BODY BYTE.
 
@@ -277,6 +300,12 @@ class Budgets:
     def validate(self) -> Budgets:
         if self.total <= 0:
             raise ValueError("total budget must be positive")
+        if self.headers <= 0:
+            raise ValueError("headers budget must be positive")
+        # `headers` is deliberately NOT held to `<= total`: its default (10 s)
+        # predates no config, so a policy with `total = 5` written before the
+        # phase existed must keep loading. `Deadline.slice()` clamps it to
+        # what is left, as it does every phase.
         for name in ("connect", "first_event", "progress"):
             value = getattr(self, name)
             if value <= 0:

@@ -54,12 +54,13 @@ kill_timeout = "140s"
   # A stream may run for up to 120 s; a deploy waits up to 130 s for it.
   LLMGW_BUDGET_TOTAL = "120"
   LLMGW_DRAIN_GRACE = "130"
-  # The connect budget also covers "connected, waiting for response headers"
-  # (finding 10), and OpenAI sends headers together with the first token
-  # (finding 28), so on a long prompt the 2 s code default is a 504 on a
-  # healthy provider: seen once in 122 calls on 17 Sep (multi-turn, 1.5k-token
-  # context). 10 s keeps it well under the 20 s first-event budget.
-  LLMGW_BUDGET_CONNECT = "10"
+  # The status-line wait has its own budget since PLAN-2 B6 (finding 10):
+  # `connect` is TCP+TLS only (code default 2 s), `headers` is "connected,
+  # waiting for the response status line". OpenAI sends its status line
+  # together with the first token (finding 28), so on a long prompt that wait
+  # legitimately exceeds 2 s: one 504 in 122 calls on 17 Sep (multi-turn,
+  # 1.5k-token context). 10 s keeps it well under the 20 s first-event budget.
+  LLMGW_BUDGET_HEADERS = "10"
 
   # Per-process shed: the 151st concurrent stream is a 503 `overloaded`
   # before its body is read. 150 was the largest cap at which the S2 load

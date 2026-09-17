@@ -91,6 +91,44 @@ from llmgw.policy import PolicySnapshot
 
 log = logging.getLogger("llmgw.server.config")
 
+
+@dataclass(frozen=True, slots=True)
+class SurfaceLimits:
+    """The two byte caps one surface runs under (PLAN-2 B4). A row is a
+    DELTA over the global `max_request_bytes` / `max_response_bytes`: `None`
+    means "inherit the global", so an operator who lowers the global with one
+    variable lowers every surface that did not set its own number."""
+
+    max_request_bytes: int | None = None
+    max_response_bytes: int | None = None
+
+    def validate(self, name: str) -> None:
+        for fname in ("max_request_bytes", "max_response_bytes"):
+            value = getattr(self, fname)
+            if value is not None and value < 1:
+                raise ValueError(f"surface_limits[{name!r}].{fname} must be positive")
+
+    def resolved(self, *, request: int, response: int) -> SurfaceLimits:
+        return SurfaceLimits(
+            self.max_request_bytes if self.max_request_bytes is not None else request,
+            self.max_response_bytes if self.max_response_bytes is not None else response,
+        )
+
+
+DEFAULT_SURFACE_LIMITS: dict[str, SurfaceLimits] = {
+    # `Surface.name` -> the caps that differ from the globals. Chat is the
+    # globals (32 MiB / 8 MiB) and needs no row; the Anthropic messages row
+    # pins 32 MiB explicitly because that is the provider's own ceiling, so
+    # an operator lowering the global does not silently cut Anthropic vision.
+    "anthropic_messages": SurfaceLimits(max_request_bytes=32 * 1024 * 1024),
+}
+
+_HEADERS_DEFAULT: dict[str, float] = (
+    {"headers": 10.0} if "headers" in getattr(Budgets, "__dataclass_fields__", {}) else {}
+)
+"""`Budgets.headers` (PLAN-2 B6) is passed only when the field exists, so this
+module imports against a `clocks.py` from either side of that change."""
+
 DEFAULT_FAKE_OPENAI_URL = "http://127.0.0.1:8801/v1"
 """Matches `make fakes` and the `fake-openai` entry in the shipped catalog.
 The trailing `/v1` is intentional and is collapsed against the surface path by
@@ -359,6 +397,7 @@ class ServerConfig:
             first_event=20.0,
             progress=15.0,
             client_stall=30.0,
+            **_HEADERS_DEFAULT,
         )
     )
     """The budgets of the ONE workload the zero-config path builds.
@@ -392,8 +431,16 @@ class ServerConfig:
     resynchronise after, so exceeding it kills the request rather than
     skipping the frame -- see `errors.FrameTooLarge`."""
 
-    max_request_bytes: int = 4 * 1024 * 1024
+    max_request_bytes: int = 32 * 1024 * 1024
     """Client request bodies over this get a 413 before any upstream work.
+
+    32 MiB since Phase B (was 4 MiB, a text-era number): base64 vision and PDF
+    bodies routinely run to 10 MiB, Anthropic accepts 32 MB and OpenAI 512 MB,
+    and a 10 MiB vision call through the chat surface was the B exit criterion
+    that the 4 MiB cap failed on 18 Sep 2026. The memory bound is per request
+    (the body is buffered so a pre-commit retry can resend it), so the worst
+    case is max_streams x this cap; lower it per surface with
+    LLMGW_MAX_REQUEST_BYTES__<SURFACE> where a route never needs it.
     Checked while reading, never after: a limit enforced on an already
     assembled body is a limit that allocated the thing it was protecting
     against."""
@@ -403,6 +450,19 @@ class ServerConfig:
     in order to send an honest `content-length`. The streaming path is bounded
     by `buffer_bytes` + `max_frame_bytes` and has no total-size limit, because
     a long answer is not a large one."""
+
+    surface_limits: Mapping[str, SurfaceLimits] = field(
+        default_factory=lambda: dict(DEFAULT_SURFACE_LIMITS)
+    )
+    """Per-surface deltas over the two caps above (PLAN-2 B4), keyed by
+    `Surface.name`; a `None` in a row inherits the global. Shipped:
+    Anthropic messages at 32 MiB requests (the provider's own ceiling; base64
+    PDFs and images arrive at that size); chat is the globals. Voice surfaces
+    add rows in Phase D. Env: `LLMGW_MAX_REQUEST_BYTES__<SURFACE_NAME_UPPER>`
+    / `LLMGW_MAX_RESPONSE_BYTES__<SURFACE_NAME_UPPER>` (two underscores, e.g.
+    `LLMGW_MAX_REQUEST_BYTES__ANTHROPIC_MESSAGES`) sets one number on one
+    row; the plain `LLMGW_MAX_REQUEST_BYTES` sets the global every row without
+    its own number inherits. Read through `limits_for()`, never directly."""
 
     catalog: Catalog = field(default_factory=lambda: DEFAULT_CATALOG)
 
@@ -663,6 +723,8 @@ class ServerConfig:
             if not self.drain_allow_short:
                 raise ValueError(message)
             log.warning("LLMGW_DRAIN_ALLOW_SHORT is set: %s", message)
+        for name, limits in self.surface_limits.items():
+            limits.validate(name)
         if self.max_streams is not None and self.max_streams < 1:
             # In code, None is the spelling for "uncapped"; a zero would refuse
             # every request and look like an outage with no log line.
@@ -701,6 +763,47 @@ class ServerConfig:
         self.tenant_limits.validate()
         self.breaker.validate()
         return self
+
+    # ------------------------------------------------------------- surfaces
+
+    def limits_for(self, surface_name: str) -> SurfaceLimits:
+        """The byte caps for one surface, fully resolved: its row's numbers
+        where the row set them, the globals everywhere else."""
+        row = self.surface_limits.get(surface_name) or SurfaceLimits()
+        return row.resolved(request=self.max_request_bytes, response=self.max_response_bytes)
+
+    # ---------------------------------------------------------------- drain
+
+    def check_drain_arithmetic(self, snapshot: PolicySnapshot) -> None:
+        """The deploy inequality against the LARGEST total any workload or
+        profile in the snapshot can hand a request (PLAN-2 B6).
+
+        `validated()` checks `budgets.total` -- the zero-config workload's --
+        but with a policy file that number is handed to nobody: each workload
+        has its own total, and a `[profiles.long_context]` at 600 s behind a
+        130 s grace is cut on every deploy while the global check stays
+        green. Called by `app.Gateway` right after the snapshot is built, so
+        a bad file still refuses at startup and never on the request path.
+        `PolicySnapshot.largest_total()` is the policy side's answer; a
+        snapshot without it (older policy.py) is measured over its workloads.
+        """
+        largest = getattr(snapshot, "largest_total", None)
+        if callable(largest):
+            total = float(largest())
+        else:
+            totals = [w.budgets.total for w in snapshot.workloads.values()]
+            total = max(totals) if totals else self.budgets.total
+        if total > self.drain_grace_seconds:
+            message = (
+                f"the largest workload/profile total in the policy is {total:g}s, above "
+                f"drain_grace_seconds={self.drain_grace_seconds:g}s: streams of that "
+                f"workload longer than the grace are cut on deploy. Raise "
+                f"LLMGW_DRAIN_GRACE (and the orchestrator's kill timeout above it), "
+                f"lower that workload's total, or set LLMGW_DRAIN_ALLOW_SHORT=1"
+            )
+            if not self.drain_allow_short:
+                raise ValueError(message)
+            log.warning("LLMGW_DRAIN_ALLOW_SHORT is set: %s", message)
 
     # -------------------------------------------------------------- tenants
 
@@ -820,6 +923,10 @@ class ServerConfig:
             first_event=_env_float(env, "LLMGW_BUDGET_FIRST_EVENT", 20.0),
             progress=_env_float(env, "LLMGW_BUDGET_PROGRESS", 15.0),
             client_stall=_env_float(env, "LLMGW_BUDGET_CLIENT_STALL", 30.0),
+            **(
+                {"headers": _env_float(env, "LLMGW_BUDGET_HEADERS", 10.0)}
+                if _HEADERS_DEFAULT else {}
+            ),
         )
         fake = _env_bool(env, "LLMGW_FAKE_UPSTREAMS", default=False)
         catalog = DEFAULT_CATALOG
@@ -836,8 +943,9 @@ class ServerConfig:
             budgets=budgets,
             buffer_bytes=_env_int(env, "LLMGW_BUFFER_BYTES", 256 * 1024),
             max_frame_bytes=_env_int(env, "LLMGW_MAX_FRAME_BYTES", 1 << 20),
-            max_request_bytes=_env_int(env, "LLMGW_MAX_REQUEST_BYTES", 4 * 1024 * 1024),
+            max_request_bytes=_env_int(env, "LLMGW_MAX_REQUEST_BYTES", 32 * 1024 * 1024),
             max_response_bytes=_env_int(env, "LLMGW_MAX_RESPONSE_BYTES", 8 * 1024 * 1024),
+            surface_limits=surface_limits_from_env(env),
             catalog=catalog,
             forward_request_headers=_env_headers(
                 env, "LLMGW_FORWARD_REQUEST_HEADERS",
@@ -878,6 +986,32 @@ class ServerConfig:
             ),
             max_streams=_env_optional_int(env, "LLMGW_MAX_STREAMS", 150),
         ).validated()
+
+
+def surface_limits_from_env(env: Mapping[str, str]) -> dict[str, SurfaceLimits]:
+    """The per-surface rows from `LLMGW_MAX_{REQUEST,RESPONSE}_BYTES__<SURFACE>`
+    over the shipped table (PLAN-2 B4). Each variable sets ONE number on ONE
+    row; everything a row does not set is inherited from the globals at
+    `limits_for()` time, which is how the plain `LLMGW_MAX_*_BYTES` variables
+    keep meaning what they always meant. Surface names are lower-cased from
+    the suffix. An unknown suffix is accepted and kept (a surface that lands
+    later reads it); a non-integer value is a `ValueError` at startup like
+    every other knob.
+    """
+    table: dict[str, SurfaceLimits] = dict(DEFAULT_SURFACE_LIMITS)
+    prefixes = (("LLMGW_MAX_REQUEST_BYTES__", "max_request_bytes"),
+                ("LLMGW_MAX_RESPONSE_BYTES__", "max_response_bytes"))
+    for key, value in env.items():
+        for prefix, attr in prefixes:
+            if not key.startswith(prefix) or not value.strip():
+                continue
+            name = key[len(prefix):].lower()
+            try:
+                n = int(value)
+            except ValueError as exc:
+                raise ValueError(f"{key}={value!r} is not an integer") from exc
+            table[name] = replace(table.get(name) or SurfaceLimits(), **{attr: n})
+    return table
 
 
 def fake_catalog(
@@ -923,4 +1057,7 @@ __all__ = [
     "ServerConfig",
     "TenantTable",
     "fake_catalog",
+    "SurfaceLimits",
+    "DEFAULT_SURFACE_LIMITS",
+    "surface_limits_from_env",
 ]

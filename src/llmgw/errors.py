@@ -509,6 +509,32 @@ class ResponseTooLarge(GatewayError):
     status = 502
 
 
+class UnsupportedUpstreamFraming(GatewayError):
+    """A streaming upstream body whose declared content type cannot be the
+    framing the surface expects -- `application/json` or `audio/mpeg` where
+    `text/event-stream` was due.
+
+    Before this class existed the pump fed such a body to the SSE parser
+    anyway: no frame ever completed, the bytes still reached the client, and
+    the request died as a *provider stall* (`FirstEventTimeout`) or a
+    *frame bound* (`FrameTooLarge`) with $0 accounted -- the exact shape the
+    gzip note in `upstream.py` describes, and the shape Inworld's NDJSON
+    stream produced on 16 Sep 2026. Raised BEFORE the status is committed,
+    it is a fallback candidate instead of a truncated answer.
+
+    `retry_same=False`: the provider will label the same body the same way
+    again. `try_next=True`: another target may speak the framing we expect.
+    NEUTRAL and GATEWAY blame: the provider did nothing wrong, we routed a
+    body to a surface that cannot read it."""
+
+    code = "unsupported_upstream_framing"
+    retry_same = False
+    try_next = True
+    health = Health.NEUTRAL
+    blame = Blame.GATEWAY
+    status = 502
+
+
 class FrameTooLarge(GatewayError):
     """A single SSE event exceeded the parser's byte bound.
 
@@ -864,6 +890,25 @@ def parse_retry_after(value: str | None, *, now: float | None = None) -> float |
     return max(0.0, when.timestamp() - reference)
 
 
+def _is_api_error_body(body: bytes | None) -> bool:
+    """True when the body is a JSON object shaped like an API error.
+
+    OpenAI and Anthropic nest under `error`; gRPC-transcoded providers
+    (Inworld) put `code` and `message` at the top level. Anything else -- an
+    HTML page, plain text, an empty body -- is the edge in front of the API,
+    and a 404 from it says nothing about the model.
+    """
+    if not body:
+        return False
+    try:
+        parsed = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return False
+    if not isinstance(parsed, dict):
+        return False
+    return "error" in parsed or ("code" in parsed and "message" in parsed)
+
+
 def _error_hints(body: bytes | None) -> tuple[str, str]:
     """Pull (type, code_or_message) out of an error body, best effort.
 
@@ -1020,7 +1065,17 @@ def from_http_status(
     if status == 402:
         return InsufficientCredits(detail or "insufficient credits", **kw)
     if status == 404:
-        return ModelNotFound(f"model {model!r} not found at {provider}", **kw)
+        # Only an API error object means "the model is not here". A 404 with
+        # an HTML page, plain text or no body at all is the provider's EDGE
+        # answering, not its API: OpenAI's did so intermittently on 18 Sep
+        # 2026 (finding 49), and calling that ModelNotFound sent the client a
+        # confident wrong message and retried nothing.
+        if _is_api_error_body(body) or _looks_like_unknown_model(detail):
+            return ModelNotFound(f"model {model!r} not found at {provider}", **kw)
+        return UpstreamServerError(
+            f"404 with a non-API body from {provider or 'upstream'} "
+            f"(edge or routing fault, not a missing model)", **kw,
+        )
     if status == 413:
         return UpstreamRequestTooLarge(detail or "request too large for upstream", **kw)
     if status == 409:
@@ -1067,7 +1122,8 @@ ERROR_CODES: frozenset[str] = frozenset(
         ConnectTimeout, ConnectionFailed,
         HeadersTimeout, FirstEventTimeout, StallTimeout, UpstreamDisconnected,
         IncompleteStream,
-        FrameTooLarge, MalformedUpstreamResponse, UpstreamServerError,
+        FrameTooLarge, UnsupportedUpstreamFraming, MalformedUpstreamResponse,
+        UpstreamServerError,
         UpstreamOverloaded, RateLimited, InsufficientCredits,
         AuthenticationFailed, InvalidRequest,
         ContextLengthExceeded, ModelNotFound, ContentFiltered, InStreamError,

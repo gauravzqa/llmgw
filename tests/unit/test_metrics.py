@@ -65,7 +65,10 @@ def test_catalog_scale_growth_is_documented_not_accidental():
     total = sum(n for n, _ in big)
     assert total > M.CARDINALITY_BUDGET      # yes, catalog scale blows it
     assert big[0][1] == "llmgw_time_to_first_event_seconds"
-    assert big[0][0] / total > 0.4           # and one histogram is half of it
+    # One histogram is the largest single line item. It was half of the
+    # total until PLAN-2 B3 added five token kinds, two unit kinds and
+    # three tool kinds as (provider, model) counters; still the biggest.
+    assert big[0][0] / total > 0.3
 
 
 def test_outcome_labels_match_the_error_module_exactly():

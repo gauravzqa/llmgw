@@ -131,13 +131,28 @@ class UpstreamRequest:
     path: str
     stream: bool
     extra_headers: Mapping[str, str] = field(default_factory=dict)
+    body_kind: str = "json"
+    """`Surface.body` (PLAN-2 B4): `json` bodies are the ones the gateway may
+    edit (`apply_api_model`, `apply_extra_body`, `apply_include_usage`,
+    `apply_request_defaults`); `multipart` and `raw` bodies are forwarded
+    byte-for-byte with the client's own `content_type`, because there is no
+    JSON object in them to rewrite a model into."""
+    content_type: str | None = None
+    """The client's `content-type`, forwarded verbatim for non-JSON bodies
+    (a multipart boundary lives in it). Ignored for `json`, which is always
+    sent as `application/json`."""
+    request_defaults: Mapping[str, Any] | None = None
+    """The merged defaults for THIS attempt's target (`plan.request_defaults_for
+    (target)`: model row under workload, workload wins), supplied by the
+    executor because a `Target` alone has no workload context. `None` means
+    "ask the target/model row", which is the pre-policy fallback."""
 
     def __repr__(self) -> str:
         # Length, never content. The body is the customer's prompt, and the
         # header map is not shown at all because that is where the key lives.
         return (
             f"<UpstreamRequest {self.target} {self.path} "
-            f"stream={self.stream} body={len(self.body)}B>"
+            f"stream={self.stream} body={len(self.body)}B kind={self.body_kind}>"
         )
 
 
@@ -152,7 +167,7 @@ class UpstreamStream:
     """
 
     __slots__ = (
-        "status", "headers", "body_modified",
+        "status", "headers", "body_modified", "defaulted_keys",
         "_response", "_deadline", "_budgets", "_read_size", "_ctx", "_started",
     )
 
@@ -165,6 +180,7 @@ class UpstreamStream:
         read_size: int,
         body_modified: bool,
         ctx: dict[str, Any],
+        defaulted_keys: tuple[str, ...] = (),
     ) -> None:
         self._response = response
         self._deadline = deadline
@@ -175,6 +191,15 @@ class UpstreamStream:
         self.status: int = response.status_code
         self.headers: Mapping[str, str] = response.headers
         self.body_modified: bool = body_modified
+        self.defaulted_keys: tuple[str, ...] = defaulted_keys
+        """Top-level request keys `apply_request_defaults` filled in for this
+        attempt (PLAN-2 B5), so the capture record can say which. Empty when
+        the client set everything or the target has no defaults."""
+
+    @property
+    def content_type(self) -> str | None:
+        """The upstream's `content-type`, for the framer choice (PLAN-2 B1)."""
+        return self.headers.get("content-type")
 
     async def aiter_raw(self) -> AsyncIterator[bytes]:
         """Raw body bytes, unbuffered, with the first chunk on its own clock.
@@ -280,14 +305,61 @@ def join_url(base_url: str | None, path: str) -> str:
     return base + tail
 
 
-def build_headers(
-    target: Target, *, stream: bool, extra: Mapping[str, str] | None = None
-) -> dict[str, str]:
-    """Auth and content headers for one attempt, per provider *kind*.
+AUTH_SCHEMES: tuple[str, ...] = ("bearer", "x-api-key", "raw", "header")
+"""How a provider wants its credential (PLAN-2 B2). `bearer` is
+`Authorization: Bearer <key>` (OpenAI, DeepSeek, OpenRouter, Inworld);
+`x-api-key` is Anthropic's header plus `anthropic-version`; `raw` is the bare
+key in `Authorization` with no scheme word (AssemblyAI); `header` is a named
+header carrying the key (`ProviderConn.auth_header`, ElevenLabs'
+`xi-api-key`). Read off the catalog row; a row without the field gets the
+scheme its `kind` implied before the field existed."""
 
-    Kind, not vendor: anything OpenAI-shaped -- OpenRouter, DeepSeek, Groq, a
+
+def auth_scheme_of(provider: ProviderConn) -> tuple[str, str | None]:
+    """`(scheme, header_name)` for a provider row, tolerant of rows that
+    predate the field: `anthropic` kind -> `x-api-key`, everything else ->
+    `bearer`, exactly the pre-B2 behaviour."""
+    scheme = getattr(provider, "auth_scheme", None)
+    if not scheme or (scheme == "bearer" and provider.kind == "anthropic"):
+        # No field, or the field's own default on an `anthropic`-kind row:
+        # the kind implies the scheme, exactly as before B2. The shipped
+        # Anthropic rows say `x-api-key` explicitly; this branch is for rows
+        # and test doubles built from `kind` alone. The one thing it rules
+        # out is an anthropic-kind row that wants plain `Bearer` (Anthropic's
+        # newer OAuth/WIF tokens) -- that needs its own scheme value when it
+        # is wanted, not a silent reinterpretation of the default.
+        scheme = "x-api-key" if provider.kind == "anthropic" else "bearer"
+    if scheme not in AUTH_SCHEMES:
+        raise errors.PolicyError(
+            f"provider {provider.id!r} has unknown auth_scheme {scheme!r}; "
+            f"expected one of {list(AUTH_SCHEMES)}",
+            provider=provider.id, credential_id=provider.key(),
+        )
+    header = getattr(provider, "auth_header", None)
+    if scheme == "header" and not header:
+        raise errors.PolicyError(
+            f"provider {provider.id!r} uses auth_scheme='header' but names no "
+            f"auth_header",
+            provider=provider.id, credential_id=provider.key(),
+        )
+    return scheme, (header.lower() if header else None)
+
+
+def build_headers(
+    target: Target,
+    *,
+    stream: bool,
+    extra: Mapping[str, str] | None = None,
+    content_type: str | None = None,
+) -> dict[str, str]:
+    """Auth and content headers for one attempt, per provider *auth scheme*.
+
+    Scheme, not vendor: anything OpenAI-shaped -- OpenRouter, DeepSeek, Groq, a
     local vLLM -- authenticates identically, which is why there is no
-    per-provider client subclass anywhere in this repo.
+    per-provider client subclass anywhere in this repo. `content_type` is the
+    client's own for a multipart or raw body (the boundary lives in it) and
+    `application/json` otherwise; the old code forced JSON, which is why a
+    multipart transcription upload could not transit (PLAN-2 B4).
 
     A missing credential raises `PolicyError` rather than sending an
     unauthenticated request and letting the provider answer 401. The 401 costs
@@ -306,12 +378,17 @@ def build_headers(
             credential_id=provider.key(),
         )
     headers = {
-        "content-type": "application/json",
+        "content-type": content_type or "application/json",
         "accept": "text/event-stream" if stream else "application/json",
     }
-    if provider.kind == "anthropic":
+    scheme, auth_header = auth_scheme_of(provider)
+    if scheme == "x-api-key":
         headers["x-api-key"] = key
         headers["anthropic-version"] = ANTHROPIC_VERSION
+    elif scheme == "raw":
+        headers["authorization"] = key
+    elif scheme == "header":
+        headers[auth_header or ""] = key
     else:
         headers["authorization"] = f"Bearer {key}"
     # Provider extras then per-request extras, both last so an operator can
@@ -450,6 +527,56 @@ def apply_include_usage(body: bytes) -> tuple[bytes, bool]:
         return body, False
     merged: dict[str, Any] = {**parsed, "stream_options": {"include_usage": True}}
     return json.dumps(merged, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), True
+
+
+def apply_request_defaults(
+    body: bytes, defaults: Mapping[str, Any] | None
+) -> tuple[bytes, tuple[str, ...]]:
+    """Fill in request keys the client did not send (PLAN-2 B5).
+
+    The fourth body edit, next to `apply_api_model`, `apply_extra_body` and
+    `apply_include_usage`, and announced through the same `X-Gw-Body-Modified`
+    flag. `defaults` is the target's merged `request_defaults` (model row,
+    then workload -- `policy.py` does the merge). Rules, in order of how
+    often they bite:
+
+    * a top-level key the client sent is NEVER overwritten, whatever its
+      value -- `"thinking": null` from the client is a decision;
+    * a dict default is merged ONE level into a dict the client sent
+      (`stream_options`, `thinking`, `output_config`): the client's inner
+      keys win, missing inner keys are filled, and the key is reported as
+      defaulted only if something was actually added;
+    * lists and scalars are never merged, only supplied when absent;
+    * a body that is not a JSON object passes through untouched.
+
+    Returns the (possibly new) bytes and the top-level keys that were
+    touched, so the capture record can list them (`defaulted_keys`).
+    """
+    if not defaults:
+        return body, ()
+    try:
+        parsed = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return body, ()
+    if not isinstance(parsed, dict):
+        return body, ()
+    touched: list[str] = []
+    merged: dict[str, Any] = dict(parsed)
+    for key, value in defaults.items():
+        if key not in merged:
+            merged[key] = value
+            touched.append(key)
+            continue
+        have = merged[key]
+        if isinstance(value, Mapping) and isinstance(have, dict):
+            added = {k: v for k, v in value.items() if k not in have}
+            if added:
+                merged[key] = {**have, **added}
+                touched.append(key)
+    if not touched:
+        return body, ()
+    out = json.dumps(merged, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return out, tuple(touched)
 
 
 def map_transport_error(
@@ -721,22 +848,45 @@ class Upstream:
         # cost a dictionary lookup come before the one that costs a handshake.
         deadline.check(**ctx)
         url = join_url(provider.base_url, req.path)
-        headers = build_headers(target, stream=req.stream, extra=req.extra_headers)
-        # Two rewrites, in this order, and one flag for both. The model has to
-        # be the one THIS target's API answers to -- see `apply_api_model` for
-        # why forwarding the client's string breaks fallback specifically --
-        # and `extra_body` is applied last so an operator's explicit pin still
-        # overrides ours.
-        body, renamed = apply_api_model(req.body, target.model.api_model)
-        body, merged = apply_extra_body(body, provider.extra_body)
-        injected = False
-        if self._inject_include_usage and req.stream and provider.kind == "openai":
-            body, injected = apply_include_usage(body)
-        body_modified = renamed or merged or injected
+        headers = build_headers(
+            target, stream=req.stream, extra=req.extra_headers,
+            content_type=req.content_type if req.body_kind != "json" else None,
+        )
+        # The body edits, in this order, and one flag for all of them -- and
+        # ONLY for JSON bodies. A multipart upload or a raw audio body has no
+        # object to rewrite a model into; it goes upstream byte-for-byte with
+        # the client's content type (B4). For JSON: the model has to be the
+        # one THIS target's API answers to -- see `apply_api_model` for why
+        # forwarding the client's string breaks fallback specifically --
+        # then the target's request defaults for keys the client left out
+        # (B5), then `extra_body` last so an operator's explicit pin still
+        # overrides everything above, then the usage opt-in.
+        body = req.body
+        body_modified = False
+        defaulted: tuple[str, ...] = ()
+        if req.body_kind == "json":
+            body, renamed = apply_api_model(body, target.model.api_model)
+            defaults = (req.request_defaults if req.request_defaults is not None
+                        else _request_defaults_of(target))
+            body, defaulted = apply_request_defaults(body, defaults)
+            body, merged = apply_extra_body(body, provider.extra_body)
+            injected = False
+            if self._inject_include_usage and req.stream and provider.kind == "openai":
+                body, injected = apply_include_usage(body)
+            body_modified = renamed or bool(defaulted) or merged or injected
 
         try:
             client = self._client_for(provider)
             request = client.build_request("POST", url, content=body, headers=headers)
+            # The connect budget, as an httpx CONNECT timeout on this one
+            # request: httpx raises `ConnectTimeout` only while establishing
+            # the connection, which is the one place a retry is provably
+            # free. Every other httpx timeout stays None (the Deadline is the
+            # only clock); the status-line wait below has its own budget.
+            request.extensions["timeout"] = {
+                "connect": max(0.0, min(budgets.connect, deadline.remaining())),
+                "read": None, "write": None, "pool": None,
+            }
         except errors.GatewayError:
             raise
         except TRANSPORT_EXCEPTIONS as exc:
@@ -750,17 +900,21 @@ class Upstream:
         self._inflight[provider.id] = self._inflight.get(provider.id, 0) + 1
         try:
             try:
-                # Connect + TLS + request write + response headers, one phase.
-                # httpx exposes no hook at "connected", so this budget covers
-                # more than its name suggests -- which is exactly why a breach
-                # here is a HeadersTimeout and not a ConnectTimeout. We cannot
+                # Connect + TLS + request write + response status line, one
+                # phase under the HEADERS budget (PLAN-2 B6; finding 10).
+                # httpx exposes no hook at "connected", so this phase covers
+                # more than the connect -- which is exactly why a breach here
+                # is a HeadersTimeout and not a ConnectTimeout: we cannot
                 # prove nothing was sent, so we must not claim the retry is
-                # free. `httpx.ConnectTimeout` is still mapped to
-                # `ConnectTimeout` in map_transport_error, because httpx raises
-                # that one only during connection establishment -- there the
-                # proof does exist.
+                # free. The connect itself is bounded separately by the
+                # per-request httpx connect timeout set above, and THAT breach
+                # arrives as `httpx.ConnectTimeout` -> `ConnectTimeout`, where
+                # the proof does exist. Before B6 both waits shared the 2 s
+                # connect budget, and OpenAI sends its status line together
+                # with the first token: one 504 in 122 calls on 17 Sep 2026.
                 async with phase(
-                    deadline, budgets.connect, on_timeout=errors.HeadersTimeout, **ctx
+                    deadline, _headers_budget(budgets),
+                    on_timeout=errors.HeadersTimeout, **ctx
                 ):
                     response = await client.send(request, stream=True)
             except errors.GatewayError:
@@ -784,6 +938,7 @@ class Upstream:
                 read_size=self._read_size,
                 body_modified=body_modified,
                 ctx=ctx,
+                defaulted_keys=defaulted,
             )
         finally:
             self._inflight[provider.id] -= 1
@@ -852,6 +1007,23 @@ class Upstream:
         return b"".join(chunks)[: self._max_error_body]
 
 
+def _request_defaults_of(target: Target) -> Mapping[str, Any] | None:
+    """The target's merged `request_defaults` (policy over model row) when
+    `policy.py` has put them on the `Target`; else the model row's own; else
+    none. Tolerant of either side of the B5 catalog/policy change."""
+    merged = getattr(target, "request_defaults", None)
+    if merged:
+        return merged
+    return getattr(target.model, "request_defaults", None) or None
+
+
+def _headers_budget(budgets: Budgets) -> float:
+    """`Budgets.headers` (B6), or the connect budget on a `Budgets` that
+    predates the field -- which is the exact pre-B6 behaviour."""
+    value = getattr(budgets, "headers", None)
+    return float(value) if value else float(budgets.connect)
+
+
 def _pool_size(client: httpx.AsyncClient) -> int:
     pool = getattr(getattr(client, "_transport", None), "_pool", None)
     connections = getattr(pool, "connections", None)
@@ -865,12 +1037,15 @@ def _pool_size(client: httpx.AsyncClient) -> int:
 
 __all__ = [
     "ANTHROPIC_VERSION",
+    "AUTH_SCHEMES",
     "Upstream",
     "UpstreamRequest",
     "UpstreamStream",
     "apply_api_model",
     "apply_include_usage",
     "apply_extra_body",
+    "apply_request_defaults",
+    "auth_scheme_of",
     "build_headers",
     "join_url",
     "map_transport_error",

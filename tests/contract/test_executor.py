@@ -128,6 +128,9 @@ def make_budgets(**overrides) -> Budgets:
     defaults = dict(total=20.0, connect=2.0, first_event=5.0, progress=5.0,
                     client_stall=5.0)
     defaults.update(overrides)
+    # PLAN-2 B4: the status-line wait is its own budget now; these rigs
+    # reason about one 'connect' number, so headers follows it unless set.
+    defaults.setdefault("headers", defaults["connect"])
     return Budgets(**defaults).validate()
 
 

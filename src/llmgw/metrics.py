@@ -74,7 +74,34 @@ DENIAL_REASONS: tuple[str, ...] = (
     # shed, next to `draining`, and like it not a tenant's budget.
     "overloaded",
 )
-TOKEN_KINDS: tuple[str, ...] = ("input", "output", "cache_read", "cache_write")
+TOKEN_KINDS: tuple[str, ...] = (
+    "input",
+    "output",
+    "cache_read",
+    "cache_write",
+    # PLAN-2 B3: the kinds providers report inside token usage that carry
+    # their own price. Audio tokens are 8-50x the text rate on the audio
+    # models; a 1-hour cache write is 2x input against 1.25x for 5 minutes;
+    # reasoning tokens are already inside `output` and are counted here for
+    # visibility only (never priced twice).
+    "audio_input",
+    "audio_output",
+    "cached_audio_input",
+    "cache_write_1h",
+    "reasoning",
+)
+UNITS: tuple[str, ...] = ("characters", "seconds")
+"""Non-token billing units (`llmgw_units_total`): characters for TTS, seconds
+for duration-billed STT. Tokens stay on `llmgw_tokens_total`."""
+TOOL_KINDS: tuple[str, ...] = (
+    "web_search_requests",
+    "web_fetch_requests",
+    "code_execution_requests",
+)
+"""Server-tool call kinds providers report in usage (Anthropic
+`usage.server_tool_use.*`), each with its own per-call price. Closed so a
+provider inventing a key cannot open a series; an unknown key is counted
+on the record and left off the metric."""
 COST_BASIS: tuple[str, ...] = ("exact", "estimated")
 
 STOP_REASONS: tuple[str, ...] = (
@@ -350,6 +377,25 @@ METRICS: tuple[MetricSpec, ...] = (
         "and folding it into input makes effective cost unknowable.",
         labels=("provider", "model", "kind"),
         label_values=((), (), TOKEN_KINDS),
+    ),
+    MetricSpec(
+        "llmgw_units_total",
+        "counter",
+        "Billed units that are not tokens: characters (TTS) and seconds "
+        "(duration-billed STT). The currency the catalog could not express "
+        "before PLAN-2 B3, kept off llmgw_tokens_total so a token dashboard "
+        "never adds characters to tokens.",
+        labels=("provider", "model", "unit"),
+        label_values=((), (), UNITS),
+    ),
+    MetricSpec(
+        "llmgw_server_tool_calls_total",
+        "counter",
+        "Provider-side tool calls billed per call (web search at $10 per 1k "
+        "on Anthropic), from usage.server_tool_use. Invisible to cost before "
+        "PLAN-2 B3.",
+        labels=("provider", "model", "tool"),
+        label_values=((), (), TOOL_KINDS),
     ),
     MetricSpec(
         "llmgw_cost_usd_total",

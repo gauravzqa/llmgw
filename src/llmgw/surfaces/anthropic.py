@@ -22,9 +22,11 @@ wedges would look healthy for another full progress window.
 
 from __future__ import annotations
 
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 from llmgw import errors
+from llmgw.framing import Framer, framer_for
 from llmgw.surfaces.base import (
     EventKind,
     RequestFacts,
@@ -49,11 +51,41 @@ _META_EVENTS = frozenset(
 )
 
 
+
+def _iteration_totals(block: dict[str, Any]) -> tuple[int, int, int, int]:
+    """Sum `usage.iterations[]` (compaction) into (input, output, cache read,
+    cache write). Absent or malformed iterations contribute nothing; a
+    single bad entry is skipped rather than failing the whole report."""
+    iterations = block.get("iterations")
+    if not isinstance(iterations, list):
+        return 0, 0, 0, 0
+    totals = [0, 0, 0, 0]
+    keys = ("input_tokens", "output_tokens", "cache_read_input_tokens",
+            "cache_creation_input_tokens")
+    for entry in iterations:
+        if not isinstance(entry, dict):
+            continue
+        for i, key in enumerate(keys):
+            value = as_int(entry.get(key))
+            if value is not None and value > 0:
+                totals[i] += value
+    return totals[0], totals[1], totals[2], totals[3]
+
+
 class AnthropicMessagesSurface:
     """`POST /v1/messages`, streaming or not."""
 
     name = "anthropic_messages"
     path = "/v1/messages"
+
+    # Phase B1/B4/B6: the dialect is SSE over a JSON request with no budget
+    # profile of its own -- i.e. exactly what it was before these existed.
+    framing = "sse"
+    body = "json"
+    default_profile: str | None = None
+
+    def framer(self, max_frame_bytes: int) -> Framer:
+        return framer_for(self.framing, max_frame_bytes=max_frame_bytes)
 
     # ------------------------------------------------------------- request
 
@@ -222,14 +254,49 @@ class AnthropicMessagesSurface:
             if all(v is None for v in (input_tokens, output_tokens, cache_read, cache_write)):
                 return
 
+            # Phase B3. Compaction (`usage.iterations[]`) re-samples the turn
+            # and the provider documents that the top-level counts EXCLUDE
+            # the iterations, so their tokens are added onto the base counts
+            # here; every other detail field below is a subset of a base
+            # count and is recorded alongside it, never added.
+            extra_in, extra_out, extra_read, extra_write = _iteration_totals(block)
+
             if input_tokens is not None:
-                usage.input_tokens = max(input_tokens, 0)
+                usage.input_tokens = max(input_tokens, 0) + extra_in
             if output_tokens is not None:
-                usage.output_tokens = max(output_tokens, 0)
+                usage.output_tokens = max(output_tokens, 0) + extra_out
             if cache_read is not None:
-                usage.cache_read_tokens = max(cache_read, 0)
+                usage.cache_read_tokens = max(cache_read, 0) + extra_read
             if cache_write is not None:
-                usage.cache_write_tokens = max(cache_write, 0)
+                total_write = max(cache_write, 0) + extra_write
+                # The one-hour TTL share is billed at 2x, the five-minute
+                # share at 1.25x, so the two are kept disjoint: the 1h count
+                # is carved out of the total and `cache_write_tokens` keeps
+                # the 5m remainder. Without the breakdown the whole write is
+                # 5m, which is what it was before this field existed.
+                creation = block.get("cache_creation")
+                one_hour = None
+                if isinstance(creation, dict):
+                    one_hour = as_int(creation.get("ephemeral_1h_input_tokens"))
+                one_hour = min(max(one_hour or 0, 0), total_write)
+                usage.cache_write_1h_tokens = one_hour
+                usage.cache_write_tokens = total_write - one_hour
+
+            out_details = block.get("output_tokens_details")
+            if isinstance(out_details, dict):
+                thinking = as_int(out_details.get("thinking_tokens"))
+                if thinking is not None:
+                    usage.reasoning_tokens = max(thinking, 0)
+
+            tools = block.get("server_tool_use")
+            if isinstance(tools, dict):
+                counted = {
+                    name: max(n, 0)
+                    for name, raw in tools.items()
+                    if isinstance(name, str) and (n := as_int(raw)) is not None
+                }
+                if counted:
+                    usage.server_tool_calls = MappingProxyType(counted)
             # The two halves flip independently. `message_start` makes the
             # prompt side final; only `message_delta` makes the completion
             # side final. A request interrupted between them bills its input

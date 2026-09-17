@@ -199,3 +199,18 @@ event rate.
 - **Process-local limits.** Admission and breaker state live in each machine;
   N machines give a tenant N times its cap. Run one machine until a tenant
   needs a real fleet-wide cap, then add shared state.
+
+## Budgets and caps added in Phase B
+
+- `LLMGW_BUDGET_HEADERS` (10 s in `fly.toml`) bounds the wait for a provider's
+  status line; `LLMGW_BUDGET_CONNECT` (2 s default) is TCP+TLS only. Keep
+  `headers < first_event`.
+- Per-surface caps: `LLMGW_MAX_REQUEST_BYTES__<SURFACE>` and
+  `LLMGW_MAX_RESPONSE_BYTES__<SURFACE>` (surface name upper-cased, two
+  underscores). Anthropic messages ship at 32 MiB requests because base64
+  images and PDFs arrive at that size; chat is 32 MiB too since 18 Sep (the global default). A multipart or raw
+  body is buffered up to its surface's cap so a pre-commit retry can resend
+  it -- that cap is the per-request memory bound.
+- The drain inequality is now checked against the largest total in the policy
+  file, not only `LLMGW_BUDGET_TOTAL`: a `[profiles.long_context]` above the
+  grace refuses to start unless `LLMGW_DRAIN_ALLOW_SHORT=1`.

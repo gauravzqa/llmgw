@@ -352,3 +352,36 @@ async def test_offer_after_close_is_dropped_as_shutdown():
 
     assert cap.offer(make_record()) is False
     assert cap.dropped["shutdown"] >= 1
+
+
+async def test_aclose_cancelled_mid_wait_finishes_the_shutdown_quietly():
+    """The forced-exit path (finding 48).
+
+    A second SIGTERM makes uvicorn cancel the lifespan task while it is inside
+    `gateway.shutdown()` -> `capture.aclose()` -> `await task`. Until 18 Sep
+    2026 that `CancelledError` propagated out of the lifespan and every forced
+    exit logged one ERROR traceback per process. `aclose()` must instead stop
+    the worker, count the leftovers as `shutdown` drops, and return normally.
+    """
+    sink = StalledSink()
+    clock = ManualClock()
+    cap = Capture(sink, max_queue_bytes=1 << 20, clock=clock, drain_timeout=5.0)
+    cap.start()
+    for i in range(3):
+        cap.offer(make_record(f"r{i}"))
+    for _ in range(10):
+        if sink.entered.is_set():
+            break
+        await asyncio.sleep(0)
+    assert sink.entered.is_set()
+
+    close = asyncio.ensure_future(cap.aclose())
+    await asyncio.sleep(0)  # aclose is now parked on `await task`
+    close.cancel()          # what uvicorn's force-exit does to the lifespan
+    await close             # must NOT raise CancelledError
+
+    assert close.done() and not close.cancelled() and close.exception() is None
+    assert cap.dropped["shutdown"] == 3
+    assert cap.queue_bytes == 0
+    assert cap._task is None  # the worker is gone; the chaos tier's task baseline holds
+    sink.gate.set()

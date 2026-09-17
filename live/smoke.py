@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import socket
 import sys
 import tempfile
@@ -589,6 +590,101 @@ def echo_roundtrip(gw: GatewayServer, *, out=sys.stdout) -> None:
         print(f"    {second.text[:300]}", file=out)
 
 
+def usage_fields_case(gw: GatewayServer, *, out=sys.stdout) -> None:
+    """PLAN-2 B3 (a): a buffered gpt-4o-mini call; the record's new kinds
+    exist and reasoning is zero on a non-reasoning model."""
+    route = f"/workloads/openai{ROUTE_FOR['openai_chat']}"
+    body = body_for(OPENAI_CHAT, stream=False)
+    body["model"] = OPENAI_MODEL_ID
+    resp = httpx.post(f"{gw.base_url}{route}", json=body, timeout=60)
+    ok = resp.status_code == 200
+    usage = resp.json().get("usage", {}) if ok else {}
+    details = usage.get("completion_tokens_details") or {}
+    reasoning = details.get("reasoning_tokens", 0) or 0
+    verdict = "PASS" if ok and reasoning == 0 else "FAIL"
+    print(f"  usage-fields: {resp.status_code} prompt={usage.get('prompt_tokens')} "
+          f"completion={usage.get('completion_tokens')} reasoning={reasoning} -> {verdict}",
+          file=out)
+    print("    (record-side: AccountingRecord.reasoning_tokens / audio_* / "
+          "server_tool_calls exist; see tests/unit/test_units.py)", file=out)
+
+
+_CACHEABLE_SYSTEM = (
+    "You are a meticulous assistant for a software team. " * 60
+    + "Answer with one word."
+)
+"""About 1,100 tokens: over Haiku 4.5's 4,096-token cache minimum? No -- and
+that is the finding this case is written to make visible. Anthropic's minimum
+cacheable prompt is 4,096 tokens on Haiku 4.5 and 1,024 on Sonnet 4.6, so a
+1,100-token system prompt caches on Sonnet and silently does not on Haiku
+(capabilities/anthropic.md §7). The case reports what happened rather than
+asserting a read, and says which side of the threshold it was on."""
+
+
+def cache_write_read_case(gw: GatewayServer, *, out=sys.stdout) -> None:
+    """PLAN-2 B3 (b): the same cached system prompt twice on Haiku 4.5.
+
+    Reports cache_creation on the first call and cache_read on the second,
+    and prices the read at `cached_input_per_m`. Spends two short calls."""
+    route = f"/workloads/anthropic{ROUTE_FOR['anthropic_messages']}"
+    body = {
+        "model": "anthropic.haiku-4-5",
+        "max_tokens": 8,
+        "system": [{"type": "text", "text": _CACHEABLE_SYSTEM,
+                    "cache_control": {"type": "ephemeral"}}],
+        "messages": [{"role": "user", "content": "ping"}],
+    }
+    spec = DEFAULT_CATALOG.models["anthropic.haiku-4-5"]
+    seen = []
+    for turn in (1, 2):
+        resp = httpx.post(f"{gw.base_url}{route}", json=body, timeout=60)
+        u = resp.json().get("usage", {}) if resp.status_code == 200 else {}
+        seen.append((resp.status_code, u))
+        print(f"  cache turn {turn}: {resp.status_code} input={u.get('input_tokens')} "
+              f"cache_write={u.get('cache_creation_input_tokens')} "
+              f"cache_read={u.get('cache_read_input_tokens')}", file=out)
+    read = (seen[1][1] or {}).get("cache_read_input_tokens") or 0
+    write = (seen[0][1] or {}).get("cache_creation_input_tokens") or 0
+    if read:
+        usd = read * spec.cached_input_per_m / 1e6
+        print(f"  cache: second call read {read} tokens, priced at cached rate "
+              f"{spec.cached_input_per_m}/M = ${usd:.7f} -> PASS", file=out)
+    elif write == 0:
+        print("  cache: no write on turn 1 -- prompt under Haiku 4.5's 4,096-token "
+              "cache minimum (documented; use Sonnet 4.6 for a 1,024 minimum) -> INFO",
+              file=out)
+    else:
+        print("  cache: written but not read on turn 2 -> FAIL", file=out)
+
+
+def big_vision_case(gw: GatewayServer, *, out=sys.stdout) -> None:
+    """PLAN-2 B4 (c): a ~10 MiB base64 image body. Skipped unless
+    LLMGW_SMOKE_BIG_VISION=1, because it needs the per-surface body cap
+    (agent S's change) and costs real vision tokens."""
+    if os.environ.get("LLMGW_SMOKE_BIG_VISION") != "1":
+        print("  big-vision: SKIPPED (set LLMGW_SMOKE_BIG_VISION=1 once the "
+              "per-surface body cap is deployed)", file=out)
+        return
+    import base64
+    # A valid-looking JPEG header followed by filler: the provider will
+    # reject the image, which is fine -- the assertion is that the GATEWAY
+    # did not 413 it first.
+    payload = base64.b64encode(b"\xff\xd8\xff" + b"\x00" * (10 * 1024 * 1024)).decode()
+    route = f"/workloads/openai{ROUTE_FOR['openai_chat']}"
+    body = {
+        "model": OPENAI_MODEL_ID, "max_tokens": 8,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "Describe this."},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{payload}",
+                                                "detail": "low"}},
+        ]}],
+    }
+    resp = httpx.post(f"{gw.base_url}{route}", json=body, timeout=120)
+    verdict = "PASS" if resp.status_code != 413 else "FAIL (gateway 413)"
+    print(f"  big-vision: {resp.status_code} served_by={resp.headers.get('x-gw-served-by')} "
+          f"-> {verdict}", file=out)
+
+
 def run(*, spend: bool = True, out=sys.stdout) -> list[Measured]:
     catalog = live_catalog()
     results: list[Measured] = []
@@ -617,6 +713,9 @@ def run(*, spend: bool = True, out=sys.stdout) -> list[Measured]:
                     label=f"{wl}/non-streaming"))
 
             echo_roundtrip(gw, out=out)
+            usage_fields_case(gw, out=out)
+            cache_write_read_case(gw, out=out)
+            big_vision_case(gw, out=out)
 
             # ---- Task 3: fallback across two real providers, raw socket ----
             for wl in FALLBACK_WORKLOADS:

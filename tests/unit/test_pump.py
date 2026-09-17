@@ -56,6 +56,10 @@ def make_budgets(**overrides) -> Budgets:
     defaults = dict(total=600.0, connect=2.0, first_event=20.0, progress=15.0,
                     client_stall=30.0)
     defaults.update(overrides)
+    # The headers budget (Phase B6) must fit inside the total like every other
+    # phase budget; tests here shrink `total` freely, so size it to fit.
+    if "headers" in getattr(Budgets, "__dataclass_fields__", {}) and "headers" not in defaults:
+        defaults["headers"] = min(2.0, defaults["total"] / 2)
     return Budgets(**defaults).validate()
 
 
@@ -869,3 +873,163 @@ async def test_a_stall_after_content_is_never_queued():
         await task
     assert getattr(caught.value, "queued", False) is False
     assert pump.result.content_events == 1
+
+
+# ================================================================ framing
+# Phase B1: the pump asks the surface for its framer. A surface that speaks
+# newline-JSON or raw audio must get commitment, progress and a terminal
+# from its own frames, and an SSE surface handed a body that cannot be SSE
+# must be refused before any byte moves, not stalled.
+
+
+class _JsonlSurface:
+    """The Inworld `:stream` shape: one JSON object per line, audio lines
+    are content, a `usage`-only line is meta, the stream ends on close."""
+
+    name = "openai_chat"  # closed metric set; not a real surface name
+    path = "/x"
+    framing = "jsonl"
+    body = "json"
+    default_profile = None
+
+    def framer(self, max_frame_bytes: int):
+        from llmgw.framing import framer_for
+
+        return framer_for(self.framing, max_frame_bytes=max_frame_bytes)
+
+    def classify(self, ev):
+        import json as _json
+
+        obj = _json.loads(ev.data)
+        if obj.get("result", {}).get("audioContent"):
+            return E_KIND.CONTENT
+        return E_KIND.META
+
+    def text_delta(self, ev):
+        return None
+
+    def apply_usage(self, ev, usage):
+        import json as _json
+
+        result = _json.loads(ev.data).get("result", {})
+        n = result.get("usage", {}).get("processedCharactersCount")
+        if n:
+            usage.characters = n
+            usage.input_exact = usage.output_exact = True
+
+    def error_from_event(self, ev):
+        return None
+
+    def native_ending(self, last_event=None):
+        return b""
+
+    def stop_reason_from_body(self, payload):
+        return None
+
+
+class _RawSurface(_JsonlSurface):
+    framing = "raw"
+
+    def classify(self, ev):
+        return E_KIND.CONTENT
+
+    def apply_usage(self, ev, usage):
+        return None
+
+
+from llmgw.surfaces.base import EventKind as E_KIND  # noqa: E402
+
+
+def _jsonl_body(lines: int = 6) -> bytes:
+    import json as _json
+
+    out = b""
+    for i in range(lines):
+        usage = {"processedCharactersCount": 19 if i == 0 else 0}
+        obj = {"result": {"audioContent": "A" * 512, "usage": usage}}
+        out += _json.dumps(obj).encode() + b"\n"
+    return out
+
+
+async def test_a_jsonl_surface_commits_progresses_and_ends_on_close():
+    """Before framers existed this body produced ZERO events inside the SSE
+    parser: FirstEventTimeout at the first-event budget, FrameTooLarge at
+    1 MiB, $0 accounted (measured against Inworld, 16 Sep 2026). Through the
+    JSONL framer every line is a frame, the first is the first event, and
+    EOF is the terminal -- but the surface above declares no TERMINAL kind,
+    so the pump reports IncompleteStream, exactly as an SSE stream without
+    `[DONE]` would. A real JSONL surface (Phase D) marks its last line or
+    treats close as its terminal; the pump's rule is unchanged."""
+    body = _jsonl_body()
+    sink = RecordingSink()
+    pump = make_pump(sink=sink, surface=_JsonlSurface())
+    with pytest.raises(E.IncompleteStream):
+        await pump.run(ScriptedSource(chunked(body, 700)))
+    res = pump.result
+    assert sink.data == body  # byte-for-byte, chunk boundaries and all
+    assert res.committed is True
+    assert res.content_events == 6 and res.events == 6
+    assert res.first_event_at is not None
+    assert res.usage.characters == 19 and res.usage.exact
+
+
+async def test_a_raw_surface_treats_every_chunk_as_progress():
+    body = bytes(range(256)) * 64  # 16 KiB of "audio"
+    sink = RecordingSink()
+    clock = ManualClock(start=0.0)
+    budgets = make_budgets(progress=5.0)
+    pump = make_pump(sink=sink, surface=_RawSurface(), clock=clock, budgets=budgets)
+    # Chunks 2 s apart: under the progress budget only because every chunk
+    # is content and resets it; the same source through the SSE parser would
+    # never reset progress and would stall at 5 s.
+    source = ScriptedSource(chunked(body, 4096), clock=clock, gap=2.0)
+    task = asyncio.create_task(pump.run(source))
+    await drive(clock, task, step=1.0, limit=40)
+    with pytest.raises(E.IncompleteStream):  # no terminal kind on the stub
+        await task
+    assert sink.data == body
+    assert pump.result.content_events == 4
+    assert pump.result.committed is True
+
+
+async def test_an_sse_surface_refuses_a_non_sse_content_type_before_any_byte():
+    sink = RecordingSink()
+    pump = make_pump(sink=sink)
+    pump_ct = Pump(
+        surface=OPENAI_CHAT, sink=sink, deadline=Deadline(ManualClock(), 60.0),
+        budgets=make_budgets(), clock=ManualClock(), content_type="application/json",
+    )
+    _LIVE_PUMPS.append(pump_ct)
+    with pytest.raises(E.UnsupportedUpstreamFraming) as caught:
+        await pump_ct.run(ScriptedSource([b'{"not":"sse"}']))
+    assert "application/json" in str(caught.value)
+    assert pump_ct.committed is False and sink.data == b""
+    # ... and the same body with the right type, or no type, is pumped.
+    assert pump.committed is False
+
+
+async def test_an_sse_surface_accepts_event_stream_content_type():
+    sink = RecordingSink()
+    pump = Pump(
+        surface=OPENAI_CHAT, sink=sink, deadline=Deadline(ManualClock(), 60.0),
+        budgets=make_budgets(), clock=ManualClock(),
+        content_type="text/event-stream; charset=utf-8",
+    )
+    _LIVE_PUMPS.append(pump)
+    data = stream_bytes(OPENAI_CHAT)
+    res = await pump.run(ScriptedSource(chunked(data, 33)))
+    assert res.terminal_seen and sink.data == data
+
+
+async def test_a_jsonl_line_over_the_bound_kills_the_request():
+    import json as _json
+
+    big = _json.dumps({"result": {"audioContent": "A" * 4096}}).encode() + b"\n"
+    sink = RecordingSink()
+    pump = make_pump(sink=sink, surface=_JsonlSurface(), max_frame_bytes=1024)
+    with pytest.raises(E.FrameTooLarge):
+        await pump.run(ScriptedSource(chunked(big, 100)))
+    # Parse FIRST, enqueue second: the chunk that blew the bound never reached
+    # the client, so the sink holds strictly less than the line -- the same
+    # guarantee the SSE bound gives, and no frame was ever classified.
+    assert pump.result.content_events == 0

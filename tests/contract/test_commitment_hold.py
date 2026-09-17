@@ -502,7 +502,7 @@ async def test_the_error_path_quotes_the_same_snapshot_as_the_success_path(
         huge = await client.post(
             f"{gateway.base_url}/workloads/ab{ROUTE}",
             content=json.dumps({**body(stream=False),
-                                "pad": "x" * (5 * 1024 * 1024)}).encode(),
+                                "pad": "x" * (33 * 1024 * 1024)}).encode(),
             headers={"content-type": "application/json"},
         )
         probe = await client.get(f"{gateway.base_url}/workloads/ab/probe")

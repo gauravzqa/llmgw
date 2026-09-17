@@ -99,6 +99,10 @@ def make_budgets(**overrides) -> Budgets:
     defaults = dict(total=600.0, connect=2.0, first_event=20.0, progress=15.0,
                     client_stall=30.0)
     defaults.update(overrides)
+    # PLAN-2 B4 split the status-line wait out of `connect` into `headers`.
+    # These rigs reason about "the connect phase" as one number, so unless a
+    # test sets `headers` itself it follows `connect`.
+    defaults.setdefault("headers", defaults["connect"])
     return Budgets(**defaults).validate()
 
 
@@ -582,7 +586,9 @@ async def test_the_total_deadline_never_resets_across_attempts():
         CANDIDATE, INCUMBENT, THIRD, clock=clock,
         cand=hangs(clock), inc=hangs(clock), third=hangs(clock),
     )
-    budgets = make_budgets(total=7.0, connect=3.0, first_event=3.0,
+    # `headers` is the phase a stalled status line burns (PLAN-2 B6); before
+    # B6 that was `connect`, and the arithmetic under test is unchanged.
+    budgets = make_budgets(total=7.0, connect=3.0, headers=3.0, first_event=3.0,
                            progress=3.0)
     task = asyncio.create_task(
         rig.run(CANDIDATE, INCUMBENT, THIRD, budgets=budgets, total=7.0)

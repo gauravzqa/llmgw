@@ -112,9 +112,11 @@ def test_exact_usage_cost_is_the_dot_product_over_all_four_buckets():
     assert rec.basis == "exact"
     assert rec.provider == "anthropic"
     assert rec.model == SONNET
-    assert rec.tokens_by_kind == {
+    assert {k: v for k, v in rec.tokens_by_kind.items() if v} == {
         "input": 1000, "output": 500, "cache_read": 2000, "cache_write": 100,
     }
+    # PLAN-2 B3: the record carries every metric kind, zero when unused.
+    assert set(rec.tokens_by_kind) == set(metrics.TOKEN_KINDS)
     assert rec.outcome is Outcome.COMPLETED
     assert rec.code == "none"
 
@@ -257,7 +259,8 @@ def test_nobody_answered_is_a_valid_zero_record():
     assert rec.provider is None
     assert rec.model is None
     assert rec.cost_usd == 0.0
-    assert rec.tokens_by_kind == {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
+    assert all(n == 0 for n in rec.tokens_by_kind.values())
+    assert set(rec.tokens_by_kind) == set(metrics.TOKEN_KINDS)
     # The record is still meaningful: outcome and attempts survive.
     assert rec.outcome is Outcome.FAILED
     assert rec.attempts == 1

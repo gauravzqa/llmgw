@@ -18,6 +18,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from llmgw import errors
+from llmgw.framing import Framer, framer_for
 from llmgw.surfaces.base import (
     EventKind,
     RequestFacts,
@@ -64,6 +65,15 @@ class OpenAIChatSurface:
 
     name = "openai_chat"
     path = "/v1/chat/completions"
+
+    # Phase B1/B4/B6: the dialect is SSE over a JSON request with no budget
+    # profile of its own -- i.e. exactly what it was before these existed.
+    framing = "sse"
+    body = "json"
+    default_profile: str | None = None
+
+    def framer(self, max_frame_bytes: int) -> Framer:
+        return framer_for(self.framing, max_frame_bytes=max_frame_bytes)
 
     # ------------------------------------------------------------- request
 
@@ -198,9 +208,13 @@ class OpenAIChatSurface:
         -- the error is invisible in tests with no caching and enormous in
         production, where the cached prefix is most of the prompt.
 
-        `cache_write_tokens` is left alone: the chat API's caching is
-        automatic and reports no creation count, so writing a 0 here would be
-        us asserting a fact the provider never stated.
+        `cache_write_tokens` is set only when the provider states it: the
+        chat API reports explicit-cache writes as
+        `prompt_tokens_details.cache_write_tokens` (it did not when this
+        surface was written -- the 16 Sep 2026 sweep corrected the comment
+        that used to sit here), and writing a 0 when the key is absent would
+        be us asserting a fact the provider never stated. Audio and reasoning
+        detail counts follow the same rule (Phase B3).
         """
         try:
             payload = event_payload(ev)
@@ -222,19 +236,42 @@ class OpenAIChatSurface:
             if prompt is None and completion is None:
                 return  # A `usage` key with nothing usable in it is not a report.
             details = block.get("prompt_tokens_details")
-            cached = None
+            cached = cache_write = audio_in = None
             if isinstance(details, dict):
                 cached = as_int(details.get("cached_tokens"))
+                # Phase B3: the chat API DOES report explicit-cache writes
+                # now (`cache_write_tokens`, billed 1.25x) and audio prompt
+                # tokens (billed at the audio rate, 8-50x text). Both are
+                # subsets of `prompt_tokens`, like `cached_tokens`.
+                cache_write = as_int(details.get("cache_write_tokens"))
+                audio_in = as_int(details.get("audio_tokens"))
             cache_read = max(cached or 0, 0)
+            cache_written = max(cache_write or 0, 0)
+
+            completion_details = block.get("completion_tokens_details")
+            reasoning = audio_out = None
+            if isinstance(completion_details, dict):
+                reasoning = as_int(completion_details.get("reasoning_tokens"))
+                audio_out = as_int(completion_details.get("audio_tokens"))
 
             if prompt is not None:
                 # max(..., 0) guards the case where a provider reports more
                 # cached tokens than prompt tokens. That is nonsense, but
-                # nonsense that must not produce a negative bill.
-                usage.input_tokens = max(prompt - cache_read, 0)
+                # nonsense that must not produce a negative bill. Cache writes
+                # are carved out the same way so the three buckets stay
+                # disjoint (see `base.py`'s convention).
+                usage.input_tokens = max(prompt - cache_read - cache_written, 0)
                 usage.cache_read_tokens = cache_read
+                if cache_write is not None:
+                    usage.cache_write_tokens = cache_written
+                if audio_in is not None:
+                    usage.audio_input_tokens = max(audio_in, 0)
             if completion is not None:
                 usage.output_tokens = completion
+                if reasoning is not None:
+                    usage.reasoning_tokens = max(reasoning, 0)
+                if audio_out is not None:
+                    usage.audio_output_tokens = max(audio_out, 0)
             # One frame, everything final. Unlike Anthropic there is no
             # halfway state to represent -- both halves flip together.
             usage.input_exact = True

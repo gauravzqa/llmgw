@@ -225,7 +225,9 @@ from llmgw.pump import Sink
 from llmgw.retry import RetryPolicy
 from llmgw.server.config import ANONYMOUS_TENANT, ServerConfig, TenantTable
 from llmgw.server.telemetry import Collectors
+from llmgw.surfaces import SURFACES as _SHIPPED_SURFACES
 from llmgw.surfaces import Surface, for_path
+from llmgw.surfaces.base import RequestFacts
 from llmgw.upstream import Upstream, UpstreamRequest, UpstreamStream
 
 log = logging.getLogger("llmgw.server")
@@ -1283,6 +1285,9 @@ class Gateway:
         reloaded file into a refused reload with the old snapshot still
         serving -- instead of a `PolicyError` on every request after it."""
 
+        # B6: the deploy inequality against the largest total in the policy,
+        # not only the zero-config default; refuses at startup like the rest.
+        config.check_drain_arithmetic(self.policy.current())
         self._derived = _derive(self.policy.current())
         """Per-snapshot values too expensive to recompute per request. Built
         eagerly for the same reason: a `RetryPolicy` that cannot be
@@ -1707,7 +1712,8 @@ class Exchange:
     """
 
     __slots__ = ("snapshot", "catalog_id", "workload_id", "target", "attempts",
-                 "started", "tenant", "breaker", "upstream", "buffered_stop_reason")
+                 "started", "tenant", "breaker", "upstream", "buffered_stop_reason",
+                 "defaulted_keys")
 
     def __init__(
         self, snapshot: PolicySnapshot, *, catalog_id: str, workload_id: str
@@ -1726,6 +1732,10 @@ class Exchange:
         self.buffered_stop_reason: str | None = None
         """The buffered path's stop reason, from `Surface.stop_reason_from_body`
         in `BufferedSink.send`; the streaming path's comes through `Usage`."""
+        self.defaulted_keys: tuple[str, ...] = ()
+        """Request keys the served attempt filled in from the target's
+        `request_defaults` (PLAN-2 B5); copied off the `UpstreamStream` at
+        status commitment, listed in the capture record."""
         self.tenant: str | None = None
         """The admitted tenant's ID. Set by `__call__` the moment
         `resolve_tenant` answers, so every response after that point --
@@ -1756,6 +1766,148 @@ class Exchange:
         if self.upstream is not None and self.upstream.request_id:
             out.append((UPSTREAM_REQUEST_ID_HEADER, _ascii(self.upstream.request_id)))
         return out
+
+
+SURFACE_NAMES: tuple[str, ...] = tuple(_SHIPPED_SURFACES)
+"""The shipped surface names, for the probe's resolved-limits table."""
+
+MULTIPART_SCAN_BYTES = 64 * 1024
+"""How far into a multipart body the gateway looks for the `model` and
+`stream` form fields (PLAN-2 B4). A bounded prefix scan, not a decode: the
+gateway needs two small text fields to route, and reading a 25 MB upload to
+find them would allocate the thing the byte cap exists to bound. The
+documented limitation is therefore that those two fields must precede the
+file part, or sit within the first 64 KiB -- which is how every SDK orders a
+transcription request (text fields first, `file` last)."""
+
+MODEL_QUERY_PARAM = b"model"
+MODEL_REQUEST_HEADER = b"x-gw-model"
+"""Where a `raw`-bodied surface finds its model: `?model=<catalog id>` or the
+`X-Gw-Model` request header (the same name the gateway sends back on every
+response, so a client can echo it). A raw body has no JSON to read it from."""
+
+
+def header_value(scope: Scope, name: bytes) -> str | None:
+    for key, value in scope.get("headers", ()):
+        if bytes(key).lower() == name:
+            return bytes(value).decode("latin-1").strip() or None
+    return None
+
+
+def query_param(scope: Scope, name: bytes) -> str | None:
+    """The FIRST value of `name` in the query string, URL-decoded, or None."""
+    from urllib.parse import parse_qsl
+
+    raw = scope.get("query_string") or b""
+    for key, value in parse_qsl(raw.decode("latin-1"), keep_blank_values=False):
+        if key.encode("latin-1") == name:
+            return value or None
+    return None
+
+
+def multipart_boundary(content_type: str | None) -> str | None:
+    if not content_type:
+        return None
+    kind, _, params = content_type.partition(";")
+    if kind.strip().lower() != "multipart/form-data":
+        return None
+    for piece in params.split(";"):
+        key, _, value = piece.strip().partition("=")
+        if key.strip().lower() == "boundary":
+            value = value.strip().strip('"')
+            return value or None
+    return None
+
+
+def scan_multipart_fields(
+    body: bytes, boundary: str, *, wanted: frozenset[str], limit: int = MULTIPART_SCAN_BYTES
+) -> dict[str, str]:
+    """Text values of the `wanted` form fields found in the first `limit`
+    bytes. Parts that are files, parts after the scan window, and parts whose
+    payload is longer than 4 KiB are skipped -- a value that big is not a
+    model id. Never raises on a malformed body; routing then fails closed on
+    the missing `model`."""
+    found: dict[str, str] = {}
+    window = body[:limit]
+    delim = b"--" + boundary.encode("latin-1")
+    for part in window.split(delim)[1:]:
+        if part.startswith(b"--"):
+            break
+        head, sep, payload = part.partition(b"\r\n\r\n")
+        if not sep:
+            continue
+        name: str | None = None
+        is_file = False
+        for line in head.split(b"\r\n"):
+            low = line.lower()
+            if not low.startswith(b"content-disposition:"):
+                continue
+            is_file = b"filename=" in low
+            marker = low.find(b" name=")
+            if marker < 0:
+                marker = low.find(b";name=")
+            if marker >= 0:
+                after = line[marker + 6:]
+                name = after.split(b";")[0].strip().strip(b'"').decode("latin-1")
+        if name is None or is_file or name not in wanted:
+            continue
+        if payload.endswith(b"\r\n"):
+            payload = payload[:-2]
+        if len(payload) > 4096:
+            continue
+        try:
+            found[name] = payload.decode("utf-8").strip()
+        except UnicodeDecodeError:
+            continue
+        if len(found) == len(wanted):
+            break
+    return found
+
+
+def _truthy(value: str | None) -> bool:
+    return (value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def facts_for_body(
+    surface: Surface, body: bytes, scope: Scope, *, content_type: str | None
+) -> RequestFacts:
+    """`RequestFacts` for any body kind (PLAN-2 B4).
+
+    `json` asks the surface, exactly as before. `multipart` scans the leading
+    form fields for `model` and `stream` (`scan_multipart_fields`); `raw`
+    reads `?model=` or `X-Gw-Model` and `?stream=`. Both non-JSON kinds fail
+    closed with `InvalidRequest` when no model is named, because a request
+    the gateway cannot route is not one it should forward and let the
+    provider bill.
+    """
+    kind = getattr(surface, "body", "json")
+    if kind == "json":
+        return surface.parse_request(body)
+    if kind == "multipart":
+        boundary = multipart_boundary(content_type)
+        if boundary is None:
+            raise errors.InvalidRequest(
+                f"{surface.name} expects a multipart/form-data body with a boundary; "
+                f"got content-type {content_type!r}"
+            )
+        fields = scan_multipart_fields(body, boundary, wanted=frozenset({"model", "stream"}))
+        model = fields.get("model")
+        if not model:
+            raise errors.InvalidRequest(
+                f"no `model` form field in the first {MULTIPART_SCAN_BYTES} bytes of "
+                f"the multipart body; put the text fields before the file part"
+            )
+        return RequestFacts(model=model, stream=_truthy(fields.get("stream")))
+    if kind == "raw":
+        model = (query_param(scope, MODEL_QUERY_PARAM)
+                 or header_value(scope, MODEL_REQUEST_HEADER))
+        if not model:
+            raise errors.InvalidRequest(
+                f"{surface.name} takes a raw body; name the model with ?model=<id> "
+                f"or the X-Gw-Model header"
+            )
+        return RequestFacts(model=model, stream=_truthy(query_param(scope, b"stream")))
+    raise errors.PolicyError(f"surface {surface.name!r} declares unknown body kind {kind!r}")
 
 
 class PassthroughEndpoint:
@@ -1923,16 +2075,25 @@ class PassthroughEndpoint:
                 # an interactive workload with a 20 s total must not spend a
                 # 600 s default reading a body.
                 deadline = Deadline.start(budgets.total, clock=gw.clock)
+                # Per-surface caps (B4): the Anthropic messages surface takes
+                # 32 MiB because the provider does; chat keeps 4 MiB. The
+                # byte-bounded read itself is unchanged.
+                limits = config.limits_for(self._surface.name)
                 body = await read_request_body(
-                    receive, limit=config.max_request_bytes, deadline=deadline
+                    receive, limit=limits.max_request_bytes, deadline=deadline
                 )
-                # Read-only. `parse_request` answers "which model, streaming?"
-                # and is structurally incapable of rebuilding a request. The
-                # only two edits any layer makes to these bytes are
-                # `upstream.py`'s, and both announce themselves as
-                # `X-Gw-Body-Modified`: the per-target `model` rewrite and a
-                # provider's `extra_body`. See surfaces/base.
-                facts = self._surface.parse_request(body)
+                # Read-only. For a JSON body `parse_request` answers "which
+                # model, streaming?" and is structurally incapable of
+                # rebuilding a request; a multipart or raw body is scanned or
+                # read from the query string instead (`facts_for_body`). The
+                # only edits any layer makes to JSON bytes are `upstream.py`'s
+                # and every one announces itself as `X-Gw-Body-Modified`; a
+                # non-JSON body is never edited at all. See surfaces/base.
+                body_kind = getattr(self._surface, "body", "json")
+                client_content_type = header_value(scope, b"content-type")
+                facts = facts_for_body(
+                    self._surface, body, scope, content_type=client_content_type
+                )
                 # The body's model pins the target ONLY when the caller named
                 # no workload; see the module docstring for why the other way
                 # round makes every candidate unreachable.
@@ -1959,6 +2120,9 @@ class PassthroughEndpoint:
                         plan, derived.retry.get(workload_id),
                         no_retry=self._no_retry(scope),
                     ),
+                    body_kind=body_kind,
+                    content_type=client_content_type if body_kind != "json" else None,
+                    max_response_bytes=limits.max_response_bytes,
                 )
         except asyncio.CancelledError:
             # ------------------------- SHUTDOWN CUT ------------------------
@@ -2049,7 +2213,11 @@ class PassthroughEndpoint:
                     "truncating %s after commitment: %s", self._route, err.code
                 )
                 return
-            await send_error(send, err, exchange=exchange)
+            provider_row = gw.config.catalog.providers.get(err.provider or "")
+            await send_error(
+                send, err, exchange=exchange,
+                scrub_all=getattr(provider_row, "scrub_error_bodies", "auth") == "all",
+            )
         finally:
             # The twin of the entry pair, on every exit path. `stream_exited`
             # first so the drain-awaitable count and the gauge fall together;
@@ -2073,6 +2241,9 @@ class PassthroughEndpoint:
         streaming: bool,
         extra_headers: Mapping[str, str],
         retry_policy: RetryPolicy | None,
+        body_kind: str = "json",
+        content_type: str | None = None,
+        max_response_bytes: int | None = None,
     ) -> None:
         """Run the plan, and start the client's response when a byte arrives.
 
@@ -2105,6 +2276,7 @@ class PassthroughEndpoint:
             # ==============================================================
             exchange.attempts = tally.opens
             exchange.target = tally.target
+            exchange.defaulted_keys = tuple(getattr(stream, "defaulted_keys", ()))
             # The provider's request id, processing time and rate-limit
             # budget, read here because this is the response being served.
             exchange.observe_upstream(stream.headers)
@@ -2142,7 +2314,12 @@ class PassthroughEndpoint:
                 sink_factory=start_response,
                 retry_policy=retry_policy,
                 extra_headers=extra_headers,
-                max_response_bytes=config.max_response_bytes,
+                body_kind=body_kind,
+                content_type=content_type,
+                max_response_bytes=(
+                    config.max_response_bytes if max_response_bytes is None
+                    else max_response_bytes
+                ),
                 # Configured, not defaulted. These are the per-stream memory
                 # the scale tier multiplies by N, and the only bound between
                 # an oversized provider frame and this process's RSS.
@@ -2279,6 +2456,17 @@ class PassthroughEndpoint:
                         collectors.tokens(
                             provider=provider, model=model, kind=kind, n=n
                         )
+                    # Non-token units (characters, seconds, audio tokens) and
+                    # per-call server tools (PLAN-2 B3), when the record and
+                    # the collectors know about them.
+                    units_fn = getattr(collectors, "units", None)
+                    if units_fn is not None:
+                        for unit, n in (getattr(rec, "units_by_kind", None) or {}).items():
+                            units_fn(provider=provider, model=model, unit=unit, n=n)
+                    tools_fn = getattr(collectors, "server_tool_calls", None)
+                    if tools_fn is not None:
+                        for tool, n in (getattr(rec, "server_tool_calls", None) or {}).items():
+                            tools_fn(provider=provider, model=model, tool=tool, n=n)
                     collectors.cost(
                         provider=provider, model=model,
                         basis=rec.basis, usd=rec.cost_usd,
@@ -2324,7 +2512,24 @@ class PassthroughEndpoint:
 
             capture = gw.capture
             if capture is not None:
+                # `defaulted_keys` (B5) rides along only once `CaptureRecord`
+                # has the field; until then the exchange holds it and the
+                # metrics side is unaffected.
+                extra_fields: dict[str, Any] = {}
+                record_fields = getattr(CaptureRecord, "__dataclass_fields__", {})
+                if "defaulted_keys" in record_fields:
+                    extra_fields["defaulted_keys"] = list(exchange.defaulted_keys)
+                # B3's accounting detail, copied when both sides have it.
+                if "units" in record_fields:
+                    extra_fields["units"] = dict(getattr(rec, "units_by_kind", None) or {})
+                if "server_tool_calls" in record_fields:
+                    extra_fields["server_tool_calls"] = dict(
+                        getattr(rec, "server_tool_calls", None) or {}
+                    )
+                if "cost_notes" in record_fields:
+                    extra_fields["cost_notes"] = list(getattr(rec, "cost_notes", None) or ())
                 capture.offer(CaptureRecord(
+                    **extra_fields,
                     # No request-id concept exists in this gateway yet; the
                     # tenant and workload are the fields an investigator filters
                     # on and both are present.
@@ -2371,6 +2576,7 @@ async def send_error(
     err: errors.GatewayError,
     *,
     exchange: Exchange,
+    scrub_all: bool = False,
 ) -> None:
     """Answer a pre-status-commitment failure. CONTRACTS.md C4.
 
@@ -2402,6 +2608,13 @@ async def send_error(
     providers today and is an assumption rather than an observation.
     """
     body = err.upstream_body if (err.passthrough and err.upstream_status) else None
+    if scrub_all and body:
+        # PLAN-2 B2: a provider whose row says `scrub_error_bodies="all"`
+        # echoes credential material into ordinary error bodies (Inworld's
+        # 403 quotes the key's first four characters; OpenAI's audio 401 its
+        # last four), so C11's one exception widens to every non-2xx from
+        # that provider. The status still passes through; the body is ours.
+        body = None
     # The provider's request id rides on the error's headers (`upstream.py`
     # keeps them since PLAN-2 A6d); it is the one thing a caller can quote to
     # the provider about a failure, and `gw_headers()` emits it.
@@ -2503,7 +2716,12 @@ def _tenant_report(gw: Gateway, tenant: str | None) -> dict[str, object] | None:
     }
 
 
-def build_app(config: ServerConfig | None = None, *, clock: Clock | None = None) -> Starlette:
+def build_app(
+    config: ServerConfig | None = None,
+    *,
+    clock: Clock | None = None,
+    extra_surfaces: Mapping[str, Surface] | None = None,
+) -> Starlette:
     """The factory. Everything a test needs to vary is an argument.
 
     A server that can only be exercised through a process-global `app` can only
@@ -2680,6 +2898,14 @@ def build_app(config: ServerConfig | None = None, *, clock: Clock | None = None)
                 "max_frame_bytes": gateway.config.max_frame_bytes,
                 "max_request_bytes": gateway.config.max_request_bytes,
                 "max_response_bytes": gateway.config.max_response_bytes,
+                "surface_limits": {
+                    name: {"max_request_bytes": lim.max_request_bytes,
+                           "max_response_bytes": lim.max_response_bytes}
+                    for name, lim in (
+                        (n, gateway.config.limits_for(n))
+                        for n in sorted({*SURFACE_NAMES, *gateway.config.surface_limits})
+                    )
+                },
             },
             # ---- the gate, as the serving path would find it right now ----
             "breakers": [
@@ -2758,6 +2984,18 @@ def build_app(config: ServerConfig | None = None, *, clock: Clock | None = None)
             f"{WORKLOAD_ROUTE_PREFIX}{route}", endpoint, methods=["POST"],
             name=f"{surface.name}_by_workload",
         ))
+    # `extra_surfaces`: client route -> Surface, mounted on the same
+    # `PassthroughEndpoint` as the shipped routes (PLAN-2 B4). This is how the
+    # contract tier exercises `body="multipart"` and `body="raw"` before any
+    # shipped surface declares them, and how Phase D's voice surfaces will
+    # be registered without touching this table.
+    for route, surface in (extra_surfaces or {}).items():
+        endpoint = PassthroughEndpoint(gateway, surface=surface, route=route)
+        routes.append(Route(route, endpoint, methods=["POST"], name=surface.name))
+        routes.append(Route(
+            f"{WORKLOAD_ROUTE_PREFIX}{route}", endpoint, methods=["POST"],
+            name=f"{surface.name}_by_workload",
+        ))
     routes.extend(
         Route(path, not_implemented, methods=["POST"], name=f"unimplemented{path}")
         for path in UNIMPLEMENTED_ROUTES
@@ -2802,5 +3040,8 @@ __all__ = [
     "app",
     "bearer_token",
     "build_app",
+    "facts_for_body",
+    "multipart_boundary",
     "run_until_disconnect",
+    "scan_multipart_fields",
 ]

@@ -307,3 +307,76 @@ the client its budget, not lost its health.
 `test_an_impatient_budget_falls_back_and_counts_the_queue_not_an_outage`
 (contract); `test_out_of_money_as_a_429_is_insufficient_credits_not_rate_limited`,
 `test_a_queued_first_event_timeout_is_neutral_but_still_falls_back` (unit).
+
+### C14 — A body the surface cannot frame is refused before the status is committed
+
+Every surface declares its framing: `sse` (both chat dialects), `jsonl`
+(newline-delimited JSON, Inworld text-to-speech) or `raw` (opaque chunks,
+binary audio). The pump frames the upstream body with the framer the surface
+names; commitment, byte bounds, backpressure, the progress/liveness split and
+native endings are unchanged. For `jsonl` the per-frame bound applies per
+line; for `raw` the pump's buffer is the only bound.
+
+An SSE surface whose upstream answers a streaming request with a
+`content-type` that is not `text/event-stream` is refused as a 502
+`unsupported_upstream_framing`, decided on the response headers before the
+status is committed to the client: `retry_same=False`, `try_next=True`,
+NEUTRAL to the breaker, blamed on the gateway, message naming the content
+type. It is therefore a fallback candidate and never a truncated stream.
+Before this contract such a body was fed to the SSE parser, produced no
+frames, was copied to the client for as long as the first-event budget
+allowed, and was recorded as a provider stall with nothing billed (measured
+against Inworld on 16 Sep 2026). An absent content type is not evidence and
+is let through as before.
+
+*Enforced by:* `test_sse_framer_is_split_invariant`,
+`test_jsonl_framer_is_split_invariant`, `test_raw_framer_frames_are_exactly_the_chunks`,
+`test_a_jsonl_surface_commits_progresses_and_ends_on_close`,
+`test_an_sse_surface_refuses_a_non_sse_content_type_before_any_byte` (unit);
+`test_a_misframed_candidate_falls_back_to_the_incumbent_uncut`,
+`test_a_misframed_only_target_is_a_502_naming_the_content_type` (contract).
+
+
+---
+
+### C15 — Units that are not tokens are exact when the provider said so, and priced at a real rate always
+
+The catalog can now price three units (`ModelSpec.unit`): tokens,
+characters (TTS, per million at `input_per_m`) and seconds (duration-billed
+STT, at `per_minute`); and, inside token usage, the kinds providers price
+separately: audio input/output, cached audio input, and Anthropic's 1-hour
+cache write. Server-tool calls (`web_search_requests` and friends) are
+priced per thousand from `tool_rates`.
+
+The promises. **Exactness is per kind and comes from the provider**: a
+count the provider stated is exact, a count the gateway inferred is
+`estimated`, and `basis` on the record says which. **No kind is ever priced
+at zero for want of a rate**: an audio token on a row with no audio rate is
+priced at the text rate, a 1-hour write on a row with no 1-hour rate at the
+5-minute rate, and every such fallback is written into `cost_notes` on the
+record and the capture line, so a bill that is right by accident can be
+told from one that is right on purpose. **Reasoning tokens are never priced
+twice**: they are already inside output and are recorded for visibility.
+**A tool call with no rate is counted and noted, not priced.**
+
+*Enforced by:* `tests/unit/test_units.py` (every kind, every fallback, the
+closed-set pins against `metrics.TOKEN_KINDS` / `metrics.UNITS`).
+
+## C16. Request defaults are a body edit, and say so
+
+A target may carry `request_defaults`; the gateway fills in only top-level
+keys the client did not send (one-level merge for dict values, never for
+lists, never over a key the client set to anything, `null` included), only on
+JSON bodies, and reports the edit under the same `X-Gw-Body-Modified: 1` as
+the model rewrite. The capture record lists the keys (`defaulted_keys`). A
+multipart or raw body is never edited.
+
+## C17. Caps are per surface, and a body the gateway cannot route is refused
+
+`max_request_bytes` and `max_response_bytes` resolve per `Surface.name`
+(`ServerConfig.limits_for`), falling back to the globals. A `multipart` body
+must name its `model` in the first 64 KiB of form fields and a `raw` body in
+`?model=` or `X-Gw-Model`; otherwise the request is a 400 before any upstream
+is contacted. Non-JSON bodies are forwarded byte-for-byte with the client's
+own `content-type` and are buffered up to the surface cap so a pre-commit
+retry can resend them.

@@ -54,10 +54,12 @@ the sink as well as the queued ones, because that chunk is still in memory.
 --------------------------------------------------------------------------
 
 The bytes written to the client are the bytes read from upstream, unmodified
-and un-reframed in meaning. Parsing happens *alongside* the copy, feeding an
-`SSEParser` whose events drive the stall clocks, the usage accumulator and
-the terminal-marker check. Nothing the tee learns is allowed to change what
-the client receives, and nothing it fails at is allowed to break the copy --
+and un-reframed in meaning. Parsing happens *alongside* the copy, feeding the
+surface's `Framer` (SSE for both chat dialects, newline-JSON or raw chunks
+for the voice surfaces; see `framing.py`) whose frames drive the stall
+clocks, the usage accumulator and the terminal-marker check. Nothing the tee
+learns is allowed to change what the client receives, and nothing it fails at
+is allowed to break the copy --
 a surface that throws while classifying a frame increments
 `usage.parse_failures` and the stream keeps going.
 
@@ -90,6 +92,7 @@ the read budget. See `_read_budget`.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections import deque
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
@@ -104,8 +107,9 @@ from llmgw.errors import (
     IncompleteStream,
     StallTimeout,
 )
-from llmgw.sse import SSEEvent, SSEParser
-from llmgw.surfaces.base import EventKind, Surface, Usage
+from llmgw.framing import Framer, assert_upstream_framing
+from llmgw.sse import SSEEvent
+from llmgw.surfaces.base import EventKind, Surface, Usage, framer_for_surface, surface_framing
 
 
 @runtime_checkable
@@ -179,10 +183,10 @@ class Pump:
 
     __slots__ = (
         "_surface", "_sink", "_deadline", "_budgets", "_clock", "_buffer",
-        "_parser", "_stall", "_committed", "_started", "_bytes_out", "_events",
+        "_framer", "_stall", "_committed", "_started", "_bytes_out", "_events",
         "_content_events", "_usage", "_terminal_seen", "_first_event_at",
         "_in_stream_error", "_last_event", "_debt", "_client_gone", "_drained",
-        "_source_ended", "_liveness_before_first",
+        "_source_ended", "_liveness_before_first", "_content_type",
     )
 
     def __init__(
@@ -195,6 +199,7 @@ class Pump:
         clock: Clock,
         buffer_bytes: int = 256 * 1024,
         max_frame_bytes: int = 1 << 20,
+        content_type: str | None = None,
     ) -> None:
         if buffer_bytes < 1:
             raise ValueError("buffer_bytes must be positive")
@@ -204,7 +209,12 @@ class Pump:
         self._budgets = budgets
         self._clock = clock
         self._buffer = _ByteBuffer(buffer_bytes)
-        self._parser = SSEParser(max_frame_bytes=max_frame_bytes, emit_comments=True)
+        # Phase B1: the surface chooses how its body is framed. Every chat
+        # dialect answers "sse" and gets the same parser as before; a
+        # newline-JSON or binary-audio surface gets a framer that does not
+        # mistake its whole body for one unterminated SSE frame.
+        self._framer: Framer = framer_for_surface(surface, max_frame_bytes=max_frame_bytes)
+        self._content_type = content_type
         self._stall = StallClock(budgets, clock=clock)
 
         self._committed = False
@@ -295,6 +305,14 @@ class Pump:
             raise RuntimeError("Pump.run() is single use; construct one per stream")
         self._started = True
         try:
+            # Defensive twin of the executor's pre-commitment check: a body
+            # whose declared type this surface cannot frame is refused here
+            # too, before any byte is read or written, so a direct caller of
+            # the pump gets the 502 rather than the stall-shaped failure it
+            # used to get. Inside the `try` so the upstream iterator is still
+            # released by the `finally` below. Free when the executor already
+            # checked (it passes the same content type).
+            assert_upstream_framing(surface_framing(self._surface), self._content_type)
             try:
                 async with asyncio.TaskGroup() as group:
                     group.create_task(self._read(source), name="llmgw-pump-read")
@@ -350,7 +368,11 @@ class Pump:
             raise
         finally:
             self._buffer.abort()
-            self._parser.close()
+            # Idempotent on every framer: a second flush after the reader
+            # already flushed returns nothing, and a poisoned framer stays
+            # quiet rather than raising a second exception into cleanup.
+            with contextlib.suppress(GatewayError, ValueError):
+                self._framer.flush()
             await _aclose(source)
 
     # ---------------------------------------------------------------- reader
@@ -376,15 +398,15 @@ class Pump:
                     self._mark_queued(err)
                     raise
                 if chunk is None:
-                    for event in self._parser.close():
+                    for event in self._framer.flush():
                         self._observe(event)
                     self._source_ended = True
                     return
                 if not chunk:
-                    # httpx hands out empty chunks. Feeding one to a parser
+                    # httpx hands out empty chunks. Feeding one to a framer
                     # that treats "no bytes" as "end of frame" invents events.
                     continue
-                for event in self._parser.feed(chunk):
+                for event in self._framer.feed(chunk):
                     self._observe(event)
                 blocked_from = self._clock.now()
                 await self._buffer.put(chunk)

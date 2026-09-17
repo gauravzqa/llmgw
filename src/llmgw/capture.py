@@ -138,6 +138,21 @@ class CaptureRecord:
     `x-envoy-upstream-service-time`). Against `first_event_latency` it splits
     provider time from gateway-plus-network time for free."""
 
+    units: dict[str, int] = field(default_factory=dict)
+    """Non-token billed units by kind: `characters`, `seconds`
+    (`metrics.UNITS`). Empty for token-billed models (PLAN-2 B3)."""
+
+    server_tool_calls: dict[str, int] = field(default_factory=dict)
+    """Provider-side tool calls by the provider's usage key
+    (`web_search_requests`...). Unlike the metric, this dict is not closed:
+    a key the catalog has no rate for is still recorded here."""
+
+    cost_notes: list[str] = field(default_factory=list)
+    """Why a cost is less exact than its `basis` says: audio tokens priced at
+    the text rate because the row has no audio rate, a tool call with no
+    rate, a 1-hour cache write priced at the 5-minute rate. Empty when every
+    kind found its own price."""
+
     def to_bytes(self) -> bytes:
         """Serialize to ONE JSON line with a trailing newline.
 
@@ -394,6 +409,22 @@ class Capture:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+        except asyncio.CancelledError:
+            # WE were cancelled while waiting: the forced-exit path (a second
+            # SIGTERM makes uvicorn cancel the lifespan task mid-shutdown).
+            # Until 18 Sep 2026 this propagated out of the lifespan and every
+            # forced exit logged one ERROR traceback per process after
+            # "Finished server process" (finding 48). The process is ending
+            # either way, so finish the job the caller asked for -- stop the
+            # worker, count what is left as `shutdown` drops -- and return
+            # normally, consuming the cancellation the way the endpoint does
+            # for uvicorn's post-grace cancel.
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            current = asyncio.current_task()
+            if current is not None:
+                current.uncancel()
         finally:
             # Whatever the worker did not flush is a shutdown drop -- recorded
             # here so the count is complete whether we stopped soft or hard.

@@ -567,3 +567,135 @@ def test_the_registry_is_a_closed_set_keyed_by_the_metrics_label():
         assert surface.name == name
         assert for_path(surface.path) is surface
     assert for_path("/v1/nope") is None
+
+
+# ============================================================ Phase B3 kinds
+# The detail fields the providers report and the gateway used to drop. Each
+# fixture is the shape recorded live in capabilities/*.md §4.
+
+from types import MappingProxyType  # noqa: E402
+
+from llmgw.sse import SSEEvent as _Ev  # noqa: E402
+from llmgw.surfaces.base import Usage as _Usage  # noqa: E402
+
+
+def _openai_usage_event(usage_block: dict) -> _Ev:
+    import json as _json
+
+    payload = {"id": "x", "object": "chat.completion.chunk", "choices": [],
+               "usage": usage_block}
+    return _Ev(data=_json.dumps(payload).encode())
+
+
+def test_openai_audio_cache_write_and_reasoning_details_are_recorded():
+    usage = _Usage()
+    OPENAI.apply_usage(_openai_usage_event({
+        "prompt_tokens": 1000, "completion_tokens": 300, "total_tokens": 1300,
+        "prompt_tokens_details": {"cached_tokens": 200, "audio_tokens": 150,
+                                  "cache_write_tokens": 100, "text_tokens": 850},
+        "completion_tokens_details": {"reasoning_tokens": 120, "audio_tokens": 80,
+                                      "accepted_prediction_tokens": 0},
+    }), usage)
+    # Disjoint buckets: fresh input = prompt - cached - written.
+    buckets = (usage.input_tokens, usage.cache_read_tokens, usage.cache_write_tokens)
+    assert buckets == (700, 200, 100)
+    assert usage.total_input_tokens == 1000
+    assert usage.output_tokens == 300
+    assert usage.audio_input_tokens == 150 and usage.audio_output_tokens == 80
+    assert usage.reasoning_tokens == 120
+    assert usage.exact
+
+
+def test_openai_details_absent_leave_the_new_fields_at_not_reported():
+    usage = _Usage()
+    OPENAI.apply_usage(
+        _openai_usage_event({"prompt_tokens": 10, "completion_tokens": 5}), usage
+    )
+    assert usage.cache_write_tokens == 0 and usage.audio_input_tokens == 0
+    assert usage.reasoning_tokens == 0 and usage.audio_output_tokens == 0
+    assert usage.input_tokens == 10 and usage.exact
+
+
+def test_openai_nonsense_details_never_go_negative():
+    usage = _Usage()
+    OPENAI.apply_usage(_openai_usage_event({
+        "prompt_tokens": 10, "completion_tokens": 1,
+        "prompt_tokens_details": {"cached_tokens": 8, "cache_write_tokens": 8},
+    }), usage)
+    assert usage.input_tokens == 0
+    assert usage.cache_read_tokens == 8 and usage.cache_write_tokens == 8
+
+
+def _anthropic_message_start(usage_block: dict) -> _Ev:
+    import json as _json
+
+    payload = {"type": "message_start", "message": {"id": "m", "usage": usage_block}}
+    return _Ev(event="message_start", data=_json.dumps(payload).encode())
+
+
+def _anthropic_message_delta(usage_block: dict) -> _Ev:
+    import json as _json
+
+    payload = {"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+               "usage": usage_block}
+    return _Ev(event="message_delta", data=_json.dumps(payload).encode())
+
+
+def test_anthropic_one_hour_cache_writes_are_split_from_five_minute_writes():
+    usage = _Usage()
+    ANTHROPIC.apply_usage(_anthropic_message_start({
+        "input_tokens": 50, "cache_read_input_tokens": 2000,
+        "cache_creation_input_tokens": 1500,
+        "cache_creation": {"ephemeral_5m_input_tokens": 500,
+                           "ephemeral_1h_input_tokens": 1000},
+        "output_tokens": 1,
+    }), usage)
+    assert usage.cache_write_tokens == 500 and usage.cache_write_1h_tokens == 1000
+    assert usage.cache_read_tokens == 2000 and usage.input_tokens == 50
+    assert usage.input_exact and not usage.output_exact
+
+
+def test_anthropic_without_the_ttl_breakdown_keeps_every_write_at_five_minutes():
+    usage = _Usage()
+    ANTHROPIC.apply_usage(_anthropic_message_start({
+        "input_tokens": 50, "cache_creation_input_tokens": 1500, "output_tokens": 1,
+    }), usage)
+    assert usage.cache_write_tokens == 1500 and usage.cache_write_1h_tokens == 0
+
+
+def test_anthropic_thinking_tokens_and_server_tools_are_recorded_on_the_final_frame():
+    usage = _Usage()
+    ANTHROPIC.apply_usage(
+        _anthropic_message_start({"input_tokens": 40, "output_tokens": 1}), usage
+    )
+    ANTHROPIC.apply_usage(_anthropic_message_delta({
+        "output_tokens": 900,
+        "output_tokens_details": {"thinking_tokens": 750},
+        "server_tool_use": {"web_search_requests": 3, "web_fetch_requests": 0, "bogus": "x"},
+    }), usage)
+    assert usage.output_tokens == 900 and usage.reasoning_tokens == 750
+    assert dict(usage.server_tool_calls) == {"web_search_requests": 3, "web_fetch_requests": 0}
+    assert isinstance(usage.server_tool_calls, MappingProxyType)
+    assert usage.exact and usage.stop_reason == "stop"
+
+
+def test_anthropic_compaction_iterations_are_added_to_the_base_counts():
+    usage = _Usage()
+    ANTHROPIC.apply_usage(_anthropic_message_start({
+        "input_tokens": 100, "cache_read_input_tokens": 10, "output_tokens": 1,
+        "iterations": [
+            {"type": "message", "input_tokens": 30, "output_tokens": 20,
+             "cache_read_input_tokens": 5, "cache_creation_input_tokens": 0},
+            {"type": "compaction", "input_tokens": 70, "output_tokens": 15},
+            "garbage",
+        ],
+    }), usage)
+    assert usage.input_tokens == 200 and usage.cache_read_tokens == 15
+    assert usage.output_tokens == 1 + 35
+
+
+def test_a_fresh_usage_has_an_immutable_empty_tool_map():
+    usage = _Usage()
+    assert dict(usage.server_tool_calls) == {}
+    with pytest.raises(TypeError):
+        usage.server_tool_calls["x"] = 1  # type: ignore[index]

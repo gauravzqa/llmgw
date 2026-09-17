@@ -54,9 +54,11 @@ spelling back.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Protocol
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from llmgw import errors
 
@@ -65,6 +67,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     # a frame (`event`, `data`, `is_comment`) and constructs none, so binding
     # it to the parser module at import time would buy nothing and cost a
     # circular import the first time the parser wants an EventKind.
+    from llmgw.framing import Framer
     from llmgw.sse import SSEEvent
 
 
@@ -237,6 +240,57 @@ class Usage:
     and a `None` here, which is the truth.
     """
 
+    # ------------------------------------------------------------------
+    # Phase B3: units and kinds beyond the four token buckets. Every one of
+    # these defaults to "not reported" and is priced by `accounting.cost()`
+    # only when a rate exists for it, so a surface that never fills them
+    # bills exactly as it did before. They are NOT part of `exact`: exactness
+    # is about the base counts a bill cannot do without; a missing detail
+    # field is a coarser bill, not an estimated one.
+    # ------------------------------------------------------------------
+
+    characters: int = 0
+    """Billable characters (text-to-speech providers bill per character).
+    Inworld reports the exact count on the first stream line; ElevenLabs in a
+    response header. Zero means not reported, never "free"."""
+
+    seconds: float = 0.0
+    """Billable audio seconds (transcription providers bill per minute or
+    per second). OpenAI rounds up to whole seconds before reporting."""
+
+    audio_input_tokens: int = 0
+    """Prompt tokens that were audio (`prompt_tokens_details.audio_tokens`).
+    Priced at the audio rate, 8 to 50x the text rate on `gpt-audio`; before
+    this field they were billed as text."""
+
+    audio_output_tokens: int = 0
+    """Completion tokens that were audio (`completion_tokens_details.audio_tokens`)."""
+
+    cached_audio_input_tokens: int = 0
+    """Cached audio prompt tokens (Realtime `cached_tokens_details.audio`)."""
+
+    cache_write_1h_tokens: int = 0
+    """Anthropic `cache_creation.ephemeral_1h_input_tokens`: writes at the
+    one-hour TTL, billed at 2x rather than the 5-minute 1.25x. Disjoint from
+    `cache_write_tokens`, which after this field holds the 5-minute share
+    only -- the surface subtracts, so the two never double-count."""
+
+    reasoning_tokens: int = 0
+    """Completion tokens spent thinking (`completion_tokens_details.
+    reasoning_tokens`, Anthropic `output_tokens_details.thinking_tokens`).
+    A SUBSET of `output_tokens`, kept for visibility: cost is unchanged
+    (providers bill reasoning at the output rate), but without it nobody can
+    see that a DeepSeek "answer" was 151 of 159 tokens of thinking."""
+
+    server_tool_calls: Mapping[str, int] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
+    """Per-call server tools the provider ran for us, by tool name
+    (`web_search_requests`, `web_fetch_requests`, `code_execution_requests`).
+    Priced per call from `ModelSpec.tool_rates`; $10 per thousand web
+    searches was invisible before this field. Immutable: a shared default
+    that a surface could mutate would leak counts between requests."""
+
     @property
     def exact(self) -> bool:
         """The billing basis. Cost is input x price_in + output x price_out,
@@ -284,6 +338,23 @@ class Surface(Protocol):
     path: str
     """The route this surface serves."""
 
+    framing: Literal["sse", "jsonl", "raw"]
+    """How the upstream body is cut into frames (Phase B1). `"sse"` for both
+    chat dialects; `"jsonl"` for newline-delimited JSON (Inworld TTS);
+    `"raw"` for opaque chunks (binary audio). The pump asks `framer()`."""
+
+    body: Literal["json", "multipart", "raw"]
+    """What the CLIENT sends (Phase B4). `"json"` is parsed for `model` and
+    `stream`; `"multipart"` is forwarded with its boundary and `model` read
+    from the form fields; `"raw"` takes `model` from the query string."""
+
+    default_profile: str | None
+    """Name of the budget profile this surface wants when the workload names
+    none (Phase B6): a text-to-speech surface asks for `"tts"` (first event
+    2 s, progress 5 s); None means the workload's own budgets."""
+
+    def framer(self, max_frame_bytes: int) -> Framer: ...
+
     def parse_request(self, body: bytes) -> RequestFacts: ...
     def classify(self, ev: SSEEvent) -> EventKind: ...
     def text_delta(self, ev: SSEEvent) -> str | None: ...
@@ -296,6 +367,39 @@ class Surface(Protocol):
         body, or None. The buffered path has no frames for `apply_usage` to
         see, so accounting asks the dialect directly. Never raises."""
         ...
+
+
+
+# ==========================================================================
+# Surface defaults. The protocol above declares the three Phase B attributes;
+# these give every surface the values that mean "exactly what it did before",
+# and `framer_for_surface` is what the pump calls so a surface that predates
+# the attributes (or a test stub) still gets an SSE framer.
+# ==========================================================================
+
+DEFAULT_FRAMING: Literal["sse", "jsonl", "raw"] = "sse"
+DEFAULT_BODY: Literal["json", "multipart", "raw"] = "json"
+
+
+def surface_framing(surface: Any) -> str:
+    """The surface's `framing`, defaulting to SSE for one that never set it."""
+    return getattr(surface, "framing", DEFAULT_FRAMING)
+
+
+def framer_for_surface(surface: Any, *, max_frame_bytes: int) -> Framer:
+    """The framer a surface wants for one stream.
+
+    Prefers the surface's own `framer()` when it has one, so a dialect can
+    tune its framer; otherwise dispatches on `framing`. Imported lazily to
+    keep `framing.py` (which imports `sse.py`) out of this module's import
+    graph -- the same reason `SSEEvent` is a typing-only import above.
+    """
+    own = getattr(surface, "framer", None)
+    if callable(own):
+        return own(max_frame_bytes)
+    from llmgw.framing import framer_for
+
+    return framer_for(surface_framing(surface), max_frame_bytes=max_frame_bytes)
 
 
 # ==========================================================================

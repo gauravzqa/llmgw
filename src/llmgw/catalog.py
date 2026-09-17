@@ -54,10 +54,41 @@ from __future__ import annotations
 
 import datetime as _dt
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
-from typing import Literal
+from typing import Any, Literal
 
 ProviderKind = Literal["openai", "anthropic"]
+
+AuthScheme = Literal["bearer", "x-api-key", "raw", "header"]
+"""How the provider wants its credential (PLAN-2 B2).
+
+`bearer`: `Authorization: Bearer <key>` (OpenAI, DeepSeek, OpenRouter, and
+Inworld, which accepts it identically to its documented Basic form -- verified
+live 2026-09-16). `x-api-key`: the header of that name, plus `anthropic-version`
+(Anthropic). `raw`: the bare key in `Authorization` with no scheme word
+(AssemblyAI). `header`: a provider-named header carrying the bare key, named
+by `ProviderConn.auth_header` (ElevenLabs `xi-api-key`). `upstream.build_headers`
+branches on this field; nothing else reads it.
+"""
+
+ScrubPolicy = Literal["auth", "all"]
+"""Which upstream error bodies are replaced by the gateway's own before they
+reach the client (CONTRACTS C11). `auth`: 401/403 only, today's rule. `all`:
+every non-2xx body, for providers whose keys are reversible (Inworld's Basic
+form) or that echo key fragments outside the auth statuses."""
+
+ForbiddenMeans = Literal["auth", "rate_limit", "policy"]
+"""What this provider's 403 means, because it is not the same thing
+everywhere: a bad credential (OpenAI region block, Anthropic permission
+error, Inworld -- verified live), a rate limit (AssemblyAI REST: 20k requests
+per 5 min answers 403), or a plan/voice/model denial (ElevenLabs). The
+classifier maps only the first onto the credential breaker."""
+
+Unit = Literal["tokens", "characters", "seconds"]
+"""What a model's rates are per million of. Text models are priced per token;
+TTS per character; duration-billed STT per second, priced through
+`ModelSpec.per_minute` rather than a per-million rate (PLAN-2 B3)."""
 
 ReasoningLevel = Literal["off", "none", "minimal", "low", "medium", "high", "xhigh", "max"]
 """The union of the providers' reasoning-effort vocabularies, as of 2026-09-16.
@@ -97,6 +128,33 @@ class ProviderConn:
     """Identity of the key, for breaker scoping. Defaults to the provider id.
     Under BYOK this becomes per-tenant, so one customer's expired key cannot
     open a breaker against the provider for everyone else."""
+
+    auth_scheme: AuthScheme = "bearer"
+    """See `AuthScheme`. `x-api-key` on the Anthropic rows; the others default
+    to bearer, which is what `build_headers` always sent them."""
+
+    auth_header: str | None = None
+    """The header name for `auth_scheme="header"`; required then, ignored
+    otherwise. Validated at construction so a row that says `header` and
+    names none fails when the catalog is built, not on the first request."""
+
+    scrub_error_bodies: ScrubPolicy = "auth"
+    """See `ScrubPolicy`."""
+
+    forbidden_means: ForbiddenMeans = "auth"
+    """See `ForbiddenMeans`. Phase A read this with `getattr`; it is a real
+    field now so a voice provider row can declare it."""
+
+    def __post_init__(self) -> None:
+        if self.auth_scheme == "header" and not self.auth_header:
+            raise ValueError(
+                f"provider {self.id!r}: auth_scheme='header' needs auth_header"
+            )
+        if self.auth_scheme != "header" and self.auth_header:
+            raise ValueError(
+                f"provider {self.id!r}: auth_header is only meaningful with "
+                f"auth_scheme='header', got {self.auth_scheme!r}"
+            )
 
     def key(self) -> str:
         return self.credential_id or self.id
@@ -145,11 +203,69 @@ class ModelSpec:
     response is still forwarded byte-for-byte, wire id and all.
     """
 
+    unit: Unit = "tokens"
+    """What `input_per_m` / `output_per_m` are per million of. For
+    `characters` (TTS) the per-million-character price goes in `input_per_m`
+    and `output_per_m` is 0 -- the meter is the text sent, there is no second
+    side. For `seconds` (duration-billed STT) the rate is `per_minute` and the
+    per-million fields are unused (0)."""
+
+    per_minute: float | None = None
+    """USD per minute of audio, for `unit="seconds"` only; cost is
+    `seconds / 60 * per_minute`. Providers round the seconds themselves
+    (OpenAI rounds up to whole seconds, verified live 2026-09-16); the gateway
+    prices what the provider reported."""
+
+    audio_input_per_m: float | None = None
+    audio_output_per_m: float | None = None
+    cached_audio_input_per_m: float | None = None
+    """Per-million rates for the audio token kinds providers report inside
+    token usage (`input_token_details.audio_tokens` and friends). Audio is 8
+    to 50x the text rate on `gpt-realtime` and `gpt-audio` ($32 in / $64 out
+    against $4 / $16), so pricing audio tokens at the text rate -- which is
+    what happened before PLAN-2 B3 -- is a silent under-bill. None means "not
+    an audio model": if audio tokens arrive anyway they are priced at the
+    text rate and the record says so (`cost_notes`)."""
+
+    cache_write_1h_per_m: float | None = None
+    """Anthropic's 1-hour cache write rate: 2x input, against 1.25x for the
+    5-minute TTL in `cache_write_per_m`. `usage.cache_creation.
+    ephemeral_1h_input_tokens` is priced here; None falls back to
+    `cache_write_per_m`, then to `input_per_m`."""
+
+    tool_rates: Mapping[str, float] = field(default_factory=dict)
+    """USD per 1,000 server-tool calls, keyed by the provider's usage key
+    (`web_search_requests` at $10 per 1k on Anthropic). Calls the provider
+    reports under a key with no rate here are counted and noted, not priced."""
+
+    request_defaults: Mapping[str, Any] = field(default_factory=dict)
+    """JSON-shaped fields applied to the request body for keys the client did
+    not send (PLAN-2 B5), merged UNDER a workload's own `request_defaults`.
+    A model-level default is for things that are true of the model however
+    it is used; a "cheap candidate must not think" decision belongs on the
+    workload, which is why the DeepSeek rows carry none."""
+
+    default_profile: str | None = None
+    """Name of a budget profile (`[profiles.<name>]` in the policy file) this
+    model is best served under, e.g. `tts` for a speech model. Data only: the
+    policy layer resolves a workload's budgets from the workload and its
+    profile, and a `single_target` route reads this to pick one when the
+    policy defines it (PLAN-2 B6)."""
+
     def __post_init__(self) -> None:
         if not self.priced_at:
             raise ValueError(f"{self.id}: priced_at is required")
         if self.id in self.aliases:
             raise ValueError(f"{self.id}: a model must not alias its own id")
+        if self.unit == "seconds" and self.per_minute is None:
+            raise ValueError(f"{self.id}: unit='seconds' needs per_minute")
+        if self.unit != "seconds" and self.per_minute is not None:
+            raise ValueError(
+                f"{self.id}: per_minute is only meaningful with unit='seconds'"
+            )
+        for name in ("tool_rates", "request_defaults"):
+            if not isinstance(getattr(self, name), Mapping):
+                raise ValueError(f"{self.id}: {name} must be a mapping")
 
 
 # --------------------------------------------------------------------------
@@ -162,6 +278,7 @@ PROVIDERS: dict[str, ProviderConn] = {
         kind="anthropic",
         base_url="https://api.anthropic.com",
         api_key_env="ANTHROPIC_API_KEY",
+        auth_scheme="x-api-key",
         max_concurrency=32,
     ),
     "openrouter": ProviderConn(
@@ -234,6 +351,7 @@ PROVIDERS: dict[str, ProviderConn] = {
         kind="anthropic",
         base_url="http://127.0.0.1:8802",
         api_key_env="FAKE_API_KEY",
+        auth_scheme="x-api-key",
         max_concurrency=20_000,
     ),
 }
@@ -264,11 +382,11 @@ MODELS: dict[str, ModelSpec] = {
         ),
         # Anthropic rates from platform.claude.com/docs/en/about-claude/pricing,
         # read 2026-09-16 (capabilities/anthropic.md §7). Cache WRITE is
-        # 1.25x input for the 5-minute TTL on every current model; the 1-hour
-        # TTL is 2x and is not yet a separate field (PLAN-2 B3). Before this
+        # 1.25x input for the 5-minute TTL on every current model and 2x for
+        # the 1-hour TTL (`cache_write_1h_per_m`, PLAN-2 B3). Before this
         # date `cache_write_per_m` was unset here, which priced every write
         # at 1.0x -- a 20% under-bill on the write line of every cached
-        # request.
+        # request. Web search is $10 per 1,000 calls (`tool_rates`).
         #
         # Haiku 4.5's retirement floor is 2026-10-15 (model deprecations page);
         # a successor row is due before then. `can_reason=True` because the
@@ -282,12 +400,14 @@ MODELS: dict[str, ModelSpec] = {
             input_per_m=1.00,
             cached_input_per_m=0.10,
             cache_write_per_m=1.25,
+            cache_write_1h_per_m=2.00,
             output_per_m=5.00,
             context_window=200_000,
             max_output=64_000,
             can_reason=True,
             priced_at="2026-09-16",
             aliases=("claude-haiku-4-5",),
+            tool_rates={"web_search_requests": 10.0},
         ),
         # Context window is 1M, default, no beta header, standard pricing
         # (models/sonnet-4-6/overview, 2026-09-16). The previous 200_000 was
@@ -301,11 +421,13 @@ MODELS: dict[str, ModelSpec] = {
             input_per_m=3.00,
             cached_input_per_m=0.30,
             cache_write_per_m=3.75,
+            cache_write_1h_per_m=6.00,
             output_per_m=15.00,
             context_window=1_000_000,
             max_output=128_000,
             can_reason=True,
             priced_at="2026-09-16",
+            tool_rates={"web_search_requests": 10.0},
         ),
         # Cheaper than Sonnet 4.6 on every axis and the current Sonnet;
         # 4.6 is listed as legacy. The default Anthropic route should move
@@ -317,11 +439,13 @@ MODELS: dict[str, ModelSpec] = {
             input_per_m=2.00,
             cached_input_per_m=0.20,
             cache_write_per_m=2.50,
+            cache_write_1h_per_m=4.00,
             output_per_m=10.00,
             context_window=1_000_000,
             max_output=128_000,
             can_reason=True,
             priced_at="2026-09-16",
+            tool_rates={"web_search_requests": 10.0},
         ),
         # DeepSeek rates from api-docs.deepseek.com/quick_start/pricing, read
         # 2026-09-16 (capabilities/deepseek.md §7). These are the PEAK rates,

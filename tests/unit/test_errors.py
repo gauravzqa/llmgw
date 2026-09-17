@@ -225,7 +225,8 @@ def test_parse_retry_after_date_in_the_past_is_zero_not_negative():
         (429, None, E.RateLimited),
         (401, None, E.AuthenticationFailed),
         (403, None, E.AuthenticationFailed),
-        (404, None, E.ModelNotFound),
+        # A bodiless 404 is the edge, not the API (finding 49): retryable.
+        (404, None, E.UpstreamServerError),
         (400, b'{"error":{"message":"bad"}}', E.InvalidRequest),
         (422, b'{"error":{"message":"bad"}}', E.InvalidRequest),
         (500, None, E.UpstreamServerError),
@@ -286,3 +287,40 @@ def test_client_status_prefers_the_upstream_status_when_passing_through():
 def test_client_status_falls_back_to_the_class_default():
     assert E.BreakerOpen("open").client_status == 503
     assert E.ClientDisconnected("gone").client_status == 499
+
+
+# ---------------------------------------------------------------- finding 49
+# A 404 is "model not found" only when an API said so. OpenAI's edge answered
+# a valid request with an intermittent 404 and a non-JSON body on 18 Sep 2026.
+
+
+def test_a_404_with_an_api_error_body_is_model_not_found():
+    from llmgw.errors import ModelNotFound, from_http_status
+    body = (b'{"error": {"message": "The model `nope` does not exist", '
+            b'"type": "invalid_request_error", "code": "model_not_found"}}')
+    err = from_http_status(404, body=body, provider="openai", model="nope")
+    assert isinstance(err, ModelNotFound)
+    assert err.retry_same is False and err.try_next is True
+
+
+def test_a_404_with_an_html_body_is_a_retryable_upstream_error():
+    from llmgw.errors import Health, ModelNotFound, UpstreamServerError, from_http_status
+    body = b"<html><head><title>404 Not Found</title></head><body>nginx</body></html>"
+    err = from_http_status(404, body=body, provider="openai", model="openai.gpt-4o-mini")
+    assert isinstance(err, UpstreamServerError) and not isinstance(err, ModelNotFound)
+    assert err.retry_same is True and err.try_next is True
+    assert err.health is Health.FAILURE
+    assert "non-API body" in str(err)
+
+
+def test_a_404_with_an_empty_body_is_not_model_not_found():
+    from llmgw.errors import ModelNotFound, from_http_status
+    err = from_http_status(404, body=b"", provider="anthropic", model="x")
+    assert not isinstance(err, ModelNotFound)
+
+
+def test_a_grpc_style_404_body_still_counts_as_an_api_error():
+    from llmgw.errors import ModelNotFound, from_http_status
+    body = b'{"code": 5, "message": "Unknown voice: NoSuchVoice not found!", "details": []}'
+    err = from_http_status(404, body=body, provider="inworld", model="v")
+    assert isinstance(err, ModelNotFound)

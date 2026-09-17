@@ -114,6 +114,7 @@ import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, field
+from typing import Any
 
 from .admission import Permit, ProviderKeyLimiter
 from .breaker import BreakerRegistry, Key, Ticket
@@ -131,11 +132,12 @@ from .errors import (
     RetryBudgetExhausted,
     decide,
 )
+from .framing import assert_upstream_framing
 from .metrics import normalize_stop_reason
 from .policy import ExecutionPlan
 from .pump import Pump, PumpResult, Sink
 from .retry import RetryBudget, RetryPolicy
-from .surfaces.base import Surface
+from .surfaces.base import Surface, surface_framing
 from .upstream import Upstream, UpstreamRequest, UpstreamStream
 
 log = logging.getLogger(__name__)
@@ -517,6 +519,8 @@ class Executor:
         deadline: Deadline,
         sink_factory: SinkFactory,
         retry_policy: RetryPolicy | None = None,
+        body_kind: str = "json",
+        content_type: str | None = None,
         extra_headers: Mapping[str, str] | None = None,
         max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
         buffer_bytes: int = DEFAULT_BUFFER_BYTES,
@@ -691,6 +695,9 @@ class Executor:
                         target=target,
                         surface=surface,
                         body=body,
+                        body_kind=body_kind,
+                        content_type=content_type,
+                        request_defaults=_defaults_for(plan, target),
                         path=path,
                         stream=stream,
                         deadline=deadline,
@@ -989,7 +996,10 @@ class Executor:
         deadline: Deadline,
         budgets: Budgets,
         retry_budget: RetryBudget,
+        body_kind: str = "json",
+        content_type: str | None = None,
         extra_headers: Mapping[str, str] | None,
+        request_defaults: Mapping[str, Any] | None = None,
         max_response_bytes: int,
         buffer_bytes: int,
         max_frame_bytes: int,
@@ -1060,6 +1070,9 @@ class Executor:
             path=path,
             stream=stream,
             extra_headers=dict(extra_headers or {}),
+            body_kind=body_kind,
+            content_type=content_type,
+            request_defaults=request_defaults,
         )
         ctx = {
             "provider": target.provider.id,
@@ -1098,6 +1111,11 @@ class Executor:
                     await _send(sink, payload)
                     return None
 
+                # The framing check BEFORE commitment (PLAN-2 B1): a body
+                # whose content type the surface's framer cannot read is a
+                # 502 the plan can still fall back from, not a stream that
+                # is copied for a few seconds and then cut as a "stall".
+                _assert_framing(surface, getattr(upstream, "content_type", None), ctx)
                 # ================== STATUS COMMITMENT ======================
                 # The upstream has produced a byte we are about to forward.
                 # From here the plan is over; see `_Commitment`.
@@ -1111,6 +1129,7 @@ class Executor:
                     clock=self._clock,
                     buffer_bytes=buffer_bytes,
                     max_frame_bytes=max_frame_bytes,
+                    content_type=getattr(upstream, "content_type", None),
                 )
                 state.pump = pump
                 return await pump.run(_ReheadedSource(first, source))
@@ -1292,6 +1311,32 @@ class _ReheadedSource:
         aclose = getattr(self._rest, "aclose", None)
         if aclose is not None:
             await aclose()
+
+
+def _defaults_for(plan: ExecutionPlan, target: Target) -> Mapping[str, Any] | None:
+    """`plan.request_defaults_for(target)` (PLAN-2 B5: model row under the
+    workload, workload wins) on a policy that has it; `None` on one that does
+    not, which lets `upstream.open` fall back to the model row alone."""
+    fn = getattr(plan, "request_defaults_for", None)
+    if fn is None:
+        return None
+    merged = fn(target)
+    return merged or None
+
+
+def _assert_framing(
+    surface: Surface, content_type: str | None, ctx: Mapping[str, str]
+) -> None:
+    """The framing check, BEFORE commitment (PLAN-2 B1). An SSE surface handed
+    an `application/json` or `audio/mpeg` body raises
+    `UnsupportedUpstreamFraming` (502, retry_same=False, try_next=True) here,
+    with the plan still open, instead of the pump discovering it after the
+    status is on the wire. The pump repeats the check defensively."""
+    try:
+        assert_upstream_framing(surface_framing(surface), content_type)
+    except GatewayError as err:
+        _attribute(err, ctx)
+        raise
 
 
 async def _next_chunk(source: AsyncIterator[bytes]) -> bytes | None:

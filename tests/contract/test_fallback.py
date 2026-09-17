@@ -118,6 +118,7 @@ candidate = "fake.candidate"
   [workloads.tight.budgets]
   total = 2.5
   connect = 0.4
+  headers = 0.4   # PLAN-2 B4: the status-line wait is its own budget
   first_event = 1.0
   progress = 0.6
 
