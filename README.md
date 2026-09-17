@@ -141,6 +141,8 @@ the leading hypothesis.
 | [preliminary-S1S2S3.md](bench/results/preliminary-S1S2S3.md) | the single-process night, with the wedge |
 | [overhead.md](bench/results/overhead.md) | added latency at concurrency 1 against an in-process fake |
 | [live_overhead.md](bench/results/live_overhead.md) | 35 paired calls against a real provider |
+| [live-fly-20260916.md](bench/results/live-fly-20260916.md) | 122 real calls through the deployed gateway on Fly (short chat, article, multi-turn, vision, tools, JSON, Anthropic, 4-way concurrency), client and gateway on one machine: TTFT 604 vs 629 ms, total 775 vs 779 ms |
+| [live-fly-20260917b.md](bench/results/live-fly-20260917b.md) | the same with client and gateway on separate machines over the IPv6 private network, Phase A build: TTFT 633 vs 650 ms, total 875 vs 884 ms; one 504 from the 2 s headers budget |
 
 ## The four foundations
 
