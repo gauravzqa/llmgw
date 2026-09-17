@@ -648,3 +648,53 @@ def test_uvicorn_c2_ending_line_is_filtered_and_nothing_else_is():
     finally:
         if not before:
             logger.removeFilter(_C2_FILTER)
+
+
+# ------------------------------------------------------------------ dual-stack
+# 17 Sep 2026: `LLMGW_HOST="::"` through uvicorn alone produced an IPv6-only
+# listener (asyncio sets IPV6_V6ONLY on sockets it opens itself), so Fly's
+# IPv4 health check refused while the IPv6 private network worked. The
+# pre-bound socket must accept BOTH.
+
+
+def _connects(host: str, port: int) -> bool:
+    import socket as _s
+    fam = _s.AF_INET6 if ":" in host else _s.AF_INET
+    with _s.socket(fam, _s.SOCK_STREAM) as c:
+        c.settimeout(1.0)
+        try:
+            c.connect((host, port))
+            return True
+        except OSError:
+            return False
+
+
+def test_bind_sockets_on_double_colon_is_dual_stack():
+    import socket as _s
+
+    from llmgw.server.lifecycle import bind_sockets
+
+    if not _s.has_dualstack_ipv6():
+        pytest.skip("no dual-stack IPv6 on this host")
+    (sock,) = bind_sockets("::", 0)
+    try:
+        port = sock.getsockname()[1]
+        assert sock.getsockopt(_s.IPPROTO_IPV6, _s.IPV6_V6ONLY) == 0
+        assert _connects("::1", port), "IPv6 loopback must connect"
+        # IPv4 loopback is the health-check path.
+        assert _connects("127.0.0.1", port), "IPv4 loopback must connect"
+    finally:
+        sock.close()
+
+
+def test_bind_sockets_on_ipv4_host_is_ipv4_only():
+    import socket as _s
+
+    from llmgw.server.lifecycle import bind_sockets
+
+    (sock,) = bind_sockets("127.0.0.1", 0)
+    try:
+        assert sock.family == _s.AF_INET
+        assert _connects("127.0.0.1", sock.getsockname()[1])
+    finally:
+        sock.close()

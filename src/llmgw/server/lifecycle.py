@@ -54,6 +54,7 @@ import asyncio
 import contextlib
 import logging
 import signal
+import socket
 from collections.abc import Iterator
 
 import uvicorn
@@ -146,6 +147,33 @@ def _quiet_c2_endings() -> None:
 _C2_FILTER = _NotAnErrorHere()
 
 
+def bind_sockets(host: str, port: int, *, backlog: int = 2048) -> list[socket.socket]:
+    """Pre-bind the listening socket so a `::` host is genuinely dual-stack.
+
+    When uvicorn is given only a host and port, asyncio's `create_server`
+    opens the AF_INET6 socket itself and sets `IPV6_V6ONLY=1` on it (it does
+    that so `host=None` can bind `::` and `0.0.0.0` side by side without
+    EADDRINUSE). The result on a host of `::` is an IPv6-only listener even
+    on a kernel whose `bindv6only` is 0 -- which is what put `layrs-llmgw`
+    half-deployed on 17 Sep 2026: the sibling machine reached it over Fly's
+    IPv6 private network, and Fly's IPv4 health check got connection refused.
+
+    Binding the socket here with `dualstack_ipv6=True` clears V6ONLY, and
+    uvicorn's `serve(sockets=...)` skips its own bind. Any other host binds
+    exactly as before. Returned sockets are owned by uvicorn from then on.
+    """
+    if host == "::" and socket.has_dualstack_ipv6():
+        sock = socket.create_server(
+            (host, port), family=socket.AF_INET6, dualstack_ipv6=True,
+            backlog=backlog, reuse_port=False,
+        )
+    else:
+        family = socket.AF_INET6 if ":" in host else socket.AF_INET
+        sock = socket.create_server((host, port), family=family, backlog=backlog)
+    sock.set_inheritable(True)
+    return [sock]
+
+
 async def serve(config: ServerConfig) -> DrainReport | None:
     """Run the gateway until a drain signal, then drain and exit.
 
@@ -180,6 +208,7 @@ async def serve(config: ServerConfig) -> DrainReport | None:
         timeout_graceful_shutdown=UVICORN_SHUTDOWN_TIMEOUT_S,
     )
     server = _DrainingServer(uconfig)
+    sockets = bind_sockets(config.host, config.port)
     _quiet_c2_endings()
 
     loop = asyncio.get_running_loop()
@@ -258,7 +287,7 @@ async def serve(config: ServerConfig) -> DrainReport | None:
             installed.append(sig)
 
     try:
-        await server.serve()
+        await server.serve(sockets=sockets)
     finally:
         for sig in installed:
             with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):

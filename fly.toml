@@ -39,8 +39,11 @@ kill_timeout = "140s"
   # and the per-machine `<id>.vm.layrs-llmgw.internal` names) is IPv6-only.
   # An IPv4-only listener passes the proxy's health check and is unreachable
   # by every sibling app. Found 16 Sep 2026 when the second machine could
-  # not connect to the first. uvicorn on "::" binds dual-stack on Linux, so
-  # the proxy's IPv4 path keeps working.
+  # not connect to the first. NOTE: uvicorn alone would make "::" IPv6-only
+  # (asyncio sets IPV6_V6ONLY when it opens the socket; the 17 Sep rollout
+  # failed its IPv4 health check that way), so lifecycle.py pre-binds a
+  # dual-stack socket and hands it to uvicorn. The proxy's IPv4 health check
+  # and the IPv6 private network both work.
   LLMGW_HOST = "::"
   LLMGW_PORT = "8080"
 
