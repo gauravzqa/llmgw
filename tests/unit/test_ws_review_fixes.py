@@ -254,3 +254,42 @@ def test_an_in_context_fault_that_is_not_fatal_leaves_the_context_open():
     r._observe(Direction.CLIENT_OUT, _status(3, "c1"))
     assert r.open_contexts == 1
     assert INWORLD_TTS_WS.classify_upstream(_status(3, "c1")).kind is FrameClass.ERROR
+
+
+# ==========================================================================
+# The production-config hole: a socket must work with only a token
+# ==========================================================================
+
+
+def test_the_surface_names_its_own_model_because_the_plugin_cannot():
+    """Found by deploying G1 and watching a healthy client get 404.
+
+    The upgrade resolves a plan before any frame arrives. Production's
+    default workload is a chat model (`openai.gpt-4o-mini`), which has no
+    target of this dialect, so the plan came back empty and the upgrade
+    answered `ModelNotFound` -- 404 -- to a client doing nothing wrong. The
+    consumer cannot route around it either: the LiveKit plugin builds its URL
+    with `urljoin(ws_url, "/tts/v1/voice:streamBidirectional")` and `urljoin`
+    discards any path prefix, so `/workloads/{w}/...` is unreachable from the
+    one caller this plane exists for.
+    """
+    from llmgw.catalog import DEFAULT_CATALOG
+
+    assert INWORLD_TTS_WS.default_model == "inworld.tts-2-flash"
+    target = DEFAULT_CATALOG.resolve(INWORLD_TTS_WS.default_model)
+    assert target.provider.id == "inworld", (
+        "the default must live on the provider the socket opens to, or the "
+        "first `create` frame refuses itself for crossing providers"
+    )
+
+
+def test_both_deprecated_inworld_ids_resolve_onto_that_provider():
+    """The plugin sends `inworld-tts-1.5-mini` from Layrs' config and
+    `inworld-tts-1.5-max` when a call site names no model at all (it is the
+    plugin's own default). Either one arriving in a `create` frame must
+    resolve, and onto the same provider as the socket."""
+    from llmgw.catalog import DEFAULT_CATALOG
+
+    for wire_id in ("inworld-tts-1.5-mini", "inworld-tts-1.5-max"):
+        target = DEFAULT_CATALOG.resolve(wire_id)
+        assert target.provider.id == "inworld", wire_id

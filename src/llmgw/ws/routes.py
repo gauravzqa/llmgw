@@ -168,6 +168,23 @@ class UpstreamSide:
 
 
 
+
+def _serves(plan: Any, surface: Any) -> bool:
+    """True when this plan can actually open this surface's socket.
+
+    A plan is a workload's candidate and incumbent, chosen for text. A
+    WebSocket product talks to exactly one provider, so a plan whose targets
+    all live somewhere else is not a plan for this route at all -- and the
+    404 it used to produce blamed the caller for the deployment's config.
+    """
+    product = getattr(surface, "product", None)
+    targets = getattr(plan, "targets", ())
+    if not targets:
+        return False
+    if product is None:
+        return True
+    return any(t.provider.id == product for t in targets)
+
 def _scrubs_all(target: Any) -> bool:
     """True when this target's provider row says every error body of its is
     unsafe to show a tenant (`scrub_error_bodies="all"`).
@@ -302,6 +319,21 @@ class WsEndpoint:
             workload = snapshot.workloads[workload_id]
             budgets = workload.budgets
             plan = snapshot.plan_for(workload_id, kind=surface.dialect)
+            if not _serves(plan, surface):
+                # The workload has nothing of this dialect -- production's
+                # default workload is a chat model, and a TTS socket is not
+                # a chat request. Fall back to the model this surface exists
+                # to serve rather than answering a healthy client 404.
+                #
+                # Only as a FALLBACK, never as an override: `plan_for(model=)`
+                # replaces the plan rather than prepending to it, so doing
+                # this unconditionally would throw away the candidate and the
+                # incumbent and with them every fallback this plane inherits.
+                fallback = getattr(surface, "default_model", None)
+                if fallback is not None:
+                    plan = snapshot.plan_for(
+                        workload_id, model=fallback, kind=surface.dialect,
+                    )
 
             permit = gw.admission.admit(tenant)
             permits.append(permit)

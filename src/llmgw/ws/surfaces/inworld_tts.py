@@ -124,6 +124,11 @@ class InworldTTSWebSocketSurface:
     name = "inworld_tts_ws"
     product = "inworld"
     dialect = "openai"
+    default_model = "inworld.tts-2-flash"
+    """What a socket opened with no workload routes to: the current
+    mini-equivalent tier, and the row both deprecated 1.5 ids alias onto.
+    The `create` frame may still name another Inworld model and it is
+    honoured; what it may not do is name one on a different provider."""
     """The catalog's `kind` for the Inworld row -- "OpenAI-shaped", meaning
     only "no Anthropic header ritual". It is the tie-breaker `plan_for` uses
     when a wire id is shared, not a statement about this socket's dialect."""

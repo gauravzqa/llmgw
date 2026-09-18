@@ -230,6 +230,22 @@ class Verdict:
 class WsSurface(Protocol):
     """One relayed product. Implementations are stateless singletons."""
 
+    default_model: str | None
+    """The catalog id this product serves when the CALLER named no workload.
+
+    Not a convenience. The plugins that open these sockets cannot name one:
+    the Inworld TTS client builds its URL with `urljoin(ws_url, "/tts/v1/
+    voice:streamBidirectional")`, and `urljoin` against an absolute path
+    discards any prefix, so `/workloads/{w}/...` is unreachable from the one
+    consumer this plane exists for. Without this the upgrade resolves against
+    the deployment's default workload -- `openai.gpt-4o-mini` in production --
+    finds no target of this dialect, and answers a healthy client 404.
+
+    A workload the caller DOES name still wins; this only fills the hole
+    where there was no choice to respect.
+    """
+
+
     name: str
     """The `metrics.SURFACES` label. Closed set; see metrics.py."""
 

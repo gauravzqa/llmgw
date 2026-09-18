@@ -89,7 +89,14 @@ def _catalog(url: str, *, second: str | None = None) -> Catalog:
     models = {
         "inworld.tts-2": base.models["inworld.tts-2"],
         "inworld.tts-2-flash": base.models["inworld.tts-2-flash"],
+        # A chat row on a different provider, so a test can build the shape
+        # production actually has: a default workload that points somewhere
+        # this socket cannot go.
+        "openai.gpt-4o-mini": base.models["openai.gpt-4o-mini"],
     }
+    providers["openai"] = replace(
+        base.providers["openai"], base_url=url, api_key_env=KEY_ENV,
+    )
     if second is not None:
         # A second Inworld row on another port, so a plan can fall back. The
         # credential id is shared deliberately: two routing entries over one
@@ -106,8 +113,8 @@ def _catalog(url: str, *, second: str | None = None) -> Catalog:
     return Catalog(models=models, providers=providers)
 
 
-def _policy(tmp_path: Path, *, candidate: str | None = None) -> Path:
-    incumbent = "inworld.tts-2-flash"
+def _policy(tmp_path: Path, *, candidate: str | None = None,
+            incumbent: str = "inworld.tts-2-flash") -> Path:
     lines = [
         'default_workload = "default"',
         "",
@@ -143,7 +150,10 @@ def _config(url: str, tmp_path: Path, **overrides) -> ServerConfig:
         forward_request_headers=FAKE_HEADERS,
         breaker=BREAKER_NEVER_TRIPS,
         tenants_file=_tenants_file(tmp_path, **overrides.pop("tenant", {})),
-        policy_file=_policy(tmp_path, candidate=overrides.pop("candidate", None)),
+        policy_file=_policy(
+            tmp_path, candidate=overrides.pop("candidate", None),
+            incumbent=overrides.pop("incumbent", "inworld.tts-2-flash"),
+        ),
         budgets=Budgets(total=60.0, connect=5.0, headers=5.0, first_event=5.0,
                         progress=5.0, client_stall=5.0),
         drain_grace_seconds=100.0,
@@ -1154,3 +1164,32 @@ async def test_the_socket_metrics_move_with_their_closed_label_sets(gateway):
     assert 'llmgw_ws_session_seconds_bucket{' in after
     assert 'llmgw_requests_total{code="none",outcome="completed",' \
            'surface="inworld_tts_ws"}' in after
+
+
+async def test_a_production_shaped_default_workload_still_serves_the_socket(
+    ws_fake, tmp_path_factory,
+):
+    """The deploy bug, as a test. Production's default workload names a chat
+    model (`LLMGW_DEFAULT_MODEL=openai.gpt-4o-mini`), which has no target of
+    this dialect, so the upgrade resolved a plan with nothing on this
+    provider and answered 404 to a client doing nothing wrong. The consumer
+    cannot route around it either: the LiveKit plugin builds its URL with
+    `urljoin(ws_url, "/tts/...")` and `urljoin` discards any path prefix, so
+    `/workloads/{w}/...` is unreachable from the one caller this plane exists
+    for. The surface's own `default_model` fills that hole -- and only that
+    hole: the fallback tests above prove a workload that DOES serve this
+    dialect still gets its candidate and its incumbent."""
+    tmp = tmp_path_factory.mktemp("ws-prod-default")
+    server = serve(build_app(_config(
+        ws_fake.base_url, tmp,
+        incumbent="openai.gpt-4o-mini", default_model="openai.gpt-4o-mini",
+    )))
+    try:
+        async with websockets.connect(
+            ws_url(server), additional_headers=auth(),
+        ) as ws:
+            assert ws.response.headers["x-gw-model"] == "inworld.tts-2-flash"
+            assert ws.response.headers["x-gw-served-by"].startswith("inworld/")
+            await synthesise(ws, context="prod")
+    finally:
+        server.stop()
