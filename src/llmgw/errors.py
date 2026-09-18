@@ -1051,6 +1051,18 @@ _BILLING_429_CODES: tuple[str, ...] = (
 # Anthropic's self-set usage limit arrives as a 400 with prose; no code.
 _BILLING_400_HINT = "reached your specified api usage limits"
 
+# ElevenLabs answers a bad credential with 400, not 401: the body is
+# `{"detail": {"type": "authentication_error", "code": "invalid_api_key",
+# "status": "api_key_id_used_as_api_key", ...}}` (observed live, 18 Sep 2026,
+# by pasting an API key ID where the key goes). Status alone therefore blames
+# the CLIENT for a credential that is OURS, which is the worst possible
+# misfiling: the dashboard fills with client errors while the real cause is a
+# gateway key that was never valid, no credential circuit ever opens, and a
+# fallback that would have worked is never tried. Same shape of rule as the
+# billing-as-429 table above -- the provider is signalling one thing through
+# a status that means another, and only the body says which.
+_AUTH_400_HINTS = ("authentication_error", "invalid_api_key")
+
 
 def _looks_like_billing(detail: str) -> bool:
     return any(code in detail for code in _BILLING_429_CODES)
@@ -1175,6 +1187,10 @@ def from_http_status(
         # `invalid_request_error`, so a status-only rule blames the CLIENT for
         # a stale catalog and the "our config drifted" signal simply does not
         # exist on OpenAI-shaped providers. Body first, here and only here.
+        if any(hint in etype or hint in detail for hint in _AUTH_400_HINTS):
+            return AuthenticationFailed(
+                detail or "upstream rejected the gateway's credential", **kw,
+            )
         if _BILLING_400_HINT in detail:
             return InsufficientCredits(detail, **kw)
         if _looks_like_unknown_model(detail):

@@ -23,6 +23,24 @@ from llmgw import errors as E
 # ---------------------------------------------------------------- payloads
 # Captured live. Do not "tidy" these -- the exact shape is the evidence.
 
+ELEVENLABS_BAD_KEY = (
+    b'{"detail":{"type":"authentication_error","code":"invalid_api_key",'
+    b'"message":"API key ID used as API key - only valid API keys can be used. '
+    b"API keys start with 'sk_' and are shown when the key is created or "
+    b'rotated.","status":"api_key_id_used_as_api_key",'
+    b'"param":"api_key","docs_url":"https://elevenlabs.io/docs/api-reference/'
+    b'authentication"}}'
+)
+"""ElevenLabs, 400 (not 401), 18 Sep 2026: the value in `.env` was an API key
+ID rather than the key itself."""
+
+OPENAI_BAD_PARAM = (
+    b'{"error":{"message":"unknown parameter \'foo\'.",'
+    b'"type":"invalid_request_error","param":"foo","code":null}}'
+)
+"""The control for the rule above: an ordinary 400 that really is the
+client's."""
+
 DEEPSEEK_UNKNOWN_MODEL = (
     b'{"error":{"message":"The supported API model names are deepseek-v4-pro, '
     b'deepseek-v4-flash, and deepseek-v4-flash-vision-exp, but you passed '
@@ -222,3 +240,22 @@ def test_out_of_money_on_a_429_is_a_billing_state_not_a_transient_rate_limit(bod
 def test_the_openrouter_402_still_classifies_the_same_way():
     err = E.from_http_status(402, body=OPENROUTER_INSUFFICIENT_CREDITS)
     assert isinstance(err, E.InsufficientCredits)
+
+
+def test_elevenlabs_signals_a_bad_credential_with_a_400():
+    """Captured live 18 Sep 2026 by putting an ElevenLabs API key ID where
+    the key goes. ElevenLabs answers 400, not 401, so a status-only rule
+    files a credential that is OURS under the client's errors: no credential
+    circuit opens, no fallback is tried, and the dashboard says the callers
+    are sending bad requests."""
+    err = E.from_http_status(400, body=ELEVENLABS_BAD_KEY, provider="elevenlabs")
+    assert isinstance(err, E.AuthenticationFailed)
+    assert err.blame is E.Blame.PROVIDER
+    assert err.health is E.Health.FAILURE
+
+
+def test_an_ordinary_400_is_still_the_clients():
+    """The auth rule reads the body, so it must not swallow the common case."""
+    err = E.from_http_status(400, body=OPENAI_BAD_PARAM, provider="openai")
+    assert isinstance(err, E.InvalidRequest)
+    assert err.blame is E.Blame.CLIENT
