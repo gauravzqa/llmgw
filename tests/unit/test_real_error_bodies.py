@@ -259,3 +259,26 @@ def test_an_ordinary_400_is_still_the_clients():
     err = E.from_http_status(400, body=OPENAI_BAD_PARAM, provider="openai")
     assert isinstance(err, E.InvalidRequest)
     assert err.blame is E.Blame.CLIENT
+
+
+def test_a_provider_that_signals_auth_with_400_does_not_get_to_say_400():
+    """The body rule concludes "the gateway's credential was rejected"; the
+    status must not then tell the client it sent a bad request. Passthrough
+    exists to keep the SHAPE an SDK expects, not to forward a status that
+    contradicts what we decided -- and 400 and 401 share a band while meaning
+    opposite things about whose fault it is."""
+    err = E.from_http_status(400, body=ELEVENLABS_BAD_KEY, provider="elevenlabs")
+    assert isinstance(err, E.AuthenticationFailed)
+    assert err.client_status == 401
+
+
+def test_a_real_401_or_403_still_passes_through_untouched():
+    for status in (401, 403):
+        err = E.AuthenticationFailed("no", provider="p", upstream_status=status)
+        assert err.client_status == status
+
+
+def test_passthrough_for_every_other_class_is_unchanged():
+    """The new rule is opt-in per class; nothing else may have moved."""
+    assert E.UpstreamOverloaded("x", upstream_status=529).client_status == 529
+    assert E.RateLimited("x", upstream_status=429).client_status == 429

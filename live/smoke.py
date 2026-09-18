@@ -554,6 +554,24 @@ STREAM_WORKLOADS = ("anthropic", "anthropic-identity", "deepseek", "openai",
 FALLBACK_WORKLOADS = ("fallback", "fallback-schema")
 
 
+
+def _missing_key_for(model_id: str, catalog: Catalog) -> str | None:
+    """The env var this model's provider needs and does not have, or None.
+
+    Reads the requirement off the catalog row rather than a list here, so a
+    provider added to the catalog cannot be silently exercised without its
+    key -- or silently skipped once it has one.
+    """
+    try:
+        target = catalog.resolve(model_id)
+    except Exception:  # noqa: BLE001 - an unroutable id is the caller's problem
+        return None
+    name = getattr(target.provider, "api_key_env", None)
+    if not name:
+        return None
+    return None if os.environ.get(name) else name
+
+
 def echo_roundtrip(gw: GatewayServer, *, out=sys.stdout) -> None:
     """The two-turn loop against a real provider (PLAN-2 A1, finding 42).
 
@@ -1199,6 +1217,10 @@ def run(*, spend: bool = True, out=sys.stdout) -> list[Measured]:
                 return results
 
             for wl in STREAM_WORKLOADS:
+                missing = _missing_key_for(MODEL_OF[wl], catalog)
+                if missing is not None:
+                    print(f"  {wl}/stream: SKIP (no {missing})", file=out)
+                    continue
                 results.append(measure(gw, wl, stream=True, catalog=catalog,
                                        model_id=MODEL_OF[wl]))
             for wl in ("anthropic", "anthropic-identity"):
@@ -1328,7 +1350,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     for status in env.ensure_loaded():
         print(f"  {status}", file=sys.stderr)
-    env.require("ANTHROPIC_API_KEY", "OPENROUTER_API_KEY", "DEEPSEEK_API_KEY")
+    # Only what every run needs. A provider whose key is absent is SKIPPED
+    # per workload below rather than refusing the whole run: the point of
+    # this harness is to exercise the providers you actually have, and
+    # demanding a key for one you do not have makes it exercise none of them.
+    env.require("ANTHROPIC_API_KEY", "DEEPSEEK_API_KEY")
     run(spend=not args.no_spend)
     return 0
 

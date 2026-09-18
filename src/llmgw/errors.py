@@ -135,6 +135,11 @@ class GatewayError(Exception):
     """Status shown to the client when we have nothing better to pass through."""
 
     passthrough: bool = False
+    passthrough_statuses: frozenset[int] | None = None
+    """Upstream statuses this class will forward, when passthrough is on.
+    None means "any status in the same hundreds band". A class sets this when
+    its band contains a status that would tell the client the opposite thing:
+    see `AuthenticationFailed`."""
     """True when the upstream's own status and body should reach the client
     verbatim once no fallback remains. We do not improve on a provider's error
     message; the caller's SDK knows how to read it and we do not."""
@@ -185,10 +190,37 @@ class GatewayError(Exception):
 
     @property
     def client_status(self) -> int:
-        """What the client actually gets."""
-        if self.passthrough and self.upstream_status is not None:
+        """What the client actually gets.
+
+        Passthrough forwards the provider's status because its shape is the
+        one the caller's SDK already handles -- but only while that status
+        agrees with what we concluded. A provider that signals an auth
+        failure through some OTHER status has already told the client the
+        wrong thing once: ElevenLabs answers a bad credential with 400
+        (`captures`/`test_real_error_bodies`), and forwarding that means the
+        caller is told it sent a bad request when in fact the GATEWAY's key
+        was rejected. That is the same misfiling the body rule exists to
+        prevent, one layer up, so a classification that overrode the status
+        keeps its own.
+        """
+        if (self.passthrough and self.upstream_status is not None
+                and self._status_agrees(self.upstream_status)):
             return self.upstream_status
         return self.status
+
+    def _status_agrees(self, upstream: int) -> bool:
+        """True when the provider's status still says what we concluded.
+
+        A class that names `passthrough_statuses` is forwarded only for
+        those; everything else falls back to the same hundreds band, which
+        is all that was ever needed while providers used the status the
+        error meant. 400 and 401 share a band and mean opposite things about
+        whose fault it is, which is exactly the case this exists for.
+        """
+        allowed = self.passthrough_statuses
+        if allowed is not None:
+            return upstream in allowed
+        return upstream // 100 == self.status // 100
 
     def health_key(self) -> tuple[str, str]:
         """The dictionary key this error's health signal is recorded under.
@@ -640,6 +672,12 @@ class AuthenticationFailed(GatewayError):
     try_next = True
     health_scope = HealthScope.CREDENTIAL
     passthrough = True
+    passthrough_statuses = frozenset({401, 403})
+    """A provider may pick either for a rejected credential and both are the
+    shape an SDK expects. Anything else is NOT forwarded: ElevenLabs answers
+    a bad key with 400, and forwarding that tells the caller it sent a bad
+    request when the truth is that the gateway's own key was rejected -- the
+    same misfiling the 400 body rule exists to undo."""
     status = 401
 
 
