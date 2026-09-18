@@ -474,3 +474,201 @@ finished turn, not a failure: outcome `completed`, stop reason `length` or
 `response_failed_is_forwarded_and_nothing_follows`,
 `error_event_is_forwarded_and_nothing_follows`, `incomplete_is_length`),
 `tests/unit/test_responses_surface.py`.
+
+## C23. A WebSocket session is a stream
+
+Everything the request path does to a request, the socket path does to an
+upgrade, in the same order and with the same refusals (PLAN-G 5). A socket
+takes the process in-flight slot (`LLMGW_MAX_STREAMS`, so the Nth+1 caller
+gets the same 503 whichever plane it arrives on) and `llmgw_streams_open`; it
+resolves a tenant, takes an admission permit for its whole life, takes a
+SESSION permit against `max_sessions` — a relayed session and a minted
+credential are both sessions, because the provider does not care which door
+they came through (C19 widened) — takes a provider-key permit, and holds a
+ticket on both the target's circuit and the credential's.
+
+Every refusal before the 101 is a real HTTP response with the existing error
+body and the existing status: 401 `unauthenticated`, 400 `policy_error`, 429
+`concurrency_rejected` / `admission_rejected`, 503 `draining` / `overloaded`
+with `Retry-After: 1`, and 502/503/504 by taxonomy when no target would
+accept an upgrade. Never a 101 followed by a close: an SDK that has been
+accepted and then dropped has no status to raise, and the LiveKit plugins
+already handle an HTTP status on the upgrade.
+
+The tenant credential is read under the scheme set the ROUTE declares, not a
+fixed one. Inworld's plugins send `Authorization: Basic <token>` built from
+one environment variable; AssemblyAI's sends the bare key; only OpenAI's
+sends Bearer. A `Basic` token is compared verbatim and never base64-decoded —
+it is a gateway-issued opaque string that the plugin happens to wrap.
+
+`X-Gw-*` ride on the 101: Policy, Catalog, Model, Workload, Served-By,
+Attempts, Tenant, Breaker, Upstream-Request-Id when the provider sent one,
+plus `X-Gw-Session-Id` (the capture record's key) and `X-Gw-Body-Modified`.
+Under **accept-then-relay** (Inworld TTS, where the provider says nothing
+unprompted and the routing input arrives in the first client FRAME)
+`X-Gw-Served-By` and `X-Gw-Model` name the target the socket was OPENED
+TOWARD, and `X-Gw-Body-Modified: 1` is a WARRANT rather than a report — the
+101 precedes the frame it would describe. The capture record is the final
+word on both: it names the model the frame asked for and the price applied.
+
+*Enforced by:* `tests/contract/test_ws_inworld_tts.py`
+(`the_101_carries_the_gateway_headers`, `bearer_is_accepted_as_well_as_basic`,
+`a_bad_tenant_token_is_a_401_with_the_usual_body`,
+`admission_refuses_at_429_with_the_tenants_own_number`,
+`max_sessions_counts_a_relayed_socket`,
+`sockets_count_toward_max_streams_and_shed_the_next_request`,
+`the_workload_twin_is_mounted`), `tests/unit/test_ws_clocks.py`.
+
+A `create` whose `modelId` resolves onto a DIFFERENT provider than the socket
+was opened to is refused: close **4907** `llmgw:policy_error`. The socket is
+already held against one provider's credential and concurrency, and serving
+another provider's model over it would bill a target that never saw the
+frame. A caller that needs a second provider opens a second socket.
+
+## C24. Commitment on a socket is per unit, and content is never replayed
+
+The unit of commitment is the product's own: a context for Inworld TTS, a
+response or a completed transcription item for OpenAI Realtime, the session
+for Inworld STT and AssemblyAI. The flag is set BEFORE the await that writes
+the committing frame to the client, the `pump.py` rule, because a send that
+raises may still have delivered a prefix. The first commitment on a socket
+commits the SOCKET: the two directions share one upstream connection, so a
+second target would splice a second provider's answers into a conversation
+the client is already reading.
+
+Before commitment a handshake failure may walk the plan — connect, upgrade
+status, a fatal first-frame error, a handshake-budget breach — with the same
+tickets, permits and dispositions an HTTP attempt uses. What may be replayed
+to the next target is the **config prefix** only: the first config frame per
+context (`create`, `transcribeConfig`, `session.update`), capped at 64 KiB.
+Content is never replayed and never buffered for replay. A failure after the
+first CONTENT frame has been forwarded upstream is a session failure even
+though nothing has come back, because replaying audio or text to a second
+provider bills the tenant twice for one utterance and can produce two
+different answers to it. After commitment, `decide(err, committed=True)`
+applies unchanged: no retry, no next target, outcome INTERRUPTED, usage so
+far recorded `estimated` (C3).
+
+*Enforced by:* `tests/contract/test_ws_inworld_tts.py`
+(`a_dead_candidate_falls_back_to_the_incumbent_before_the_101`,
+`both_targets_dead_is_a_502_naming_the_last_failure`),
+`tests/unit/test_ws_frames.py` (`only_create_is_the_replayable_config_prefix`).
+
+## C25. A failure after the 101 is a close code, never a frame
+
+Once the client has been accepted there are exactly two ways to end a
+session, and inventing a frame is not one of them. The gateway's own verdicts
+are close codes **4900–4999** with reason `llmgw:<code>`, where `<code>` is
+an `errors.ERROR_CODES` value so a client may switch on either:
+
+| code | meaning | default reason |
+|---|---|---|
+| 4900 | the process is draining | `llmgw:session_draining` |
+| 4901 | `Budgets.session_total` expired | `llmgw:total_deadline_exceeded` |
+| 4902 | the provider stopped producing | `llmgw:stall_timeout` / `llmgw:first_event_timeout` |
+| 4903 | the client stopped reading for `client_stall` | `llmgw:client_too_slow` |
+| 4904 | the upstream ended or failed mid-session | `llmgw:upstream_disconnected` |
+| 4905 | a frame exceeded `max_frame_bytes` | `llmgw:frame_too_large` |
+| 4906 | nothing in either direction for `Budgets.idle` | `llmgw:session_idle` |
+| 4907 | the upstream session could not be established | the error's own code |
+
+A provider's close passes through with ITS code and ITS reason, byte for
+byte: a client that sees 1000 after an Inworld `error` frame is seeing what
+the provider did, and translating it to a 49xx would tell that client the
+GATEWAY refused it. Nothing else is ever emitted. The gateway never
+synthesises a provider-shaped frame to report a gateway problem — the
+client's state machine reads every frame as the provider's, so an invented
+`{"error": …}` fails the wrong contexts, records the wrong blame and can send
+a plugin reconnecting at a provider that is perfectly healthy. For the same
+reason the gateway does not police the provider's own limits: a sixth Inworld
+context and a `send_text` over 2,000 characters are RELAYED, and Inworld
+answers each with a `result.status` naming the one context it refused.
+
+The range is clear of every provider code observed or documented (1000/1001/
+1006/1008/1009/1011, AssemblyAI 3005–3009 and 410, OpenAI 4000, ElevenLabs
+4300), so 49xx means "the gateway" with no ambiguity.
+
+*Enforced by:* `tests/contract/test_ws_inworld_tts.py`
+(`a_fatal_provider_error_and_close_pass_through_untranslated`,
+`a_provider_stall_closes_4902`, `a_socket_that_says_nothing_is_closed_4906…`,
+`a_slow_client_is_closed_4903_with_bounded_memory`,
+`the_sixth_context_is_answered_by_the_provider_not_the_gateway`,
+`text_over_two_thousand_characters_is_relayed_not_policed`),
+`tests/unit/test_ws_frames.py`.
+
+**One exception, and it is the only edit the relay makes to a provider's
+bytes.** A provider row marked `scrub_error_bodies="all"` writes fragments of
+the GATEWAY's own credential into its error text: Inworld's code-7 message
+quotes the first four characters of the API key (`captures-ws` probe 2b).
+Relaying that frame untouched would make this plane the one place a tenant
+can read the gateway's key back, while the HTTP twin has scrubbed the same
+body since Phase B. So the frame is REPLACED, never dropped and never
+invented: it is still JSON, it still has `error`, it keeps the provider's own
+`code`, `status` and `contextId`, and only the free-text `message` and
+`details` are swapped for a fixed sentence saying the gateway withheld them.
+A client's error handling sees the shape it expects and can still tell an
+auth failure from a bad argument. The provider's real text is on the capture
+record, which is ours. `Frame.replace_json` is the only constructor for this,
+so grepping it gives the complete list of rewrites.
+
+## C26. A drain winds sessions down; it does not wait for them
+
+A socket cannot be drained the way a request is, by waiting for it to finish,
+because it was never going to finish: a TTS connection is idle between
+utterances and a transcription session ends when the speaker stops. So
+`begin_drain` flips `draining` (new upgrades get 503) and then, before it
+awaits anything, calls `Session.drain()` on every open session. Each session
+forwards the provider's OWN terminate where the protocol has one
+(`closeStream`, `Terminate`), waits at most `LLMGW_WS_DRAIN_WAIT` (20 s) for
+the answer that carries the billing number, and closes the client **4900**.
+Inworld TTS has no session terminate, so it waits for open contexts to reach
+zero and closes 4900 at `drain_grace - ws_drain_wait_s` if they do not; the
+plugin fails those contexts and re-synthesises on a fresh socket, which is
+what it already does for a provider-side disconnect. The two windows are
+different on purpose: contexts get most of the grace, because an idle pooled
+socket has none open and closes at once, so that window is only ever spent
+on audio actually being synthesised, while `ws_drain_wait_s` reserves the
+tail after the client is gone for the terminate and its meter.
+
+`Budgets.session_total` MAY exceed the drain grace and does not enter
+`PolicySnapshot.largest_total()`: a three-hour session is normal and is
+handled by the hook, not by refusing to start. The arithmetic that is
+checked is `ws_drain_wait_s <= drain_grace_seconds`. A session longer than
+the grace is reported at INFO at startup.
+
+Output on this path is bounded, not per session: uvicorn's two
+per-connection INFO lines are filtered alongside its C2-ending line, because
+three hundred sockets closing in the same instant is twelve hundred lines
+into a pipe nobody is draining and a process that cannot finish writing
+cannot exit (finding 41).
+
+*Enforced by:* `tests/contract/test_ws_inworld_tts.py`
+(`drain_closes_4900_once_the_contexts_are_gone_and_cuts_nothing`,
+`drain_gives_up_on_a_context_that_will_not_close`,
+`a_new_upgrade_during_a_drain_is_a_503`),
+`tests/chaos/test_ws_invariants.py`, `tests/unit/test_lifecycle.py`.
+
+## C27. A session's units are exact only from a provider meter
+
+One `CaptureRecord` per session at close, `kind="session"`, `request_id` =
+`X-Gw-Session-Id`, priced by `accounting.account_usage` — the same dot
+product the HTTP plane uses, so a character costs the same number on both.
+`basis` is `exact` only when the provider's own meter arrived:
+`audioChunk.usage.processedCharactersCount` summed across flushes (Inworld
+TTS; the count is on the FIRST chunk of each flush and 0 after, so it is a
+sum and neither a first nor a last read), `result.usage.transcribedAudioMs`
+after `closeStream` (Inworld STT), `response.done.response.usage` (OpenAI),
+`Termination.session_duration_seconds` (AssemblyAI).
+
+Otherwise the record is `estimated` and `cost_notes` names the derivation in
+words — "characters estimated from relayed send_text text", "seconds derived
+from relayed audio bytes", "contexts=N", and, where a deprecated client id
+resolved through an alias, which row's price was applied. A bill that cannot
+say how it was computed is a bill that cannot be defended, and an estimate
+labelled exact is worse than an obvious estimate because it gets billed.
+
+*Enforced by:* `tests/contract/test_ws_inworld_tts.py`
+(`one_utterance_relays_byte_identical_audio_and_an_exact_meter`,
+`three_contexts_interleave_and_each_is_metered`),
+`tests/unit/test_ws_frames.py` (`usage_sums_across_flushes…`),
+`live/smoke_ws.py`.

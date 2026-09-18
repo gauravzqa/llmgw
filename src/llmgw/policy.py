@@ -126,6 +126,10 @@ life) the birthday bound is not close.
 """
 
 _BUDGET_KEYS = frozenset(f.name for f in dataclasses.fields(Budgets))
+_NULLABLE_BUDGET_KEYS = frozenset({"liveness", "session_total", "idle"})
+"""Budget keys a policy file may set to `null` to mean "no such bound".
+Every other key is a number of seconds; a `null` there is a typo, and
+silently accepting it would disable a clock somebody meant to tighten."""
 _WORKLOAD_KEYS = frozenset({
     "incumbent", "candidate", "budgets", "retry", "profile", "request_defaults",
 })
@@ -572,6 +576,14 @@ class PolicySnapshot:
         every stream this policy can start, including one under a profile
         nobody has attached to a workload yet. `server/config.py` validates
         the drain grace against this number, not only the global default.
+
+        `Budgets.session_total` is deliberately NOT considered (PLAN-G 4.3).
+        The inequality this number feeds is about per-unit totals -- a
+        request that cannot finish inside the grace is cut on every deploy --
+        and a WebSocket session is not a unit: it is drained by
+        `Session.drain()` inside `ws_drain_wait_s`, which `config.py` checks
+        separately. Folding a 3 h `stt_session` in here would refuse startup
+        for a socket the drain hook handles in twenty seconds.
         """
         totals = [w.budgets.total for w in self.workloads.values()]
         totals.extend(b.total for b in self.profiles.values())
@@ -959,7 +971,7 @@ def _budgets_from(
     _reject_unknown(overrides, _BUDGET_KEYS, f"[{where}.budgets]")
     values: dict[str, Any] = {}
     for key, value in overrides.items():
-        if key == "liveness" and value is None:
+        if key in _NULLABLE_BUDGET_KEYS and value is None:
             values[key] = None
             continue
         if isinstance(value, bool) or not isinstance(value, (int, float)):

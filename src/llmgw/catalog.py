@@ -60,7 +60,7 @@ from typing import Any, Literal
 
 ProviderKind = Literal["openai", "anthropic"]
 
-AuthScheme = Literal["bearer", "x-api-key", "raw", "header"]
+AuthScheme = Literal["bearer", "x-api-key", "raw", "header", "basic"]
 """How the provider wants its credential (PLAN-2 B2).
 
 `bearer`: `Authorization: Bearer <key>` (OpenAI, DeepSeek, OpenRouter, and
@@ -399,10 +399,17 @@ PROVIDERS: dict[str, ProviderConn] = {
         kind="openai",
         base_url="https://api.inworld.ai",
         api_key_env="INWORLD_API_KEY",
-        # Bearer behaves identically to the documented Basic form (verified
-        # live 2026-09-16). The key is reversible base64 and the 403 body
-        # reflects its first four characters, so EVERY non-2xx body is
-        # replaced by the gateway's own (C11 widened, PLAN-2 B2).
+        # Basic, because the WebSocket plane has no choice: `Authorization:
+        # Basic <key>` is the ONLY credential form Inworld's upgrade accepts
+        # (`?key=` is read as no credential at all, captures-ws probe 2a) and
+        # it is exactly what the LiveKit plugin sends. On HTTP the two forms
+        # behave identically (verified live 2026-09-16), so switching the row
+        # changes the bytes on the wire and nothing else -- the Phase D voice
+        # surfaces and the Inworld HTTP live smoke are unaffected. The key is
+        # reversible base64 and the 403 body reflects its first four
+        # characters, so EVERY non-2xx body is replaced by the gateway's own
+        # (C11 widened, PLAN-2 B2).
+        auth_scheme="basic",
         scrub_error_bodies="all",
         max_concurrency=16,
     ),
@@ -843,6 +850,15 @@ MODELS: dict[str, ModelSpec] = {
             id="inworld.tts-2",
             provider="inworld",
             api_model="inworld-tts-2",
+            # `inworld-tts-1.5-max` is the LiveKit plugin's OWN default
+            # (`inworld/tts.py:55 DEFAULT_MODEL`), so any Layrs call site
+            # that constructs `inworld.TTS()` without naming a model sends
+            # it -- and on the WebSocket plane the `create` frame is the
+            # only thing that can name a target, so an unaliased id is a
+            # closed socket rather than a fallback. 1.5-max is the higher
+            # tier of the deprecated pair, so it lands on `tts-2` while
+            # 1.5-mini lands on `tts-2-flash`.
+            aliases=("inworld-tts-1.5-max",),
             input_per_m=25.0,
             output_per_m=0.0,
             unit="characters",
@@ -856,6 +872,17 @@ MODELS: dict[str, ModelSpec] = {
             id="inworld.tts-2-flash",
             provider="inworld",
             api_model="inworld-tts-2-flash",
+            # PLAN-G R10. Layrs' LiveKit plugin sends `inworld-tts-1.5-mini`
+            # in its `create.modelId` (harness/config.py:84) and the plugin
+            # drops any path prefix, so the socket's own first frame is the
+            # ONLY thing that can name a target: without this alias every
+            # relayed TTS session is a 400 before it starts. 1.5-mini is
+            # deprecated and Inworld auto-routes it; -2-flash is the current
+            # mini-equivalent tier, so the alias lands here rather than on
+            # `inworld.tts-2`. The price basis differs from Layrs' own
+            # per-minute table, which is why a session priced through the
+            # alias carries a `cost_notes` line saying so.
+            aliases=("inworld-tts-1.5-mini",),
             input_per_m=15.0,
             output_per_m=0.0,
             unit="characters",

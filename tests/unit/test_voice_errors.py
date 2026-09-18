@@ -52,7 +52,10 @@ def test_inworld_401_and_403_are_credential_failures_by_default():
 def test_inworld_provider_row_scrubs_every_error_body():
     row = DEFAULT_CATALOG.providers["inworld"]
     assert row.scrub_error_bodies == "all"
-    assert row.auth_scheme == "bearer" and row.forbidden_means == "auth"
+    # `basic` since PLAN-G G1: the WebSocket upgrade accepts nothing else
+    # (captures-ws probe 2a), and on HTTP the two forms are identical
+    # (verified live 2026-09-16), so the switch is invisible to Phase D.
+    assert row.auth_scheme == "basic" and row.forbidden_means == "auth"
 
 
 def test_inworld_other_400s_stay_invalid_request():

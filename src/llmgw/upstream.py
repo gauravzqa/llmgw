@@ -338,14 +338,17 @@ def join_url(base_url: str | None, path: str, *, prefix: str | None = None) -> s
     return base + tail
 
 
-AUTH_SCHEMES: tuple[str, ...] = ("bearer", "x-api-key", "raw", "header")
+AUTH_SCHEMES: tuple[str, ...] = ("bearer", "x-api-key", "raw", "header", "basic")
 """How a provider wants its credential (PLAN-2 B2). `bearer` is
 `Authorization: Bearer <key>` (OpenAI, DeepSeek, OpenRouter, Inworld);
 `x-api-key` is Anthropic's header plus `anthropic-version`; `raw` is the bare
 key in `Authorization` with no scheme word (AssemblyAI); `header` is a named
 header carrying the key (`ProviderConn.auth_header`, ElevenLabs'
-`xi-api-key`). Read off the catalog row; a row without the field gets the
-scheme its `kind` implied before the field existed."""
+`xi-api-key`); `basic` is `Authorization: Basic <key>` with the key used AS
+the credentials string -- Inworld's portal key is already the base64 of
+`id:secret`, so this scheme must NOT re-encode it. Read off the catalog row;
+a row without the field gets the scheme its `kind` implied before the field
+existed."""
 
 
 def auth_scheme_of(provider: ProviderConn) -> tuple[str, str | None]:
@@ -422,6 +425,13 @@ def build_headers(
         headers["authorization"] = key
     elif scheme == "header":
         headers[auth_header or ""] = key
+    elif scheme == "basic":
+        # NOT base64(key): the value a Basic-auth provider hands out is
+        # already the encoded `id:secret` pair (Inworld's portal key is 76
+        # characters of base64), and encoding it a second time produces a
+        # credential the provider reads as garbage. The scheme word is the
+        # only thing added.
+        headers["authorization"] = f"Basic {key}"
     else:
         headers["authorization"] = f"Bearer {key}"
     # Provider extras then per-request extras, both last so an operator can

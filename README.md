@@ -53,6 +53,28 @@ billed in seconds). OpenAI and Inworld paths are exercised against the real
 providers; ElevenLabs and AssemblyAI are contract-tested against fakes built
 from their documented shapes only, because no keys for them exist here.
 
+Since PLAN-G G1 there is a second data plane, on the same process and the
+same admission: `GET /tts/v1/voice:streamBidirectional` (and its
+`/workloads/<w>/` twin) accepts a WebSocket upgrade and relays an Inworld TTS
+session frame for frame. It is the transport Layrs actually runs -- the
+LiveKit Inworld plugin never touches the HTTP paths above -- so pointing that
+plugin's `ws_url` at the gateway is the whole integration. A socket is a
+stream: it takes the same tenant permit, the same per-credential cap, the
+same `LLMGW_MAX_STREAMS` slot and the same breaker tickets, and every refusal
+before the 101 is the ordinary HTTP error body with the ordinary status
+(C23). The tenant token arrives as `Authorization: Basic <token>`, which is
+what the plugin sends. After the 101 a failure is a close code in 4900-4999
+with reason `llmgw:<code>` and a provider's own close passes through
+untranslated (C25); commitment is per context and content is never replayed
+to a second target (C24); a deploy closes each session 4900 once its contexts
+are gone (C26); and the session's characters are billed from
+`audioChunk.usage.processedCharactersCount`, summed across flushes, exact
+(C27). The only byte the gateway edits is `create.modelId`, rewritten to the
+target's wire id and announced as `X-Gw-Body-Modified` on the 101 -- which is
+what lets the plugin keep sending the deprecated `inworld-tts-1.5-mini` it
+sends today. Inworld STT, OpenAI Realtime and AssemblyAI streaming land in
+G2-G4 on the same relay.
+
 Verified against real providers: streaming chat, streaming tool calls with a
 second-turn round trip, reasoning passthrough, vision, JSON mode, mid-stream
 cancellation, and error classification, on Anthropic, OpenAI and DeepSeek.

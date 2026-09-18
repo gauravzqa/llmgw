@@ -126,15 +126,55 @@ this one message and nothing else; uvicorn's other errors, including the
 reach the log."""
 
 
-class _NotAnErrorHere(logging.Filter):
-    """Drop uvicorn's `_C2_ENDING_MESSAGE`; pass everything else."""
+_WS_CONNECTION_LINES = frozenset({"connection open", "connection closed"})
+"""The `websockets` library's own per-connection INFO lines, which uvicorn
+routes onto `uvicorn.error` (it hands `ServerProtocol` that logger).
+
+Two lines per socket, and per-socket output on this plane is the same
+hazard as per-stream output on the HTTP one. The socket plane makes it
+worse in two ways the S8-B finding did not have to consider: a session
+lasts minutes rather than milliseconds, so the count of them a process
+holds is far higher, and a mass disconnect ends all of them in the SAME
+instant -- three hundred sockets is twelve hundred lines of "connection
+closed" into a pipe nobody is draining, and the process that cannot finish
+writing them cannot exit (finding 41).
+
+Nothing is lost by dropping them. "A socket opened and closed" is exactly
+what `llmgw_ws_sessions_open`, `llmgw_ws_close_total` and the session's own
+capture record say, with the tenant, the target, the close code, the units
+and the cost attached."""
+
+_WS_ACCESS_PREFIX = '%s - "WebSocket '
+"""uvicorn's own per-upgrade access-shaped line, matched on the FORMAT
+string rather than the formatted message so the filter costs no string
+interpolation on a line it is about to discard."""
+
+
+class _BoundedShutdownOutput(logging.Filter):
+    """Keep stderr's volume independent of the number of open connections.
+
+    Drops exactly three things: uvicorn's name for a C2 ending, and the two
+    per-WebSocket-connection lines above. Everything else -- including the
+    `Cancel N running task(s)` line that says the grace was too short, and
+    every real error -- reaches the log untouched.
+
+    The rule this enforces is the one finding 41 actually established, which
+    is narrower and more useful than "log less": output on a shutdown path
+    must not SCALE with the number of things being shut down. A summary line
+    is free; a line per connection is a pipe that fills.
+    """
 
     def filter(self, record: logging.LogRecord) -> bool:
+        message = str(record.msg)
+        if message.startswith(_WS_ACCESS_PREFIX):
+            return False
+        if message in _WS_CONNECTION_LINES:
+            return False
         return record.getMessage() != _C2_ENDING_MESSAGE
 
 
 def _quiet_c2_endings() -> None:
-    """Install `_NotAnErrorHere` on `uvicorn.error`, once.
+    """Install `_BoundedShutdownOutput` on `uvicorn.error`, once.
 
     Called from `serve()` AFTER `uvicorn.Config` has run its `dictConfig`,
     which replaces handlers but leaves filters added to the logger object
@@ -144,7 +184,7 @@ def _quiet_c2_endings() -> None:
     logging.getLogger("uvicorn.error").addFilter(_C2_FILTER)
 
 
-_C2_FILTER = _NotAnErrorHere()
+_C2_FILTER = _BoundedShutdownOutput()
 
 
 def bind_sockets(host: str, port: int, *, backlog: int = 2048) -> list[socket.socket]:
@@ -206,6 +246,41 @@ async def serve(config: ServerConfig) -> DrainReport | None:
         # Our drain owns the real wait (the grace); this only has to be long
         # enough for the leftovers' native endings to flush. See the constant.
         timeout_graceful_shutdown=UVICORN_SHUTDOWN_TIMEOUT_S,
+        # ---- the WebSocket plane (PLAN-G 1.1) -----------------------------
+        # PINNED, not auto-selected. `ws="auto"` picks the sansio impl when
+        # `websockets` is importable and the legacy one otherwise, so the
+        # protocol the drain tests ran against would depend on what else was
+        # installed in the image. The sansio implementation is also the only
+        # one with a future: uvicorn's `websockets_impl.py` imports
+        # `websockets.legacy.*`, deprecated since websockets 14 and slated
+        # for removal, while `websockets_sansio_impl.py` builds on
+        # `websockets.server.ServerProtocol`.
+        #
+        # It is also the implementation that carries the
+        # `websocket.http.response` extension, which is what makes a pre-101
+        # refusal a real HTTP response with the gateway's own error body
+        # (C23) instead of Starlette's default close 1008 before accept.
+        ws="websockets-sansio",
+        # One inbound frame may not exceed the frame bound the rest of the
+        # gateway already enforces. Without it `websockets` defaults to 1 MiB
+        # anyway, but the number would be the library's rather than the
+        # operator's, and `LLMGW_MAX_FRAME_BYTES` would silently not apply to
+        # the plane whose frames are biggest.
+        ws_max_size=config.max_frame_bytes,
+        # OFF. Both the audio the TTS plane carries and the base64 the STT
+        # plane carries compress poorly for the CPU they cost on a
+        # shared-cpu-1x, and per-message deflate keeps a compression context
+        # per socket -- tens of KiB of resident memory multiplied by
+        # `max_streams`, against a proxy whose whole job is to add neither
+        # latency nor memory. Measured in S9 before it is ever turned on.
+        ws_per_message_deflate=False,
+        # Ping defaults (20 s interval, 20 s timeout) are left exactly as
+        # uvicorn ships them. They are TRANSPORT liveness and nothing else:
+        # Inworld never pings and never closes a healthy socket, so the only
+        # thing that reclaims an abandoned session is the gateway's own
+        # `idle` budget (clocks.Budgets.idle), which pings deliberately do
+        # not reset. Their real job here is to keep an intermediary's idle
+        # timer -- Fly's proxy on `.flycast` -- from cutting a live socket.
     )
     server = _DrainingServer(uconfig)
     sockets = bind_sockets(config.host, config.port)

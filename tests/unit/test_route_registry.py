@@ -90,7 +90,10 @@ def test_the_responses_route_is_mounted_in_both_forms():
     from llmgw.server.config import ServerConfig
 
     app = app_module.build_app(ServerConfig())
-    mounted = {(r.path, tuple(sorted(r.methods or ()))) for r in app.routes}  # type: ignore[attr-defined]
+    # HTTP routes only: PLAN-G mounts `WebSocketRoute`s on the same app and
+    # a websocket route has no methods (the scope type is what selects it).
+    mounted = {(r.path, tuple(sorted(r.methods or ())))
+               for r in app.routes if hasattr(r, "methods")}  # type: ignore[attr-defined]
     assert ("/v1/responses", ("POST",)) in mounted
     assert ("/workloads/{workload}/v1/responses", ("POST",)) in mounted
     names = {r.name for r in app.routes}  # type: ignore[attr-defined]
@@ -141,7 +144,10 @@ def test_build_app_mounts_every_registry_route_with_its_methods_and_the_workload
     from llmgw.server.config import ServerConfig
 
     app = app_module.build_app(ServerConfig())
-    mounted = {(r.path, tuple(sorted(r.methods or ()))) for r in app.routes}  # type: ignore[attr-defined]
+    # HTTP routes only: PLAN-G mounts `WebSocketRoute`s on the same app and
+    # a websocket route has no methods (the scope type is what selects it).
+    mounted = {(r.path, tuple(sorted(r.methods or ())))
+               for r in app.routes if hasattr(r, "methods")}  # type: ignore[attr-defined]
     for surface in REGISTRY:
         declared = surface_methods(surface)
         methods = tuple(sorted({*declared, "HEAD"} if "GET" in declared else declared))

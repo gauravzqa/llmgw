@@ -563,6 +563,13 @@ PHASE_C_SURFACES = {"models", "count_tokens", "embeddings", "realtime_control",
                     "assemblyai_token"}
 VOICE_SURFACE_NAMES = {"audio_speech", "audio_transcription", "inworld_tts",
                        "elevenlabs_tts", "assemblyai_sync"}
+WS_SURFACE_NAMES = {"inworld_tts_ws", "inworld_stt_ws", "openai_realtime",
+                    "assemblyai_streaming", "elevenlabs_tts_ws"}
+"""PLAN-G: the socket plane's names live in `metrics.SURFACES` but never in
+the HTTP `REGISTRY` -- a WebSocket route is built from `llmgw.ws.WS_REGISTRY`
+and mounted as a `WebSocketRoute`, so `for_path` cannot and must not find
+one. They are listed here so the closed-set assertion below stays an
+assertion rather than a wildcard."""
 """Phase C's surfaces. Their names join `metrics.SURFACES` in the same
 change that adds the voice names (Phase D, another file); until then the
 server emits no surface-labelled metric for them rather than raising."""
@@ -596,7 +603,7 @@ def test_the_registry_is_a_closed_set_keyed_by_the_metrics_label():
     assert names - set(metrics.SURFACES) <= PHASE_C_SURFACES | voice
     assert "openai_responses" in names and "openai_responses" in metrics.SURFACES
     ahead = set(metrics.SURFACES) - names
-    assert ahead <= VOICE_SURFACE_NAMES | PHASE_C_SURFACES, ahead
+    assert ahead <= VOICE_SURFACE_NAMES | PHASE_C_SURFACES | WS_SURFACE_NAMES, ahead
 
 
 # ============================================================ Phase B3 kinds

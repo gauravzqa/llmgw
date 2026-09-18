@@ -190,6 +190,61 @@ class Collectors:
             surface=self._one_of(surface, M.SURFACES, "surface", m),
         ).dec()
 
+    # ---- the socket plane (PLAN-G 7.3) -------------------------------------
+    #
+    # Five families, one method each, and every one of them is called from a
+    # `finally` or from a place that cannot raise into the relay: a metric
+    # that can fail a session is worse than a metric that is missing.
+
+    def ws_session_open(self, *, surface: str) -> None:
+        """`llmgw_ws_sessions_open` += 1. Paired with `ws_session_close`."""
+        m = "llmgw_ws_sessions_open"
+        self._by_name[m].labels(  # type: ignore[attr-defined]
+            surface=self._one_of(surface, M.SURFACES, "surface", m),
+        ).inc()
+
+    def ws_session_close(self, *, surface: str) -> None:
+        """`llmgw_ws_sessions_open` -= 1. The other half of the pair."""
+        m = "llmgw_ws_sessions_open"
+        self._by_name[m].labels(  # type: ignore[attr-defined]
+            surface=self._one_of(surface, M.SURFACES, "surface", m),
+        ).dec()
+
+    def ws_bytes(self, *, surface: str, direction: str, n: int) -> None:
+        """`llmgw_ws_bytes_total`. `n` is bytes on the wire, after framing."""
+        if n <= 0:
+            return
+        m = "llmgw_ws_bytes_total"
+        self._by_name[m].labels(  # type: ignore[attr-defined]
+            surface=self._one_of(surface, M.SURFACES, "surface", m),
+            direction=self._one_of(direction, M.WS_DIRECTIONS, "direction", m),
+        ).inc(n)
+
+    def ws_close(self, *, surface: str, side: str, code_class: str) -> None:
+        """`llmgw_ws_close_total`. `code_class` comes from
+        `llmgw.ws.errors.close_code_class`, never from a raw code."""
+        m = "llmgw_ws_close_total"
+        self._by_name[m].labels(  # type: ignore[attr-defined]
+            surface=self._one_of(surface, M.SURFACES, "surface", m),
+            side=self._one_of(side, M.WS_CLOSE_SIDES, "side", m),
+            code_class=self._one_of(code_class, M.WS_CLOSE_CLASSES, "code_class", m),
+        ).inc()
+
+    def ws_inband_error(self, *, surface: str, fatal: bool) -> None:
+        """`llmgw_ws_inband_errors_total`: one provider error FRAME."""
+        m = "llmgw_ws_inband_errors_total"
+        self._by_name[m].labels(  # type: ignore[attr-defined]
+            surface=self._one_of(surface, M.SURFACES, "surface", m),
+            fatal="true" if fatal else "false",
+        ).inc()
+
+    def ws_session_seconds(self, *, surface: str, seconds: float) -> None:
+        """`llmgw_ws_session_seconds`: one session's lifetime, at its close."""
+        m = "llmgw_ws_session_seconds"
+        self._by_name[m].labels(  # type: ignore[attr-defined]
+            surface=self._one_of(surface, M.SURFACES, "surface", m),
+        ).observe(max(0.0, seconds))
+
     # ---- attempts ----------------------------------------------------------
 
     def attempt(self, *, provider: str, model: str, result: str) -> None:

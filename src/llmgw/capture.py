@@ -107,7 +107,19 @@ class CaptureRecord:
     kind: str = "request"
     """`request` for a served call; `mint` for a credential the gateway
     issued on a tenant's behalf (Phase E) -- the only cost attribution
-    possible for media that never transits the gateway."""
+    possible for media that never transits the gateway; `session` for one
+    relayed WebSocket session and `response` for one response inside a
+    Realtime session (PLAN-G 7.2)."""
+
+    session_id: str | None = None
+    """The `request_id` of the SESSION this record belongs to, or None.
+
+    Set only on records a session contains -- a Realtime `response.done`
+    writes its own `kind="response"` record so per-turn cost is queryable,
+    and this field is the join back to the session that produced it. The
+    session's own record has `kind="session"` and `session_id=None`: it IS
+    the session, and pointing a row at itself makes the join ambiguous.
+    Echoed to the client as `X-Gw-Session-Id` on the 101."""
     """Did a byte reach the client? The commitment flag the pump owns. Carried
     here because 'failed' and 'interrupted' are the same outcome to a metric
     but a different story to whoever is reading the one request that broke."""

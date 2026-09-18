@@ -73,6 +73,17 @@ SURFACES: tuple[str, ...] = (
     "elevenlabs_tts",
     "elevenlabs_tts_timestamps",
     "assemblyai_sync",
+    # PLAN-G: the WebSocket plane. One name per product dialect, `_ws`-
+    # suffixed where an HTTP surface of the same provider already exists, so
+    # `llmgw_requests_total{surface="inworld_tts"}` keeps meaning the HTTP
+    # one. All five are declared at once although G1 registers only the
+    # first: the set is closed, and a label a later phase adds is a label
+    # every dashboard built before it has to be rewritten for.
+    "inworld_tts_ws",
+    "inworld_stt_ws",
+    "openai_realtime",
+    "assemblyai_streaming",
+    "elevenlabs_tts_ws",
 )
 OUTCOMES: tuple[str, ...] = tuple(o.value for o in Outcome)
 ATTEMPT_RESULTS: tuple[str, ...] = (
@@ -123,6 +134,52 @@ TOOL_KINDS: tuple[str, ...] = (
 provider inventing a key cannot open a series; an unknown key is counted
 on the record and left off the metric."""
 COST_BASIS: tuple[str, ...] = ("exact", "estimated")
+
+# ---- PLAN-G: the socket plane's closed vocabularies ----------------------
+WS_DIRECTIONS: tuple[str, ...] = ("client_in", "client_out")
+"""Named from the CLIENT's point of view, which is the only point of view a
+dashboard can reason about without knowing the topology: `client_in` is bytes
+the client sent us (and we relayed upstream), `client_out` is bytes we sent
+the client. Counted after framing, so the number is what the socket carried
+and not what a JSON body would have measured."""
+
+WS_CLOSE_SIDES: tuple[str, ...] = ("client", "upstream")
+"""Which of a session's two sockets this close was observed on. Both are
+counted because they answer different questions: `client` closes are our
+own verdicts plus the plugin's hang-ups, `upstream` closes are the
+provider's."""
+
+WS_CLOSE_CLASSES: tuple[str, ...] = (
+    "normal_1000",
+    "going_away_1001",
+    "abnormal_1006",
+    "policy_1008",
+    "too_large_1009",
+    "internal_1011",
+    "provider_3xxx",
+    "provider_4xxx",
+    "gateway_49xx",
+    "other",
+)
+"""Close codes folded into a bounded set. The raw code is unbounded by the
+RFC and by every provider's private range, so it is a capture field; these
+nine buckets are what a dashboard can alert on. `gateway_49xx` is ours
+(4900-4999) and is separated from `provider_4xxx` deliberately: "we ended
+it" and "they ended it" are the two things an incident needs to tell
+apart, and a single `4xxx` bucket cannot."""
+
+BOOLS: tuple[str, ...] = ("true", "false")
+"""The `fatal` label of `llmgw_ws_inband_errors_total`, as the strings
+Prometheus stores. Spelled out so the closed-set guard can check it."""
+
+WS_SESSION_BUCKETS: tuple[float, ...] = (
+    1.0, 10.0, 60.0, 300.0, 900.0, 1800.0, 3600.0, 7200.0, 10800.0,
+)
+"""Session lifetimes, in seconds. Log-ish from one second (a handshake that
+failed immediately) to three hours (AssemblyAI's own session cap), because
+the distribution this measures spans four orders of magnitude and the
+question it answers -- "how many sockets would a deploy cut?" -- is about
+the tail."""
 
 STOP_REASONS: tuple[str, ...] = (
     "stop",
@@ -476,6 +533,51 @@ METRICS: tuple[MetricSpec, ...] = (
         "len(asyncio.all_tasks()). Baseline drift after a run is a leak, and "
         "this gauge is how the scale tier proves there is not one.",
         labels=(),
+    ),
+    # ---- the socket plane (PLAN-G 7.3) -------------------------------------
+    MetricSpec(
+        "llmgw_ws_sessions_open",
+        "gauge",
+        "Relayed WebSocket sessions currently open. The socket plane's twin "
+        "of llmgw_streams_open, and the number the chaos tier asserts "
+        "returns to zero after a mass disconnect.",
+        labels=("surface",),
+        label_values=(SURFACES,),
+    ),
+    MetricSpec(
+        "llmgw_ws_bytes_total",
+        "counter",
+        "Bytes relayed on a WebSocket session, per direction, after framing. "
+        "Against llmgw_ws_sessions_open this is the per-socket bandwidth the "
+        "max_streams derivation needs.",
+        labels=("surface", "direction"),
+        label_values=(SURFACES, WS_DIRECTIONS),
+    ),
+    MetricSpec(
+        "llmgw_ws_close_total",
+        "counter",
+        "WebSocket closes by side and code class. gateway_49xx is a verdict "
+        "we issued; everything else is somebody else's.",
+        labels=("surface", "side", "code_class"),
+        label_values=(SURFACES, WS_CLOSE_SIDES, WS_CLOSE_CLASSES),
+    ),
+    MetricSpec(
+        "llmgw_ws_inband_errors_total",
+        "counter",
+        "Provider error frames seen inside a session, split by whether they "
+        "ended it. A rising non-fatal count is a client sending frames its "
+        "provider refuses; a rising fatal count is an outage.",
+        labels=("surface", "fatal"),
+        label_values=(SURFACES, BOOLS),
+    ),
+    MetricSpec(
+        "llmgw_ws_session_seconds",
+        "histogram",
+        "How long relayed sessions lived. The deploy question -- how many "
+        "sockets a drain has to cut -- is read off this tail.",
+        labels=("surface",),
+        label_values=(SURFACES,),
+        buckets=WS_SESSION_BUCKETS,
     ),
 )
 

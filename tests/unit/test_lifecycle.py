@@ -620,24 +620,35 @@ async def test_cancel_while_not_draining_is_not_ours_and_propagates(
     assert gw.inflight == 0  # the finally still paired the tracker
 
 
-def test_uvicorn_c2_ending_line_is_filtered_and_nothing_else_is():
-    """`lifecycle.serve` drops uvicorn's "returned without completing
-    response" -- its name for the C2 ending, logged once per cut stream at
-    ERROR -- and only that. Installing twice must not stack."""
+def test_per_connection_uvicorn_lines_are_filtered_and_nothing_else_is():
+    """`lifecycle.serve` drops the three uvicorn lines whose VOLUME scales
+    with the number of open streams or sockets -- its name for the C2 ending,
+    and (PLAN-G) the two per-WebSocket-connection lines -- and only those.
+    Installing twice must not stack."""
     from llmgw.server.lifecycle import (
         _C2_ENDING_MESSAGE,
         _C2_FILTER,
-        _NotAnErrorHere,
+        _BoundedShutdownOutput,
         _quiet_c2_endings,
     )
 
-    def record(msg: str) -> logging.LogRecord:
-        return logging.LogRecord("uvicorn.error", logging.ERROR, __file__, 0, msg, (), None)
+    def record(msg: str, *args) -> logging.LogRecord:
+        return logging.LogRecord(
+            "uvicorn.error", logging.ERROR, __file__, 0, msg, args, None,
+        )
 
-    flt = _NotAnErrorHere()
+    flt = _BoundedShutdownOutput()
     assert flt.filter(record(_C2_ENDING_MESSAGE)) is False
+    # PLAN-G: two lines per socket, times every socket a deploy cuts.
+    assert flt.filter(record("connection open")) is False
+    assert flt.filter(record("connection closed")) is False
+    assert flt.filter(record(
+        '%s - "WebSocket %s" [accepted]', "127.0.0.1:1", "/tts/v1/voice",
+    )) is False
+    # Everything that does NOT scale with the connection count survives.
     assert flt.filter(record("Exception in ASGI application")) is True
     assert flt.filter(record("Cancel 3 running task(s), timeout graceful shutdown exceeded"))
+    assert flt.filter(record("Application startup complete.")) is True
 
     logger = logging.getLogger("uvicorn.error")
     before = [f for f in logger.filters if f is _C2_FILTER]

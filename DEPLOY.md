@@ -145,6 +145,9 @@ finishes its streams inside the grace, and exits. Nothing is cut.
 ```
 LLMGW_BUDGET_TOTAL  <=  LLMGW_DRAIN_GRACE  <  grace + 3 s  <  kill_timeout
        120                   130                 133             140
+
+LLMGW_WS_DRAIN_WAIT <=  LLMGW_DRAIN_GRACE            session_total may exceed both
+        20                    130                              3600
 ```
 
 - **total ≤ grace**: a stream is allowed to run for `total`; a deploy waits
@@ -159,8 +162,21 @@ LLMGW_BUDGET_TOTAL  <=  LLMGW_DRAIN_GRACE  <  grace + 3 s  <  kill_timeout
   streams would end by SIGKILL, not by the contract's native ending, and the
   drain would be theatre. Only `fly.toml` can hold this inequality; the process
   cannot see it.
+- **ws_drain_wait ≤ grace** (PLAN-G, C26): the per-SESSION slice of the drain.
+  A WebSocket session is not waited for the way a stream is — it was never
+  going to finish on its own — so the drain forwards the provider's own
+  terminate, waits at most this long for the answer that carries the billing
+  number, and closes the client 4900. Above the grace the wait would be cut by
+  the grace anyway and the number would be a fiction, so
+  `check_drain_arithmetic` refuses it (same `LLMGW_DRAIN_ALLOW_SHORT` escape
+  hatch as the first inequality, for the bench).
+- **`session_total` is NOT in this arithmetic.** A three-hour transcription
+  session behind a 130 s grace is normal, not a misconfiguration:
+  `PolicySnapshot.largest_total()` excludes it and startup logs one INFO line
+  per profile whose sessions outlive a deploy. What ends those sessions on a
+  deploy is the hook above, inside `LLMGW_WS_DRAIN_WAIT`, not the grace.
 
-Change one number, change all four, in both files.
+Change one number, change all of them, in both files.
 
 ## Re-deriving the cap on this VM
 

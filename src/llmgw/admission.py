@@ -117,6 +117,12 @@ REASON_PROVIDER_KEY_CONCURRENCY = "provider_key_concurrency"
 
 SCOPE_TENANT = "tenant"
 SCOPE_PROVIDER_KEY = "provider_key"
+SCOPE_SESSION = "session"
+"""The scope of a relayed-WebSocket-session permit (PLAN-G C23). Deliberately
+NOT a `metrics.llmgw_permits_in_use{scope}` value: that gauge's label set is
+closed at two, and a relayed session is already visible on
+`llmgw_ws_sessions_open`. The scope is here so a `Permit`'s repr and the
+probe can say what it counts."""
 
 # `tokens` is a float accumulator. The tolerance absorbs representational
 # error only -- a refill that lands on 0.9999999999999 after exactly 1/rate
@@ -244,7 +250,8 @@ class _TenantState:
     deciding tenant A's admission is a single dictionary lookup that never
     touches tenant B. Isolation is a data-layout property here, not a policy."""
 
-    __slots__ = ("limits", "tokens", "updated", "in_use", "denied", "sessions")
+    __slots__ = ("limits", "tokens", "updated", "in_use", "denied", "sessions",
+                 "relayed")
 
     def __init__(self, limits: TenantLimits, now: float) -> None:
         self.limits = limits
@@ -253,6 +260,19 @@ class _TenantState:
         self.in_use = 0
         self.sessions: list[float] = []
         """Expiry instants of minted credentials still alive (Phase E)."""
+        self.relayed = 0
+        """Relayed WebSocket sessions open right now (PLAN-G C23).
+
+        A COUNT, not a list of expiries, because the two kinds of session end
+        differently and the difference is the whole reason they are separate
+        fields. A minted credential is used against the provider directly and
+        the gateway never sees it end, so the only honest release is the
+        clock. A relayed session ends in our own `finally`, so counting it by
+        expiry would either hold a slot after the socket closed or free one
+        while it was still open. Both live under the SAME `max_sessions` cap,
+        because the cap is about how many concurrent provider sessions a
+        tenant may have and the provider does not care which door they came
+        through."""
         self.denied: dict[str, int] = {
             REASON_TENANT_CONCURRENCY: 0,
             REASON_TENANT_RATE: 0,
@@ -428,24 +448,80 @@ class AdmissionController:
             return
         now = self._clock.now()
         state.sessions = [t for t in state.sessions if t > now]
-        if len(state.sessions) >= cap:
-            soonest = min(state.sessions)
+        live = len(state.sessions) + state.relayed
+        if live >= cap:
+            # `retry_after` is the earliest MINTED expiry when there is one:
+            # a relayed session has no expiry to promise, so a tenant holding
+            # only relayed sessions gets a 429 with no number, which is the
+            # honest answer ("when one of your sockets closes").
+            soonest = min(state.sessions) if state.sessions else None
             state.denied[REASON_TENANT_CONCURRENCY] += 1
             self._denials[REASON_TENANT_CONCURRENCY] += 1
             raise AdmissionRejected(
                 f"tenant {tenant!r} at its session cap "
-                f"({len(state.sessions)}/{cap} credentials alive)",
-                retry_after=max(0.0, soonest - now),
+                f"({live}/{cap} sessions alive)",
+                retry_after=None if soonest is None else max(0.0, soonest - now),
             )
         state.sessions.append(now + max(0.0, float(ttl_s)))
 
+    def enter_session(self, tenant: str) -> Permit:
+        """Count one RELAYED session against the tenant's `max_sessions`.
+
+        The socket-plane twin of `reserve_session` (PLAN-G C23), and the
+        reason `max_sessions` is a cap on sessions rather than on mints: a
+        tenant that opens two hundred Inworld sockets through the gateway has
+        two hundred provider sessions open exactly as surely as a tenant that
+        minted two hundred credentials, and a cap that could only see one of
+        the two ways would be a cap an operator could not reason about.
+
+        Returns a `Permit`, not None, because a relayed session ends where we
+        can see it: the caller holds the permit for the socket's life and the
+        `finally` releases it, the same shape `admit()` has. The two permits
+        are separate objects on purpose -- one counts requests in flight, one
+        counts sessions alive, and a socket is one of each.
+        """
+        state = self._tenants.get(tenant)
+        if state is None:
+            if self._default is None:
+                self._denials[REASON_TENANT_RATE] += 1
+                raise AdmissionRejected(
+                    f"unknown tenant {tenant!r}: no limits configured and no default"
+                )
+            state = self._tenants[tenant] = _TenantState(self._default, self._clock.now())
+        cap = state.limits.max_sessions
+        if cap is not None:
+            now = self._clock.now()
+            state.sessions = [t for t in state.sessions if t > now]
+            live = len(state.sessions) + state.relayed
+            if live >= cap:
+                soonest = min(state.sessions) if state.sessions else None
+                state.denied[REASON_TENANT_CONCURRENCY] += 1
+                self._denials[REASON_TENANT_CONCURRENCY] += 1
+                raise AdmissionRejected(
+                    f"tenant {tenant!r} at its session cap "
+                    f"({live}/{cap} sessions alive)",
+                    retry_after=None if soonest is None else max(0.0, soonest - now),
+                )
+        state.relayed += 1
+        return Permit(
+            scope=SCOPE_SESSION, key=tenant,
+            release=lambda: self._release_session(tenant),
+        )
+
+    def _release_session(self, tenant: str) -> None:
+        state = self._tenants[tenant]
+        if state.relayed <= 0:  # pragma: no cover - Permit guards this
+            raise ValueError(f"tenant {tenant!r} has no relayed session to release")
+        state.relayed -= 1
+
     def live_sessions(self, tenant: str) -> int:
-        """Minted credentials still inside their TTL. Observation only."""
+        """Sessions counted against `max_sessions`: minted credentials still
+        inside their TTL, plus relayed sockets open now. Observation only."""
         state = self._tenants.get(tenant)
         if state is None:
             return 0
         now = self._clock.now()
-        return sum(1 for t in state.sessions if t > now)
+        return sum(1 for t in state.sessions if t > now) + state.relayed
 
     # ---- observation -------------------------------------------------------
 

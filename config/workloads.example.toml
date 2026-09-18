@@ -112,6 +112,56 @@ first_event = 2.0
 progress = 5.0
 total = 150.0
 
+[profiles.tts_session.budgets]
+# The WebSocket TTS SESSION profile (PLAN-G 4.1). A socket is not a request:
+# these numbers bound one relayed Inworld TTS connection, which lives across
+# many utterances, while `[profiles.tts]` above bounds one HTTP call.
+#
+# Every one of them sits above what the live captures measured (18 Sep 2026,
+# Chennai, `capabilities/captures-ws.md`) by roughly the margin the HTTP
+# profiles use over their own measurements -- 3x on the handshake phases,
+# 4x on first audio, and progress at least as loose as first_event:
+#
+#   connect      101 arrived at 0.46-1.4 s        -> 5 s    (3.6x the worst)
+#   headers      `create` -> `contextCreated` 326 ms -> 10 s (30x; this is
+#                also the ONLY signal that a credential is bad, so it is
+#                sized to be certain rather than fast)
+#   first_event  `send_text` -> first audio 370-455 ms -> 3 s (6.6x), PLUS
+#                whatever buffering the client declared on its `create`
+#                (`maxBufferDelayMs`, capped at 30 s). The captures measured
+#                370-455 ms only because every probe flushed in the same
+#                millisecond; the LiveKit plugin does not. It sends
+#                `autoMode: true` with `maxBufferDelayMs: 3000`, one
+#                `send_text` per sentence, and `flush_context` only after the
+#                whole LLM response has been tokenised, so a short first
+#                sentence legitimately produces silence for three seconds
+#                (`inworld/tts.py:401-416, 1273-1281`). A flat 2 s here
+#                closed healthy first turns with 4902. Buffering the client
+#                asked for is not a stall, so the budget is
+#                `first_event + maxBufferDelayMs`: 6 s for that plugin, and
+#                3 s for a client that declares nothing
+#   progress     first -> last audio 320 ms for a 29-character utterance;
+#                a 2,000-character one is ~30x that      -> 5 s
+#   client_stall the relay's outbound buffer full this long -> 10 s
+#   idle         nothing in either direction. The provider never pings and
+#                never closes a healthy socket (75 s idle, zero frames), so
+#                this budget is the ONLY thing that reclaims an abandoned
+#                session                                  -> 600 s
+#   session_total a pooled plugin socket legitimately lives for a whole
+#                conversation; an hour is the cap, not the expectation
+#                                                         -> 3600 s
+#
+# `total` is left at the default: it bounds a request-shaped unit of work and
+# nothing on this plane is one. `largest_total()` ignores `session_total` for
+# the same reason, so this profile does not enlarge the deploy inequality.
+connect = 5.0
+headers = 10.0
+first_event = 3.0
+progress = 5.0
+client_stall = 10.0
+idle = 600.0
+session_total = 3600.0
+
 [profiles.long_context]
 [profiles.long_context.budgets]
 # A 1M-token prompt on Sonnet 4.6 / 5 can take the better part of a minute

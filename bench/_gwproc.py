@@ -69,6 +69,15 @@ FAKE_FORWARD = (
     "x-fake-delay",
     "x-fake-status",
     "x-fake-bytes",
+    # The WebSocket knobs (fakes/ws.py), for S9-S12's Arm G. Same argument:
+    # an upgrade whose `X-Fake-*` headers are dropped reaches the fake as mode
+    # `ok`, and the two arms would then measure different providers. The fake
+    # also reads every knob as a `__fake_*` query parameter, which survives a
+    # gateway that forwards query strings but not headers.
+    "x-fake-stall-after",
+    "x-fake-stall-side",
+    "x-fake-read-bps",
+    "x-fake-rtt",
 )
 
 

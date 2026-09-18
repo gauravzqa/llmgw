@@ -104,8 +104,30 @@ class SurfaceLimits:
     max_request_bytes: int | None = None
     max_response_bytes: int | None = None
 
+    max_in_bps: int | None = None
+    max_out_bps: int | None = None
+    """Per-SOCKET byte-rate ceilings, bytes per second, one per direction
+    (PLAN-G 4.2). `in` is client -> upstream, `out` is upstream -> client,
+    named from the gateway's point of view so the two agree with
+    `metrics.WS_DIRECTIONS`. `None` means no rate bound.
+
+    A byte cap and a byte RATE are different protections and a socket needs
+    both. `max_request_bytes` bounds one message; nothing in it stops a
+    client sending ten thousand legal messages a second, which is the shape
+    a relayed audio stream has anyway. The rate bound is a token bucket over
+    one-second windows: over-rate INBOUND stops reading the client (TCP
+    backpressure carries the refusal, so the provider never sees a pacing
+    violation of its own), and over-rate outbound fills the relay buffer,
+    which is already the `client_stall` path.
+
+    Sized from the medium, not from a guess: 16 kHz PCM16 mono is 32 KB/s
+    and base64 inflates it by a third, so 64 KB/s of inbound audio leaves
+    headroom for 24 kHz; a second of 24 kHz LINEAR16 TTS audio is 48 KB, so
+    128 KB/s outbound tolerates two contexts flushing at once."""
+
     def validate(self, name: str) -> None:
-        for fname in ("max_request_bytes", "max_response_bytes"):
+        for fname in ("max_request_bytes", "max_response_bytes",
+                      "max_in_bps", "max_out_bps"):
             value = getattr(self, fname)
             if value is not None and value < 1:
                 raise ValueError(f"surface_limits[{name!r}].{fname} must be positive")
@@ -114,6 +136,8 @@ class SurfaceLimits:
         return SurfaceLimits(
             self.max_request_bytes if self.max_request_bytes is not None else request,
             self.max_response_bytes if self.max_response_bytes is not None else response,
+            self.max_in_bps,
+            self.max_out_bps,
         )
 
 
@@ -125,6 +149,13 @@ DEFAULT_SURFACE_LIMITS: dict[str, SurfaceLimits] = {
     "anthropic_messages": SurfaceLimits(max_request_bytes=32 * 1024 * 1024),
     # A token count is a prompt, not a PDF (Phase C2): its own smaller cap.
     "count_tokens": SurfaceLimits(max_request_bytes=4 * 1024 * 1024),
+    # PLAN-G 4.2: the WebSocket surfaces carry rates, not just caps. Inworld
+    # TTS is text in (`send_text`, 2,000 characters a message) and audio out
+    # (a 24 kHz LINEAR16 second is 48 KB on the wire, and the captures'
+    # largest single `audioChunk` frame is 25,012 B).
+    "inworld_tts_ws": SurfaceLimits(
+        max_in_bps=16 * 1024, max_out_bps=128 * 1024,
+    ),
 }
 
 _HEADERS_DEFAULT: dict[str, float] = (
@@ -662,6 +693,26 @@ class ServerConfig:
     kill timeout above this grace, or a SIGKILL, not the drain, ends the
     process and every stream still open with it."""
 
+    ws_drain_wait_s: float = 20.0
+    """How long a drain waits for ONE WebSocket session to end politely
+    (`LLMGW_WS_DRAIN_WAIT`, PLAN-G 4.3, C26).
+
+    The grace above is the whole process's budget; this is the per-session
+    slice inside it. A socket cannot be drained the way a request is, by
+    waiting for it to finish, because it was never going to finish -- a TTS
+    connection is idle between utterances and a transcription session ends
+    when the learner stops talking. So the drain hook sends the provider's
+    OWN terminate (`closeStream`, `Terminate`; Inworld TTS has none, so it
+    waits for open contexts to reach zero), waits at most this long for the
+    provider's answer -- which carries the billing number on two of the four
+    products -- and then closes the client with 4900.
+
+    Its inequality is `ws_drain_wait_s <= drain_grace_seconds`, checked in
+    `check_drain_arithmetic`. Above the grace the wait would be cut by the
+    grace anyway, and the terminate would be sent to a provider nobody is
+    listening to -- so the number would be a fiction, and the session's
+    seconds would silently become `estimated` on every deploy."""
+
     inject_include_usage: bool = False
     """Add `stream_options: {include_usage: true}` to OpenAI-dialect streaming
     requests that did not set `stream_options` (`LLMGW_INJECT_INCLUDE_USAGE`).
@@ -751,6 +802,8 @@ class ServerConfig:
         # instant SIGTERM arrived, which is the opposite of the endpoint's job.
         if self.drain_grace_seconds <= 0:
             raise ValueError("drain_grace_seconds must be positive")
+        if self.ws_drain_wait_s <= 0:
+            raise ValueError("ws_drain_wait_s must be positive")
         if self.budgets.total > self.drain_grace_seconds:
             # The deploy inequality (see the `drain_grace_seconds` docstring).
             # Refused, not clamped: clamping the total would silently shorten
@@ -830,7 +883,47 @@ class ServerConfig:
         a bad file still refuses at startup and never on the request path.
         `PolicySnapshot.largest_total()` is the policy side's answer; a
         snapshot without it (older policy.py) is measured over its workloads.
+
+        The SECOND inequality, added with the socket plane (PLAN-G 4.3):
+
+            LLMGW_WS_DRAIN_WAIT (20) <= LLMGW_DRAIN_GRACE (130)
+
+        and `session_total` is deliberately not part of either. A session
+        longer than the grace is normal and is handled by the drain hook, so
+        it is reported at INFO -- the operator should know a deploy will cut
+        mid-session sockets, and should not be refused a startup for it.
         """
+        if self.ws_drain_wait_s > self.drain_grace_seconds:
+            # Refused for the same reason the first inequality is: a per-
+            # session wait above the whole process's grace is a number that
+            # can never be honoured, and the visible consequence is a
+            # provider terminate sent into a drain that is already over.
+            # `LLMGW_DRAIN_ALLOW_SHORT` covers it too, because it is the same
+            # decision -- "I have decided a fast rollout is worth cutting the
+            # tail" -- and the bench deliberately drains shorter than the work
+            # it is serving in order to observe the cut.
+            message = (
+                f"ws_drain_wait_s={self.ws_drain_wait_s:g}s exceeds "
+                f"drain_grace_seconds={self.drain_grace_seconds:g}s: a session's "
+                f"polite-close wait cannot outlast the whole drain. Lower "
+                f"LLMGW_WS_DRAIN_WAIT or raise LLMGW_DRAIN_GRACE"
+            )
+            if not self.drain_allow_short:
+                raise ValueError(message)
+            log.warning("LLMGW_DRAIN_ALLOW_SHORT is set: %s", message)
+        sessions = [
+            (name, b.session_total)
+            for name, b in getattr(snapshot, "profiles", {}).items()
+            if getattr(b, "session_total", None) is not None
+            and b.session_total > self.drain_grace_seconds
+        ]
+        for name, total in sessions:
+            log.info(
+                "profile %r has session_total=%gs above drain_grace_seconds=%gs: "
+                "sockets of that profile outlive a deploy and are closed 4900 by "
+                "the drain hook within ws_drain_wait_s=%gs (PLAN-G C26), not cut",
+                name, total, self.drain_grace_seconds, self.ws_drain_wait_s,
+            )
         largest = getattr(snapshot, "largest_total", None)
         if callable(largest):
             total = float(largest())
@@ -1024,6 +1117,7 @@ class ServerConfig:
                 env, "LLMGW_CAPTURE_QUEUE_BYTES", 8 * 1024 * 1024
             ),
             drain_grace_seconds=_env_float(env, "LLMGW_DRAIN_GRACE", 130.0),
+            ws_drain_wait_s=_env_float(env, "LLMGW_WS_DRAIN_WAIT", 20.0),
             drain_allow_short=_env_bool(env, "LLMGW_DRAIN_ALLOW_SHORT", default=False),
             inject_include_usage=_env_bool(
                 env, "LLMGW_INJECT_INCLUDE_USAGE", default=False

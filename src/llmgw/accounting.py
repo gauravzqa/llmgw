@@ -81,7 +81,8 @@ provider's number is used verbatim and the bytes are ignored.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import dataclasses
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
 from .catalog import Catalog, ModelSpec, Target, price_of
@@ -91,7 +92,7 @@ from .metrics import normalize_stop_reason
 from .pump import PumpResult
 from .surfaces.base import Usage
 
-__all__ = ["AccountingRecord", "account", "TOKEN_KINDS", "UNITS"]
+__all__ = ["AccountingRecord", "account", "account_usage", "TOKEN_KINDS", "UNITS"]
 
 # Mirrors `metrics.TOKEN_KINDS`. Duplicated rather than imported so accounting
 # has no dependency on the metrics module (which the wiring layer owns): the
@@ -279,12 +280,100 @@ def account(result: ExecutionResult, *, catalog: Catalog) -> AccountingRecord:
 
 
 def _account(result: ExecutionResult, *, catalog: Catalog) -> AccountingRecord:
-    plan = result.plan
-    committed = bool(result.committed)
+    """The HTTP adapter: pull the six facts off an `ExecutionResult` and hand
+    them to the shared pricer.
 
-    target = _billed_target(result)
+    Everything specific to a request lives here -- which target got billed
+    when the executor did not say (`_billed_target`), and the interrupted
+    stream's output-token guess from bytes written (`_billed_output_tokens`,
+    which needs the pump). What is left is a `Usage` and a `Target`, and that
+    is exactly what a relayed WebSocket session also ends with, which is why
+    the pricing below is `_account_usage` and not a method on this path.
+    """
+    plan = result.plan
     usage = _usage_of(result.pump)
-    output_tokens = _billed_output_tokens(usage, result.pump)
+    return _account_usage(
+        usage,
+        target=_billed_target(result),
+        catalog=catalog,
+        outcome=result.outcome,
+        committed=bool(result.committed),
+        attempts=len(result.attempts),
+        workload_id=plan.workload_id,
+        policy_id=plan.policy_id,
+        code=result.error.code if result.error is not None else "none",
+        output_tokens=_billed_output_tokens(usage, result.pump),
+    )
+
+
+def account_usage(
+    usage: Usage,
+    *,
+    target: Target | None,
+    catalog: Catalog,
+    outcome: Outcome,
+    committed: bool,
+    attempts: int,
+    workload_id: str,
+    policy_id: str,
+    code: str,
+    cost_notes: Sequence[str] = (),
+) -> AccountingRecord:
+    """Price a `Usage` that did not come from an `ExecutionResult`. C27.
+
+    The WebSocket plane's entry point. A relayed session has no
+    `ExecutionResult` -- no pump, no attempt list of the executor's making,
+    no `served_by` -- but it ends with the same two objects a request ends
+    with: the counts the provider reported, and the target they were reported
+    by. So it is priced by the SAME dot product (`_cost_usd`), which is the
+    only way "characters at the Inworld TTS rate" can be guaranteed to mean
+    the same number on both planes.
+
+    `cost_notes` is prepended to whatever the pricer itself notes, because a
+    session knows things the pricer cannot: that its seconds were derived
+    from relayed audio bytes rather than metered, that it was priced through
+    a deprecated-model alias, how many contexts it carried.
+
+    Never raises, for the reason the module docstring gives: an accounting
+    layer that can fail is a request path that can fail for a reason the
+    client cannot act on. A malformed input produces a valid, zero-cost,
+    `estimated` record and a note saying so.
+    """
+    try:
+        rec = _account_usage(
+            usage, target=target, catalog=catalog, outcome=outcome,
+            committed=committed, attempts=attempts, workload_id=workload_id,
+            policy_id=policy_id, code=code,
+        )
+    except Exception:  # noqa: BLE001 - accounting observes; it does not get a vote
+        rec = _fallback_record(None)
+        return dataclasses.replace(
+            rec,
+            workload_id=workload_id, policy_id=policy_id, outcome=outcome,
+            committed=committed, attempts=attempts,
+            code=code if isinstance(code, str) else "gateway_error",
+            cost_notes=(*tuple(cost_notes), *rec.cost_notes),
+        )
+    if cost_notes:
+        rec = dataclasses.replace(rec, cost_notes=(*tuple(cost_notes), *rec.cost_notes))
+    return rec
+
+
+def _account_usage(
+    usage: Usage,
+    *,
+    target: Target | None,
+    catalog: Catalog,
+    outcome: Outcome,
+    committed: bool,
+    attempts: int,
+    workload_id: str,
+    policy_id: str,
+    code: str,
+    output_tokens: int | None = None,
+) -> AccountingRecord:
+    """The dot product, shared by both planes. May raise; callers guard."""
+    output_tokens = usage.output_tokens if output_tokens is None else output_tokens
 
     extra = {name: _usage_int(usage, name) for name in _USAGE_INT_FIELDS}
     tool_calls = _usage_tool_calls(usage)
@@ -310,8 +399,8 @@ def _account(result: ExecutionResult, *, catalog: Catalog) -> AccountingRecord:
         cost, notes = _cost_usd(usage, spec, out_tok, extra=extra, tool_calls=tool_calls)
 
     return AccountingRecord(
-        workload_id=plan.workload_id,
-        policy_id=plan.policy_id,
+        workload_id=workload_id,
+        policy_id=policy_id,
         provider=provider,
         model=model,
         input_tokens=in_tok,
@@ -320,11 +409,11 @@ def _account(result: ExecutionResult, *, catalog: Catalog) -> AccountingRecord:
         cache_write_tokens=cw_tok,
         cost_usd=cost,
         basis="exact" if usage.exact else "estimated",
-        outcome=result.outcome,
+        outcome=outcome,
         committed=committed,
-        attempts=len(result.attempts),
+        attempts=attempts,
         parse_failures=usage.parse_failures,
-        code=result.error.code if result.error is not None else "none",
+        code=code,
         stop_reason=normalize_stop_reason(getattr(usage, "stop_reason", None)),
         audio_input_tokens=extra["audio_input_tokens"],
         audio_output_tokens=extra["audio_output_tokens"],

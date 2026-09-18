@@ -253,6 +253,73 @@ ALL_PATHS: tuple[str, ...] = tuple(dict.fromkeys(
 """Every route template the counters know. Templated routes are counted under
 the template, not the concrete path, so the vocabulary stays closed."""
 
+# --------------------------------------------------------------------------
+# The WebSocket vocabulary (PLAN-G 8.1). The frames and handlers live in
+# `fakes/ws.py`; the names live here because `Stats` owns a fixed slot layout
+# and a fixed layout needs a closed vocabulary. `build_app` imports the routes
+# from `fakes.ws` lazily, so the two modules are not circular.
+# --------------------------------------------------------------------------
+
+WS_PATHS: tuple[str, ...] = (
+    "/tts/v1/voice:streamBidirectional",
+    "/stt/v1/transcribe:streamBidirectional",
+    "/v1/realtime",
+    "/v3/ws",
+)
+"""The four upgrade routes, as the plugins address them (PLAN-G 8.1)."""
+
+WS_MODES: tuple[str, ...] = (
+    "ok",
+    "error-7-then-close-1000-on-first-message",
+    "error-16-missing-credential",
+    "auth-fail-in-band",
+    "nonfatal-error",
+    "context-multiplex",
+    "close-1008-with-error-frame",
+    "close-1008-without",
+    "queued-before-begin",
+    "stall-mid-session",
+    "die-mid-session",
+    "slow-consumer",
+    "usage-in-termination",
+    "terminate-then-hang",
+    "idle",
+)
+"""`X-Fake-Mode` values the WebSocket routes accept. Not every mode is
+meaningful on every product; `fakes.ws.SUPPORTED` is the per-product table and
+an unsupported pair is refused on the upgrade rather than quietly served as
+`ok`."""
+
+WS_CLIENT_FRAMES: tuple[str, ...] = (
+    # Inworld TTS (captures-ws.md 1.2 probe 1)
+    "create", "send_text", "flush_context", "close_context",
+    # Inworld STT (probe 6)
+    "transcribeConfig", "audioChunk", "endTurn", "closeStream",
+    # OpenAI Realtime (probes 7, 8)
+    "session.update", "input_audio_buffer.append", "input_audio_buffer.commit",
+    "input_audio_buffer.clear", "conversation.item.create", "response.create",
+    "response.cancel",
+    # AssemblyAI (voice-assemblyai.md 2, "Client -> server JSON")
+    "Terminate", "UpdateConfiguration", "ForceEndpoint", "KeepAlive",
+    # everything else
+    "binary", "other", "invalid-json",
+)
+"""Closed vocabulary of client frame kinds, counted by count AND by bytes.
+This is what makes C24 assertable from outside the gateway: "the config prefix
+was replayed exactly once and content was never replayed" is
+`client_frames["create"] == 1 and client_frames["send_text"] == 0` at the row
+that lost the handshake."""
+
+_WS_SCALARS: tuple[str, ...] = (
+    "ws_open", "ws_open_now", "ws_peak_open", "ws_closed_by_client",
+    "ws_closed_by_server", "terminates_received", "bytes_in", "bytes_out",
+    "frames_in", "frames_out",
+)
+_WS_SCALAR_INDEX: dict[str, int] = {n: i for i, n in enumerate(_WS_SCALARS)}
+_WS_MODE_INDEX: dict[str, int] = {m: i for i, m in enumerate(WS_MODES)}
+_WS_PATH_INDEX: dict[str, int] = {p: i for i, p in enumerate(WS_PATHS)}
+_WS_FRAME_INDEX: dict[str, int] = {f: i for i, f in enumerate(WS_CLIENT_FRAMES)}
+
 # One 64 KiB block of filler, allocated once at import and re-yielded. See
 # `_huge_event_chunks` for why this matters: an 8 MiB `data:` line built as a
 # single Python bytes object costs 8 MiB of RSS per concurrent request, and
@@ -282,7 +349,12 @@ _F_TOTAL, _F_OPEN, _F_PEAK = 0, 1, 2
 _F_MODE = 3
 _F_PATH = _F_MODE + len(MODES)
 _F_WRITES = _F_PATH + len(ALL_PATHS)
-_SLOT_FIELDS = _F_WRITES + len(MODES)
+_F_WS = _F_WRITES + len(MODES)
+_F_WS_MODE = _F_WS + len(_WS_SCALARS)
+_F_WS_PATH = _F_WS_MODE + len(WS_MODES)
+_F_WS_CFRAME = _F_WS_PATH + len(WS_PATHS)
+_F_WS_CBYTES = _F_WS_CFRAME + len(WS_CLIENT_FRAMES)
+_SLOT_FIELDS = _F_WS_CBYTES + len(WS_CLIENT_FRAMES)
 _SLOT_BYTES = _SLOT_FIELDS * 8
 _ZERO_SLOT = memoryview(bytes(_SLOT_BYTES)).cast("q")
 
@@ -362,6 +434,75 @@ class Stats:
         with self._lock:
             self._own[_F_OPEN] -= 1
 
+    # -- WebSocket counters (PLAN-G 8.1) ----------------------------------
+    #
+    # Same discipline as the HTTP ones: a fixed vector, one lock, a closed
+    # vocabulary. `ws_open` counts accepted upgrades (an upgrade refused for a
+    # bad `X-Fake-Mode` is not one); `ws_closed_by_client` counts the sockets
+    # whose first close came from the other end, `ws_closed_by_server` the
+    # ones the fake closed itself (a mode's close, or the abort in
+    # `die-mid-session`); `terminates_received` counts only the two frames
+    # that mean "end this session, please": AssemblyAI `Terminate` and Inworld
+    # STT `closeStream`. Inworld TTS `close_context` ends a CONTEXT, not a
+    # session, so it is counted under `client_frames` and nowhere else -- S12
+    # asserts `terminates_received == STT sessions`.
+
+    def ws_opened(self, mode: str, path: str) -> None:
+        own = self._own
+        with self._lock:
+            own[_F_WS + _WS_SCALAR_INDEX["ws_open"]] += 1
+            own[_F_WS + _WS_SCALAR_INDEX["ws_open_now"]] += 1
+            peak = _F_WS + _WS_SCALAR_INDEX["ws_peak_open"]
+            own[peak] = max(own[peak], own[_F_WS + _WS_SCALAR_INDEX["ws_open_now"]])
+            own[_F_WS_MODE + _WS_MODE_INDEX[mode]] += 1
+            own[_F_WS_PATH + _WS_PATH_INDEX[path]] += 1
+
+    def ws_closed(self, *, by_client: bool) -> None:
+        key = "ws_closed_by_client" if by_client else "ws_closed_by_server"
+        own = self._own
+        with self._lock:
+            own[_F_WS + _WS_SCALAR_INDEX["ws_open_now"]] -= 1
+            own[_F_WS + _WS_SCALAR_INDEX[key]] += 1
+
+    def ws_client_frame(self, kind: str, nbytes: int) -> None:
+        own = self._own
+        i = _WS_FRAME_INDEX[kind]
+        with self._lock:
+            own[_F_WS_CFRAME + i] += 1
+            own[_F_WS_CBYTES + i] += nbytes
+            own[_F_WS + _WS_SCALAR_INDEX["frames_in"]] += 1
+            own[_F_WS + _WS_SCALAR_INDEX["bytes_in"]] += nbytes
+
+    def ws_server_frame(self, nbytes: int) -> None:
+        own = self._own
+        with self._lock:
+            own[_F_WS + _WS_SCALAR_INDEX["frames_out"]] += 1
+            own[_F_WS + _WS_SCALAR_INDEX["bytes_out"]] += nbytes
+
+    def ws_terminate(self) -> None:
+        with self._lock:
+            self._own[_F_WS + _WS_SCALAR_INDEX["terminates_received"]] += 1
+
+    def _ws_snapshot(self) -> dict[str, object]:
+        snap: dict[str, object] = {
+            name: self._sum(_F_WS + i) for i, name in enumerate(_WS_SCALARS)
+        }
+        snap["by_mode"] = {
+            m: n for m in WS_MODES if (n := self._sum(_F_WS_MODE + _WS_MODE_INDEX[m]))
+        }
+        snap["by_path"] = {
+            p: n for p in WS_PATHS if (n := self._sum(_F_WS_PATH + _WS_PATH_INDEX[p]))
+        }
+        snap["client_frames"] = {
+            f: n for f in WS_CLIENT_FRAMES
+            if (n := self._sum(_F_WS_CFRAME + _WS_FRAME_INDEX[f]))
+        }
+        snap["client_bytes"] = {
+            f: n for f in WS_CLIENT_FRAMES
+            if (n := self._sum(_F_WS_CBYTES + _WS_FRAME_INDEX[f]))
+        }
+        return snap
+
     def _sum(self, field: int) -> int:
         return sum(cells[field] for cells in self._all)
 
@@ -372,6 +513,7 @@ class Stats:
                 p: n for p in ALL_PATHS if (n := self._sum(_F_PATH + _PATH_INDEX[p]))
             }
             writes = {m: n for m in MODES if (n := self._sum(_F_WRITES + _MODE_INDEX[m]))}
+            ws = self._ws_snapshot()
             return {
                 "total": self._sum(_F_TOTAL),
                 "by_mode": by_mode,
@@ -379,6 +521,15 @@ class Stats:
                 "writes_by_mode": writes,
                 "open_streams": self._sum(_F_OPEN),
                 "peak_open_streams": self._sum(_F_PEAK),
+                # The four names PLAN-G 8.1 promises are ALSO at the top level,
+                # so `stats()["ws_open"]` reads as the plan writes it; `ws` has
+                # the rest (per-mode, per-path, per-client-frame-kind).
+                "ws_open": ws["ws_open"],
+                "ws_closed_by_client": ws["ws_closed_by_client"],
+                "terminates_received": ws["terminates_received"],
+                "bytes_in": ws["bytes_in"],
+                "bytes_out": ws["bytes_out"],
+                "ws": ws,
             }
 
     def own_snapshot(self) -> dict[str, int]:
@@ -1342,7 +1493,16 @@ def build_app(surface: Surface, *, default_mode: str = "ok") -> Starlette:
             route, _handler(surface, mode_default, stats_path=route),
             methods=["GET" if route in GET_ROUTES else "POST"],
         ))
+    # The WebSocket plane (PLAN-G 8.1). Mounted on EVERY port: the shipped
+    # catalog's voice rows are `kind="openai"` and redirect to the OpenAI
+    # fake, the bench points a whole gateway at one port, and a 404 on an
+    # upgrade is a much worse diagnostic than a fake that answers. Imported
+    # here rather than at module scope because `fakes.ws` imports this module
+    # for `STATS` and the counter vocabulary.
+    from fakes.ws import websocket_routes
+
     routes += [
+        *websocket_routes(STATS),
         Route("/__stats", _stats, methods=["GET"]),
         Route("/__stats/reset", _stats_reset, methods=["POST"]),
     ]

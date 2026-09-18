@@ -238,6 +238,7 @@ from llmgw.surfaces.base import (
     surface_upstream_path,
 )
 from llmgw.upstream import Upstream, UpstreamRequest, UpstreamStream
+from llmgw.ws.routes import build_ws_routes
 
 log = logging.getLogger("llmgw.server")
 
@@ -408,24 +409,78 @@ def gw_headers(
     return out
 
 
-def bearer_token(scope: Scope) -> str | None:
-    """The token in `Authorization: Bearer <token>`, or None.
+BEARER_ONLY: frozenset[str] = frozenset({"bearer"})
+"""The scheme set every HTTP route runs under, and the default everywhere.
+Named so the WebSocket routes' wider sets read as a deliberate widening at
+their own call sites rather than as a default somebody forgot to narrow."""
 
-    Case-insensitive scheme, per RFC 6750; a header with any other scheme, or
-    an empty token, is "no token" rather than an error, because the error the
-    caller gets either way is the same 401 and a message that distinguished
-    "malformed" from "missing" would have to describe the header's contents
-    to do so.
+AUTH_SCHEMES_ACCEPTED: frozenset[str] = frozenset({"bearer", "basic", "raw"})
+"""Every scheme a route is allowed to declare. `raw` means the whole header
+value is the token with no scheme word -- AssemblyAI's plugin sends its key
+that way. A route asking for a scheme outside this set is a programming
+error, not a configuration one, so `credential_token` raises."""
+
+
+def credential_token(
+    scope: Scope, *, schemes: frozenset[str] = BEARER_ONLY
+) -> str | None:
+    """The tenant token in `Authorization`, under the schemes a route accepts.
+
+    `bearer_token` was Bearer-only, and correctly so: every HTTP client the
+    gateway fronts sends Bearer. The socket plane cannot keep that rule,
+    because the credential arrives in whatever shape the CONSUMER's plugin
+    sends it, and the LiveKit Inworld plugins send `Authorization: Basic
+    <key>` (tts.py:263, stt.py:122) while AssemblyAI's sends the bare key.
+    Those are the plugins' own strings, built from one environment variable,
+    and a gateway that demanded `Bearer` would be asking Layrs to patch a
+    pinned third-party library to talk to it.
+
+    So the scheme set is a property of the ROUTE, declared by the surface
+    (`WsSurface.auth_schemes`), and HTTP keeps `{"bearer"}` unchanged --
+    `bearer_token` below is this function with that default, kept as its own
+    name because it is called from several places and "bearer" is the fact
+    those call sites are asserting.
+
+    `basic` here is NOT RFC 7617 decoding. The token is taken verbatim after
+    the scheme word and compared against the tenants table, exactly as a
+    Bearer token is: the tenant token is a gateway-issued opaque string, the
+    plugin wraps it in `Basic ` because that is what it does with its
+    provider key, and base64-decoding it would turn a perfectly good token
+    into a lookup miss. What Inworld does with ITS key upstream is
+    `upstream.build_headers`' business and is a different string entirely.
+
+    A header whose scheme the route does not accept, or an empty token, is
+    "no token" rather than an error -- the 401 is the same either way, and a
+    message that distinguished them would have to quote the header to do it.
     """
+    unknown = schemes - AUTH_SCHEMES_ACCEPTED
+    if unknown:  # pragma: no cover - a surface declaring nonsense
+        raise ValueError(f"unknown tenant auth scheme(s): {sorted(unknown)}")
     for name, value in scope.get("headers", ()):
         if bytes(name).lower() != AUTHORIZATION_HEADER:
             continue
-        scheme, _, token = bytes(value).decode("latin-1").strip().partition(" ")
-        if scheme.lower() != "bearer":
+        raw = bytes(value).decode("latin-1").strip()
+        scheme, sep, token = raw.partition(" ")
+        if not sep:
+            # No scheme word at all. Only a route that declared `raw` may
+            # read it, and then the whole value is the token.
+            return (raw or None) if "raw" in schemes else None
+        if scheme.lower() not in schemes:
             return None
         token = token.strip()
         return token or None
     return None
+
+
+def bearer_token(scope: Scope) -> str | None:
+    """The token in `Authorization: Bearer <token>`, or None.
+
+    Case-insensitive scheme, per RFC 6750; a header with any other scheme, or
+    an empty token, is "no token" rather than an error. Unchanged in
+    behaviour: it is `credential_token` under the Bearer-only default, which
+    is what every HTTP route uses.
+    """
+    return credential_token(scope, schemes=BEARER_ONLY)
 
 
 def _ascii(value: str) -> bytes:
@@ -1209,7 +1264,7 @@ class Gateway:
                  "tenants", "admission", "breakers", "limiter",
                  "_upstream", "_derived", "_collectors", "_capture",
                  "_inflight", "_idle", "_draining_denied", "_overloaded_denied",
-                 "shutdown_cuts")
+                 "shutdown_cuts", "ws_sessions")
 
     def __init__(self, config: ServerConfig, *, clock: Clock | None = None) -> None:
         self.config = config.validated()
@@ -1359,6 +1414,24 @@ class Gateway:
         logged per stream. Read once, by `lifecycle.log_shutdown_cuts`, after
         the server has stopped -- the only moment the count is final."""
 
+        self.ws_sessions: set[Any] = set()
+        """Relayed WebSocket sessions currently open (`llmgw.ws.session.
+        Session`), for the one thing the in-flight tracker cannot express.
+
+        A drain WAITS for a request, because a request was always going to
+        end. A socket was not: a TTS connection is idle between utterances and
+        a transcription session ends when the learner stops talking, so
+        waiting on `_idle` alone would spend the whole grace and then cut
+        every session at the worst possible instant. `begin_drain` therefore
+        tells each session to wind itself down FIRST -- forward the
+        provider's own terminate, close the client 4900 -- and only then
+        waits on the tracker, which those sessions are still counted in.
+
+        Typed `Any` to keep `llmgw.ws` importable from here without a cycle:
+        the ws package imports `Gateway`. Membership is managed by the
+        session's own open/finally pair, the same shape `stream_entered`
+        has, so a session cannot leak into this set."""
+
         self._upstream: Upstream | None = None
 
     @property
@@ -1466,8 +1539,17 @@ class Gateway:
 
     # ------------------------------------------------------------ tenant
 
-    def resolve_tenant(self, scope: Scope) -> str:
+    def resolve_tenant(
+        self, scope: Scope, *, schemes: frozenset[str] = BEARER_ONLY
+    ) -> str:
         """The tenant this request is admitted as. Raises `Unauthenticated`.
+
+        `schemes` is the set of `Authorization` schemes THIS route accepts,
+        and it defaults to Bearer-only, so every HTTP caller is resolved
+        exactly as before. A WebSocket route passes its surface's
+        `auth_schemes` (Inworld: Basic and Bearer) because the credential
+        arrives in the shape the consumer's plugin sends it -- see
+        `credential_token`.
 
         The mode is a property of the DEPLOYMENT, as with workloads:
 
@@ -1486,18 +1568,18 @@ class Gateway:
         The token does not leave this method. It is compared and dropped;
         the return value and both error messages carry the id or nothing.
         """
-        token = bearer_token(scope)
+        token = credential_token(scope, schemes=schemes)
         if self.tenants is None:
             return ANONYMOUS_TENANT
         if token is None:
             if ANONYMOUS_TENANT in self.tenants:
                 return ANONYMOUS_TENANT
             raise Unauthenticated(
-                "no bearer token, and anonymous access is not configured"
+                "no credential, and anonymous access is not configured"
             )
         tenant = self.tenants.resolve(token)
         if tenant is None:
-            raise Unauthenticated("unknown bearer token")
+            raise Unauthenticated("unknown credential")
         return tenant
 
     def realtime_pin(self, tenant: str) -> Mapping[str, Any] | None:
@@ -1685,6 +1767,30 @@ class Gateway:
         self.draining = True
         started = self.clock.now()
         inflight_at_start = self._inflight
+        # STEP 1b (PLAN-G C26): tell every open socket to wind down, before
+        # the wait and without awaiting any of them. `drain()` is synchronous
+        # and schedules the session's own bounded shutdown -- send the
+        # provider's terminate, wait up to `ws_drain_wait_s` for its answer
+        # (which carries the billing number on two of the four products),
+        # close the client 4900. Awaiting them here instead would serialise
+        # five hundred twenty-second waits inside a hundred-and-thirty-second
+        # grace; scheduling them lets the existing `_idle` wait below observe
+        # all of them finishing in parallel, and a session that will not end
+        # is cut by the grace exactly as a stream is.
+        #
+        # A copy of the set, because `drain()` may complete a session
+        # synchronously and remove it. Never raises: a drain that failed
+        # because one session's hook did is a deploy that hangs.
+        for session in list(self.ws_sessions):
+            try:
+                # The grace ACTUALLY in play, not the configured one: a
+                # caller may drain with a shorter window than `fly.toml`
+                # says (the bench does, and so does every drain test), and a
+                # session that sized its deadline off the config would sit
+                # past the end of it.
+                session.drain(grace_s=grace_s)
+            except Exception:  # noqa: BLE001 - one bad session may not stop a deploy
+                log.exception("ws session drain hook failed; the grace still bounds it")
         timed_out = False
         try:
             async with self.clock.timeout(grace_s):
@@ -3157,8 +3263,14 @@ def build_app(
                 "max_request_bytes": gateway.config.max_request_bytes,
                 "max_response_bytes": gateway.config.max_response_bytes,
                 "surface_limits": {
+                    # The byte RATES are reported beside the byte caps
+                    # (PLAN-G 4.2) because for a WebSocket surface the caps
+                    # alone say almost nothing: one frame is never the
+                    # problem, the rate of them is.
                     name: {"max_request_bytes": lim.max_request_bytes,
-                           "max_response_bytes": lim.max_response_bytes}
+                           "max_response_bytes": lim.max_response_bytes,
+                           "max_in_bps": lim.max_in_bps,
+                           "max_out_bps": lim.max_out_bps}
                     for name, lim in (
                         (n, gateway.config.limits_for(n))
                         for n in sorted({*SURFACE_NAMES, *gateway.config.surface_limits})
@@ -3263,6 +3375,13 @@ def build_app(
         Route(path, not_implemented, methods=["POST"], name=f"unimplemented{path}")
         for path in UNIMPLEMENTED_ROUTES
     )
+    # PLAN-G: the socket plane, mounted from its own registry. A
+    # `WebSocketRoute` and a `Route` cannot collide (Starlette matches on the
+    # scope type first), so the two tables are independent and the ws paths
+    # need not avoid the HTTP ones -- which is fortunate, because the
+    # provider chose them and `/tts/v1/voice:streamBidirectional` is not a
+    # name anybody would pick twice.
+    routes.extend(build_ws_routes(gateway))
     routes += [
         Route("/healthz", healthz, methods=["GET"]),
         Route("/metrics", metrics, methods=["GET"]),

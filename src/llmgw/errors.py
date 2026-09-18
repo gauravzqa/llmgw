@@ -805,6 +805,68 @@ class ClientTooSlow(GatewayError):
 
 
 # ==========================================================================
+# 6. The socket plane (PLAN-G). Two endings a request-shaped taxonomy had no
+#    name for, because a request cannot have them: a long-lived session can
+#    be ended by a DEPLOY, and it can be ended by nobody doing anything.
+#    Both are here rather than in `llmgw/ws/errors.py` for one reason --
+#    `ERROR_CODES` is the closed vocabulary `llmgw_requests_total{code}` is
+#    bounded by, and a class registered from a package the metrics layer does
+#    not import would be a label the collector refuses at the worst moment.
+# ==========================================================================
+
+
+class SessionDraining(GatewayError):
+    """The process began a graceful drain while this session was open.
+
+    The socket equivalent of the 503 the HTTP ingress sheds with, and it
+    carries the same `"draining"`-shaped meaning: not a fault, an instruction
+    to go somewhere else. `try_next=False` is deliberate even though another
+    target would probably work -- the whole process is going away, so the
+    next target would be opened from a machine that is about to stop, and the
+    honest move is to let the client's own reconnect land on a machine that
+    is not. Both plugins reconnect on close (tts.py:603-616, stt.py:287-336).
+
+    CANCELED, not FAILED: the session did what it was asked to do right up
+    until the deploy, and its capture record carries the units it relayed.
+    NEUTRAL health, because a deploy is not evidence about a provider -- the
+    same rule `ClientDisconnected` states."""
+
+    code = "session_draining"
+    retry_same = False
+    try_next = False
+    health = Health.NEUTRAL
+    blame = Blame.GATEWAY
+    outcome = Outcome.CANCELED
+    status = 503
+
+
+class SessionIdle(GatewayError):
+    """Nothing happened on the socket, in either direction, for `idle`.
+
+    The reason this exists at all is `capabilities/captures-ws.md` 1.3:
+    Inworld never pings, never closes a healthy socket, and answered nothing
+    for 75 s of a live probe. So an abandoned session -- a client process
+    killed without a close frame, an upstream socket whose contexts all
+    closed and whose owner forgot it -- is indistinguishable at the transport
+    layer from a healthy one, and the gateway's own budget is the ONLY thing
+    that will ever reclaim it. Without this class a leaked socket is a leaked
+    provider session the tenant is billed for on the products billed by
+    session-open time.
+
+    Blame CLIENT, health NEUTRAL: the provider was available the whole time.
+    CANCELED rather than FAILED, for the same reason a disconnect is -- an
+    idle socket is an ending, not a fault."""
+
+    code = "session_idle"
+    retry_same = False
+    try_next = False
+    health = Health.NEUTRAL
+    blame = Blame.CLIENT
+    outcome = Outcome.CANCELED
+    status = 499
+
+
+# ==========================================================================
 # Disposition: the one place the commitment invariant is written.
 # ==========================================================================
 
@@ -1152,6 +1214,7 @@ ERROR_CODES: frozenset[str] = frozenset(
         ContextLengthExceeded, ModelNotFound, ContentFiltered, InStreamError,
         TotalDeadlineExceeded, RetryBudgetExhausted, ClientDisconnected,
         ClientTooSlow,
+        SessionDraining, SessionIdle,
     )
 )
 # The base `GatewayError.code` ("gateway_error") is unioned in AFTER the

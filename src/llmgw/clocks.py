@@ -297,6 +297,38 @@ class Budgets:
     """How long the pump tolerates a client that has stopped reading before
     ending the request to reclaim the buffer. Not a provider fault."""
 
+    session_total: float | None = None
+    """Wall-clock ceiling on a WebSocket SESSION, in seconds (PLAN-G 4.1).
+
+    Not a second `total`. `total` bounds one request-shaped unit of work and
+    is what the deploy inequality (`total <= drain_grace`) is about; a socket
+    is not a unit of work, it is a place several of them happen, and a TTS
+    socket that lives an hour while synthesising forty utterances has done
+    nothing wrong. So the session clock is a separate field, `None` means
+    unbounded, and `PolicySnapshot.largest_total()` deliberately ignores it
+    -- a 3 h `stt_session` must not refuse startup behind a 130 s grace. The
+    drain hook, not the grace, is what ends a long session on deploy (4.3).
+
+    A breach closes the client with 4901 and the upstream with 1000. It
+    exists because every provider caps a socket somewhere (OpenAI at 60 min,
+    AssemblyAI at 3 h) and a gateway that learns the cap from the provider's
+    close code learns it after the session is already unrecoverable."""
+
+    idle: float | None = None
+    """Max gap with NO activity of any kind in either direction, in seconds.
+
+    `progress` is about a unit that started and stopped producing; this is
+    about a socket with no unit in flight at all -- an Inworld TTS connection
+    whose contexts have all closed, a transcription session nobody is
+    speaking into. `None` disables it. A breach closes the client with 4906.
+
+    It is the gateway's own liveness, not a proxy for the provider's:
+    Inworld never pings and never closes a healthy socket (captures-ws 1.3),
+    so nothing but this budget ever reclaims an abandoned upstream socket.
+    Transport pings (uvicorn's 20 s, `websockets`' 20 s) do NOT reset it --
+    they prove the TCP path is alive, which is exactly what an abandoned
+    socket also proves."""
+
     def validate(self) -> Budgets:
         if self.total <= 0:
             raise ValueError("total budget must be positive")
@@ -319,6 +351,16 @@ class Budgets:
                 )
         if self.liveness is not None and self.liveness < self.progress:
             raise ValueError("liveness budget must be >= progress budget")
+        # The two session-scale clocks (PLAN-G). Positive or None; NOT held
+        # to `<= total`, because they measure a socket and `total` measures a
+        # request -- see their docstrings for why conflating the two would
+        # make every long-lived session refuse startup.
+        for name in ("session_total", "idle"):
+            value = getattr(self, name)
+            if value is not None and value <= 0:
+                raise ValueError(
+                    f"{name} budget must be positive, or None for unbounded"
+                )
         return self
 
 
