@@ -25,6 +25,7 @@ dependencies = [
     # re-run `tests/contract/test_lifecycle.py` before trusting a deploy.
     "uvicorn>=0.52,<0.53",
     "prometheus-client>=0.20",
+    "websockets>=15,<18",
 ]
 
 [project.optional-dependencies]
