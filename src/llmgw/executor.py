@@ -528,6 +528,7 @@ class Executor:
         buffer_bytes: int = DEFAULT_BUFFER_BYTES,
         max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES,
         on_finish: OnFinish | None = None,
+        request_facts: Any = None,
     ) -> ExecutionResult:
         """Walk the plan until something answers, or nothing can.
 
@@ -712,6 +713,7 @@ class Executor:
                         max_frame_bytes=max_frame_bytes,
                         commitment=commitment,
                         state=state,
+                        request_facts=request_facts,
                     )
                 except GatewayError as err:
                     inflight = None
@@ -1009,6 +1011,7 @@ class Executor:
         max_frame_bytes: int,
         commitment: _Commitment,
         state: _AttemptState,
+        request_facts: Any = None,
     ) -> PumpResult | None:
         """Open one target and, if it produces a byte, serve it to the client.
 
@@ -1087,9 +1090,17 @@ class Executor:
             "credential_id": target.credential_key,
         }
         # ======================= THE GATE ==================================
-        # Both refusals below raise before any socket exists. They are
+        # The refusals below raise before any socket exists. They are
         # `try_next` by taxonomy and the loop obeys that; nothing here
         # decides anything.
+        #
+        # 0. The surface's say on THIS target (PLAN-2 Phase F): a Responses
+        #    body that names provider-held state is refused for a provider
+        #    that holds none. Before the breaker on purpose -- it is not
+        #    evidence about the provider and must cost it no ticket.
+        check_target = getattr(surface, "check_target", None)
+        if check_target is not None:
+            check_target(request_facts, target)
         state.tickets = self._acquire_tickets(target)
         async with self._acquire_permit(target):
             retry_budget.record_attempt()

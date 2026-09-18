@@ -13,6 +13,7 @@ from llmgw.surfaces import (
     EMBEDDINGS,
     MODELS,
     OPENAI_CHAT,
+    OPENAI_RESPONSES,
     REALTIME_CONTROL,
     REGISTRY,
     ROUTES,
@@ -58,6 +59,8 @@ def test_the_two_chat_surfaces_keep_their_routes_and_upstream_paths():
          ("/v1/realtime/client_secrets", "/v1/realtime/calls/{call_id}/{action}"),
          "/v1/realtime/{call_id}/{action}", ("POST",), "openai", False),
         (ASSEMBLYAI_TOKEN, ("/assemblyai/v3/token",), "/v3/token", ("GET",), "openai", True),
+        # PLAN-2 Phase F: the Responses surface, same path both sides.
+        (OPENAI_RESPONSES, ("/v1/responses",), "/v1/responses", ("POST",), "openai", False),
     ],
 )
 def test_phase_c_surfaces_declare_their_contract(
@@ -68,6 +71,31 @@ def test_phase_c_surfaces_declare_their_contract(
     assert surface_methods(surface) == methods
     assert surface_dialect(surface) == dialect
     assert surface_forward_query(surface) is query
+
+
+def test_the_responses_route_is_served_and_no_longer_announced_as_unbuilt():
+    """Phase F retired the 501: `/v1/responses` is a registry route with its
+    own surface, and the `UNIMPLEMENTED_ROUTES` mechanism stays (empty) for
+    the next surface announced before it is built."""
+    assert "/v1/responses" not in app_module.UNIMPLEMENTED_ROUTES
+    assert app_module.UNIMPLEMENTED_ROUTES == ()
+    assert app_module.ROUTE_TO_UPSTREAM_PATH["/v1/responses"] == "/v1/responses"
+    assert for_route("/v1/responses") is OPENAI_RESPONSES
+    assert OPENAI_RESPONSES.name == "openai_responses"
+    assert "openai_responses" in app_module.SURFACE_NAMES
+    assert not set(app_module.UNIMPLEMENTED_ROUTES) & set(ROUTES)
+
+
+def test_the_responses_route_is_mounted_in_both_forms():
+    from llmgw.server.config import ServerConfig
+
+    app = app_module.build_app(ServerConfig())
+    mounted = {(r.path, tuple(sorted(r.methods or ()))) for r in app.routes}  # type: ignore[attr-defined]
+    assert ("/v1/responses", ("POST",)) in mounted
+    assert ("/workloads/{workload}/v1/responses", ("POST",)) in mounted
+    names = {r.name for r in app.routes}  # type: ignore[attr-defined]
+    assert "openai_responses" in names and "openai_responses_by_workload" in names
+    assert "unimplemented/v1/responses" not in names
 
 
 def test_the_servers_route_table_is_derived_from_the_registry():

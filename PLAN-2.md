@@ -408,6 +408,8 @@ never widens the pinned session config. Size: three to four days.
 
 ## Phase F: Responses API
 
+Shipped 2026-09-18; see CONTRACTS.md C22 and capabilities/captures-responses.md.
+
 `POST /v1/responses` as a first-class surface: semantic SSE events
 (`response.*`), `response.failed` and `response.incomplete` as the native
 ending forwarded when upstream sent them (the P1 note already says so),

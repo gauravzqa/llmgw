@@ -299,12 +299,13 @@ token. The probe is an operator endpoint and an operator holds ids, not
 tokens; a probe that had to be handed a secret to answer a question about a
 tenant would be a probe that teaches people to paste secrets into URLs."""
 
-UNIMPLEMENTED_ROUTES: tuple[str, ...] = ("/v1/responses",)
-"""Registered so the answer is a 501 that names the phase, not a 404 that
-looks like a typo. The Responses surface has a real `response.failed` frame to
-forward on failure (C2, third row) and no surface object exists for it yet, so
-serving it would mean guessing at an ending -- which is the one thing C2
-forbids."""
+UNIMPLEMENTED_ROUTES: tuple[str, ...] = ()
+"""Routes mounted as a 501 that names the phase, so a not-yet-built surface
+answers "not built" rather than a 404 that looks like a typo. Empty since
+PLAN-2 Phase F: `/v1/responses` was the last entry and is now served by
+`surfaces.responses.OpenAIResponsesSurface` (its `response.failed` ending is
+C2's third row, forwarded when upstream sent it). The mechanism stays for the
+next surface that is announced before it is built."""
 
 
 # ==========================================================================
@@ -2576,6 +2577,9 @@ class PassthroughEndpoint:
                 # an oversized provider frame and this process's RSS.
                 buffer_bytes=config.buffer_bytes,
                 max_frame_bytes=config.max_frame_bytes,
+                # What `parse_request` read, for the surface's per-target
+                # refusal (`Surface.check_target`, Phase F).
+                request_facts=exchange.request_facts,
                 # The accounting hook rides INSIDE the executor rather than
                 # being called on `result` below, because the line below is
                 # never reached on a client disconnect: `run_until_disconnect`

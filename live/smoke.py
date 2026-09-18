@@ -56,14 +56,19 @@ from llmgw.catalog import (
     DEFAULT_CATALOG,
     Catalog,
     ModelSpec,
-    ProviderConn,
     price_of,
 )
 from llmgw.clocks import Budgets
 from llmgw.server.app import build_app
 from llmgw.server.config import ServerConfig
 from llmgw.sse import SSEParser
-from llmgw.surfaces import ANTHROPIC_MESSAGES, OPENAI_CHAT, Surface, Usage
+from llmgw.surfaces import (
+    ANTHROPIC_MESSAGES,
+    OPENAI_CHAT,
+    OPENAI_RESPONSES,
+    Surface,
+    Usage,
+)
 
 PROMPT = "Reply with exactly the word: ok"
 MAX_TOKENS = 16
@@ -95,20 +100,23 @@ IDENTITY_MODEL_ID = "anthropic.haiku-4-5-identity"
 uncompressed body. See `live_catalog` -- this pair is a bug reproduction, not
 a feature."""
 
-OPENAI_PROVIDER = "openai"
 OPENAI_MODEL_ID = "openai.gpt-4o-mini"
 OPENAI_STRICT_MODEL_ID = "openai.gpt-5-nano"
-"""OpenAI is NOT in the shipped catalog even though `$OPENAI_API_KEY` is set
-and the account reaches 135 models. Added here because Task 3 needs two real
-OpenAI-dialect providers and OpenRouter's account has no credit -- and
-because "the catalog has no entry for a provider we hold a working key to"
-is itself a reconciliation finding."""
+"""Both shipped catalog rows now (`gpt-4o-mini` since 16 Sep 2026, finding
+36; `gpt-5-nano` since Phase F). Until then this module carried its own
+copies with an alias-less `openai.gpt-4o-mini`, and because `with_overrides`
+REPLACES a row, the override silently dropped the `gpt-4o-mini-2024-07-18`
+alias the shipped row declares -- which is the id OpenAI echoes and the one
+`echo_roundtrip` and the Responses two-turn case send back. The live run
+must see the catalog the gateway ships, aliases included."""
+
+DEEPSEEK_MODEL_ID = "deepseek.deepseek-v4-flash"
 
 
 def live_catalog(base: Catalog = DEFAULT_CATALOG) -> Catalog:
     """The shipped catalog, plus what a live run needs that it does not have.
 
-    Four additions, each of which is a finding rather than a convenience:
+    Two additions, each of which is a finding rather than a convenience:
 
     1. `live.ghost-deepseek` -- a candidate that fails NATURALLY. The wire
        model id is not one DeepSeek serves, so the 400 is DeepSeek's, in
@@ -122,7 +130,10 @@ def live_catalog(base: Catalog = DEFAULT_CATALOG) -> Catalog:
        labelled `text/event-stream`. `ProviderConn.extra_headers` is merged
        LAST by `build_headers`, which makes it the only lever that exists
        today. The real fix belongs in `Upstream._client_for`.
-    3+4. `openai` and two models on it, because the catalog has none.
+
+    The `openai` provider and its two models used to be a third and fourth
+    addition; they ship in the catalog now and are deliberately NOT overridden
+    (see `OPENAI_MODEL_ID`).
     """
     ghost = ModelSpec(
         id=GHOST_MODEL_ID, provider="deepseek", api_model=GHOST_API_MODEL,
@@ -140,28 +151,9 @@ def live_catalog(base: Catalog = DEFAULT_CATALOG) -> Catalog:
         # one alias claimed by two catalog ids is a construction error (A1).
         aliases=(),
     )
-    openai_provider = ProviderConn(
-        id=OPENAI_PROVIDER, kind="openai", base_url="https://api.openai.com/v1",
-        api_key_env="OPENAI_API_KEY", max_concurrency=32,
-    )
-    # Rates are the published list prices; OpenAI exposes no price endpoint,
-    # so unlike the OpenRouter rows in `live.probe` these are NOT externally
-    # verified, and the date says only when they were copied.
-    gpt_mini = ModelSpec(
-        id=OPENAI_MODEL_ID, provider=OPENAI_PROVIDER, api_model="gpt-4o-mini",
-        input_per_m=0.15, cached_input_per_m=0.075, output_per_m=0.60,
-        context_window=128_000, max_output=16_384, priced_at="2026-09-09",
-    )
-    gpt_nano = ModelSpec(
-        id=OPENAI_STRICT_MODEL_ID, provider=OPENAI_PROVIDER, api_model="gpt-5-nano",
-        input_per_m=0.05, cached_input_per_m=0.005, output_per_m=0.40,
-        context_window=400_000, max_output=128_000, can_reason=True,
-        priced_at="2026-09-09",
-    )
     return base.with_overrides(
-        providers={IDENTITY_PROVIDER: identity_provider,
-                   OPENAI_PROVIDER: openai_provider},
-        models={m.id: m for m in (ghost, identity_model, gpt_mini, gpt_nano)},
+        providers={IDENTITY_PROVIDER: identity_provider},
+        models={m.id: m for m in (ghost, identity_model)},
     )
 
 
@@ -849,6 +841,344 @@ def phase_c_routes_case(gw: GatewayServer, *, out=sys.stdout) -> None:
           f"input_tokens={n}")
 
 
+# ==========================================================================
+# PLAN-2 Phase F: `/v1/responses` (CONTRACTS.md C22). Every shape below was
+# first seen on the wire in `capabilities/captures-responses.md` (17 Sep
+# 2026); these cases assert that the same shapes survive the gateway. All on
+# the bare route, so the body's `model` picks the target through the alias
+# table -- which is exactly what the Responses SDK does when it echoes ids.
+# ==========================================================================
+
+RESPONSES_ROUTE = "/v1/responses"
+RESPONSES_TERMINALS = ("response.completed", "response.incomplete")
+
+
+@dataclass
+class ResponsesStream:
+    """One streamed `/v1/responses` call: the measurement, the response
+    headers, and every frame in order as `(event name, parsed payload)`.
+    `payload` is None for comments, `[DONE]` and unparseable data."""
+
+    measured: Measured
+    headers: dict[str, str] = field(default_factory=dict)
+    frames: list[tuple[str, dict[str, Any] | None]] = field(default_factory=list)
+    body_text: str = ""
+
+    @property
+    def names(self) -> list[str]:
+        return [name for name, _ in self.frames]
+
+    @property
+    def terminal(self) -> tuple[str, dict[str, Any] | None]:
+        """The last non-comment frame; `("", None)` for an empty stream."""
+        for name, payload in reversed(self.frames):
+            if name != "<sse-comment>":
+                return name, payload
+        return "", None
+
+    @property
+    def response(self) -> dict[str, Any]:
+        """The full `response` object off the terminal frame, or `{}`."""
+        _, payload = self.terminal
+        resp = (payload or {}).get("response")
+        return resp if isinstance(resp, dict) else {}
+
+
+def _responses_body(model: str, text: str, *, stream: bool,
+                    max_output_tokens: int = MAX_TOKENS, **extra: Any) -> dict[str, Any]:
+    """`max_output_tokens` is this dialect's cap and 16 is OpenAI's floor
+    (probe 9: 8 is a 400 `integer_below_min_value`)."""
+    body: dict[str, Any] = {"model": model, "input": text, "stream": stream,
+                            "max_output_tokens": max_output_tokens}
+    body.update(extra)
+    return body
+
+
+def _responses_stream(gw: GatewayServer, body: dict[str, Any], *, label: str,
+                      model_id: str, catalog: Catalog,
+                      timeout: float = 90.0) -> ResponsesStream:
+    """POST one streamed body and account for it the way `measure` does:
+    first byte, total, and usage folded by the SAME `OPENAI_RESPONSES.apply_usage`
+    the gateway bills with, so a row in the results table is comparable with
+    the chat rows above it."""
+    measured = Measured(label=label, workload="responses", model_id=model_id, stream=True)
+    result = ResponsesStream(measured=measured)
+    parser = SSEParser(max_frame_bytes=1 << 20)
+    seen: list[str] = []
+    started = time.perf_counter()
+    with httpx.Client(timeout=httpx.Timeout(timeout, connect=10.0)) as client:
+        with client.stream("POST", gw.base_url + RESPONSES_ROUTE, json=body) as resp:
+            measured.headers_ms = (time.perf_counter() - started) * 1000
+            measured.status = resp.status_code
+            measured.gw = {k: v for k, v in resp.headers.items() if k.startswith("x-gw-")}
+            measured.upstream_headers = _interesting(resp.headers)
+            result.headers = dict(resp.headers)
+            if resp.status_code != 200:
+                result.body_text = resp.read().decode("utf-8", "replace")[:400]
+                measured.error_body = result.body_text
+                measured.total_ms = (time.perf_counter() - started) * 1000
+                return result
+            try:
+                for chunk in resp.iter_raw():
+                    if measured.ttft_ms is None and chunk:
+                        measured.ttft_ms = (time.perf_counter() - started) * 1000
+                    for ev in parser.feed(chunk):
+                        _collect_responses_frame(ev, result, seen)
+                for ev in parser.close():
+                    _collect_responses_frame(ev, result, seen)
+            except httpx.RemoteProtocolError as exc:
+                measured.note = f"TRUNCATED: {type(exc).__name__}: {exc}"
+        measured.total_ms = (time.perf_counter() - started) * 1000
+    measured.events = seen
+    measured.usd = usd_of(measured.usage, catalog.models[model_id])
+    return result
+
+
+def _collect_responses_frame(ev: Any, result: ResponsesStream, seen: list[str]) -> None:
+    _note_event(ev, seen)
+    OPENAI_RESPONSES.apply_usage(ev, result.measured.usage)
+    if ev.is_comment:
+        result.frames.append(("<sse-comment>", None))
+        return
+    if ev.data.strip() == b"[DONE]":
+        result.frames.append(("[DONE]", None))
+        return
+    try:
+        payload = json.loads(ev.data)
+    except ValueError:
+        payload = None
+    if not isinstance(payload, dict):
+        payload = None
+    name = ev.event or (payload or {}).get("type") or "<unnamed-data>"
+    result.frames.append((str(name), payload))
+
+
+def _verdict(out, label: str, status: int, headers: dict[str, str] | httpx.Headers,
+             ok: bool, detail: str = "") -> None:
+    """`_case` for a call that has no `httpx.Response` (a consumed stream)."""
+    verdict = "PASS" if ok else "FAIL"
+    served = headers.get("x-gw-served-by", "-")
+    print(f"  {label}: {status} served_by={served} {detail} -> {verdict}", file=out)
+
+
+def responses_openai_case(gw: GatewayServer, *, catalog: Catalog,
+                          out=sys.stdout) -> list[Measured]:
+    """Cases 1-5: happy paths streamed and buffered, the cap-hit ending, the
+    two-turn state loop through the alias table, and the background refusal.
+    Returns the streamed happy path as a measured row."""
+    rows: list[Measured] = []
+
+    # 1. Streamed happy path -- the measured row.
+    s = _responses_stream(gw, _responses_body(OPENAI_MODEL_ID, PROMPT, stream=True),
+                          label="responses/openai/stream", model_id=OPENAI_MODEL_ID,
+                          catalog=catalog)
+    rows.append(s.measured)
+    first = s.names[0] if s.names else ""
+    terminal, _ = s.terminal
+    ctype = s.headers.get("content-type", "")
+    ok = (s.measured.status == 200 and ctype.startswith("text/event-stream")
+          and first == "response.created" and terminal == "response.completed"
+          and "[DONE]" not in s.names
+          and "x-gw-served-by" in s.headers and "x-gw-model" in s.headers)
+    _verdict(out, "responses stream", s.measured.status, s.headers, ok,
+             f"first={first} last={terminal} frames={len(s.frames)} "
+             f"done_marker={'[DONE]' in s.names} model_hdr={s.headers.get('x-gw-model')} "
+             f"ctype={ctype.split(';')[0]}")
+
+    # 2. Buffered happy path: A1 rewrite puts the CATALOG id in `model`.
+    r = httpx.post(f"{gw.base_url}{RESPONSES_ROUTE}", timeout=60,
+                   json=_responses_body(OPENAI_MODEL_ID, PROMPT, stream=False))
+    j = r.json() if r.status_code == 200 else {}
+    u = j.get("usage") or {}
+    total_ok = (isinstance(u.get("total_tokens"), int)
+                and u.get("total_tokens")
+                == (u.get("input_tokens", -1) + u.get("output_tokens", -1)))
+    _case(out, "responses buffered", r,
+          r.status_code == 200 and j.get("status") == "completed"
+          and j.get("model") == OPENAI_MODEL_ID
+          and r.headers.get("x-gw-body-modified") == "1" and total_ok,
+          f"status={j.get('status')} model={j.get('model')!r} "
+          f"body_modified={r.headers.get('x-gw-body-modified')} "
+          f"usage={u.get('input_tokens')}+{u.get('output_tokens')}={u.get('total_tokens')}")
+
+    # 3. Cap hit: the terminal frame is `response.incomplete`, never followed
+    # by (or replaced with) a `response.completed` (C22).
+    s = _responses_stream(
+        gw, _responses_body(OPENAI_MODEL_ID, "Write a 300-word essay about rivers.",
+                            stream=True, max_output_tokens=16),
+        label="responses/openai/incomplete", model_id=OPENAI_MODEL_ID, catalog=catalog)
+    terminal, _ = s.terminal
+    reason = (s.response.get("incomplete_details") or {}).get("reason")
+    _verdict(out, "responses incomplete", s.measured.status, s.headers,
+             s.measured.status == 200 and terminal == "response.incomplete"
+             and reason == "max_output_tokens" and "response.completed" not in s.names,
+             f"last={terminal} reason={reason} stop={s.measured.usage.stop_reason} "
+             f"out={s.measured.usage.output_tokens}")
+
+    # 4. Two turns of provider-held state. Turn B names the SNAPSHOT id
+    # OpenAI echoes (the gateway rewrote A's `model` to the catalog id, so an
+    # SDK that had talked to OpenAI directly is what this simulates); the
+    # alias table must route it to the same row (A1).
+    a = httpx.post(f"{gw.base_url}{RESPONSES_ROUTE}", timeout=60,
+                   json=_responses_body(OPENAI_MODEL_ID,
+                                        "My favourite colour is teal. Reply OK.",
+                                        stream=False))
+    a_id = a.json().get("id") if a.status_code == 200 else None
+    _case(out, "responses two-turn A", a, bool(a_id), f"id={a_id}")
+    if a_id:
+        b = httpx.post(f"{gw.base_url}{RESPONSES_ROUTE}", timeout=60,
+                       json=_responses_body("gpt-4o-mini-2024-07-18",
+                                            "What is my favourite colour? One word.",
+                                            stream=False, previous_response_id=a_id))
+        bj = b.json() if b.status_code == 200 else {}
+        _case(out, "responses two-turn B (snapshot id + previous_response_id)", b,
+              b.status_code == 200 and bj.get("previous_response_id") == a_id,
+              f"previous_response_id_echo={bj.get('previous_response_id') == a_id} "
+              f"model={bj.get('model')!r}"
+              + ("" if b.status_code == 200 else f" {b.text[:200]}"))
+
+    # 5. `background: true` is refused before any target is chosen.
+    r = httpx.post(f"{gw.base_url}{RESPONSES_ROUTE}", timeout=60,
+                   json=_responses_body(OPENAI_MODEL_ID, "hi", stream=False, background=True))
+    _case(out, "responses background refused", r,
+          r.status_code == 400 and "background" in r.text.lower() and _no_upstream(r),
+          f"names_background={'background' in r.text.lower()} "
+          f"no_upstream={_no_upstream(r)}")
+    return rows
+
+
+def _no_upstream(resp: httpx.Response) -> bool:
+    """True when the gateway answered without opening a socket upstream.
+
+    The gateway does not OMIT `x-gw-served-by` on such a response; it sends
+    the literal `-` (the same sentinel `_case` prints) with `x-gw-attempts: 0`.
+    Asserting on header absence would fail every gateway-side 400 for the
+    wrong reason, so this is the form the assertion takes."""
+    served = resp.headers.get("x-gw-served-by")
+    return served in (None, "-") and resp.headers.get("x-gw-attempts", "0") == "0"
+
+
+def _metric_value(gw: GatewayServer, family: str, *needles: str) -> float | None:
+    """The sample value of the first `/metrics` line in `family` whose label
+    set contains every needle, or None when there is no such line yet."""
+    text = httpx.get(f"{gw.base_url}/metrics", timeout=10).text
+    for line in text.splitlines():
+        if line.startswith(family) and all(n in line for n in needles):
+            try:
+                return float(line.rsplit(" ", 1)[1])
+            except (IndexError, ValueError):
+                return None
+    return None
+
+
+def responses_web_search_case(gw: GatewayServer, *, catalog: Catalog, out=sys.stdout) -> None:
+    """Case 6: one hosted `web_search_preview` call (about USD 0.03: the
+    search is per-call priced, not per token). Asserts the lifecycle event
+    reached the client, that the provider's own count is on the terminal
+    frame, and that the gateway counted it as a server tool call."""
+    before = _metric_value(gw, "llmgw_server_tool_calls_total", "web_search_requests") or 0.0
+    s = _responses_stream(
+        gw, _responses_body(OPENAI_MODEL_ID, "What is today's top headline? One sentence.",
+                            stream=True, max_output_tokens=64,
+                            tools=[{"type": "web_search_preview"}]),
+        label="responses/openai/web-search", model_id=OPENAI_MODEL_ID, catalog=catalog,
+        timeout=120)
+    terminal, _ = s.terminal
+    n = ((s.response.get("tool_usage") or {}).get("web_search") or {}).get("num_requests")
+    counted = dict(s.measured.usage.server_tool_calls).get("web_search_requests")
+    _verdict(out, "responses web-search", s.measured.status, s.headers,
+             s.measured.status == 200 and "response.web_search_call.completed" in s.names
+             and isinstance(n, int) and n >= 1 and terminal in RESPONSES_TERMINALS,
+             f"last={terminal} web_search_call.completed="
+             f"{'response.web_search_call.completed' in s.names} num_requests={n} "
+             f"client_side_count={counted} "
+             f"tokens={s.measured.usage.input_tokens}+{s.measured.usage.output_tokens}")
+    # The gateway's own accounting runs as the stream closes; give it a moment.
+    after = None
+    for _ in range(20):
+        after = _metric_value(gw, "llmgw_server_tool_calls_total", "web_search_requests")
+        if after is not None and after > before:
+            break
+        time.sleep(0.1)
+    delta = None if after is None else after - before
+    verdict = "PASS" if delta is not None and delta >= 1 else "FAIL"
+    print(f"  responses web-search metric: llmgw_server_tool_calls_total"
+          f"{{web_search_requests}} +{delta} -> {verdict}", file=out)
+
+
+def responses_reasoning_case(gw: GatewayServer, *, catalog: Catalog, out=sys.stdout) -> None:
+    """Case 7: a reasoning model on the surface. `reasoning_tokens` is a
+    subset of `output_tokens` and may be 0 at effort low (probe 4); the
+    assertion is that the field arrives as an integer, not its value."""
+    if OPENAI_STRICT_MODEL_ID not in catalog.models:
+        print(f"  responses reasoning: SKIPPED ({OPENAI_STRICT_MODEL_ID} is not in the "
+              "catalog; its price row is still unconfirmed) -> INFO", file=out)
+        return
+    s = _responses_stream(
+        gw, _responses_body(OPENAI_STRICT_MODEL_ID,
+                            "What is 17*23? Answer with the number only.",
+                            stream=True, max_output_tokens=256, reasoning={"effort": "low"}),
+        label="responses/openai/gpt-5-nano", model_id=OPENAI_STRICT_MODEL_ID, catalog=catalog)
+    terminal, _ = s.terminal
+    reasoning = ((s.response.get("usage") or {}).get("output_tokens_details") or {}
+                 ).get("reasoning_tokens")
+    text = "".join(
+        part.get("text", "") for item in s.response.get("output", [])
+        if item.get("type") == "message" for part in item.get("content", []))
+    _verdict(out, "responses reasoning (gpt-5-nano)", s.measured.status, s.headers,
+             s.measured.status == 200 and terminal == "response.completed"
+             and isinstance(reasoning, int) and not isinstance(reasoning, bool),
+             f"last={terminal} reasoning_tokens={reasoning!r} "
+             f"out={s.measured.usage.output_tokens} text={text!r} "
+             f"model={s.response.get('model')!r}")
+
+
+def responses_deepseek_case(gw: GatewayServer, *, catalog: Catalog, out=sys.stdout) -> None:
+    """Case 8: DeepSeek's stateless door on the same surface. A small cap is
+    routinely spent on reasoning alone (probe 10a), so `incomplete` is as
+    good as `completed`; what must hold is 200 + a usage object, the
+    gateway's own 400 for provider-held state (C22), and reasoning streamed
+    in clear."""
+    r = httpx.post(f"{gw.base_url}{RESPONSES_ROUTE}", timeout=90,
+                   json=_responses_body(DEEPSEEK_MODEL_ID, "Say hi.", stream=False,
+                                        max_output_tokens=128))
+    j = r.json() if r.status_code == 200 else {}
+    u = j.get("usage") if isinstance(j.get("usage"), dict) else {}
+    reasoning = (u.get("output_tokens_details") or {}).get("reasoning_tokens")
+    _case(out, "responses deepseek buffered", r,
+          r.status_code == 200 and j.get("status") in ("completed", "incomplete")
+          and isinstance(j.get("usage"), dict),
+          f"status={j.get('status')} model={j.get('model')!r} "
+          f"usage={u.get('total_tokens')} reasoning={reasoning}")
+    r = httpx.post(f"{gw.base_url}{RESPONSES_ROUTE}", timeout=90,
+                   json=_responses_body(DEEPSEEK_MODEL_ID, "Say hi.", stream=False,
+                                        max_output_tokens=128, previous_response_id="resp_x"))
+    _case(out, "responses deepseek previous_response_id refused (C22)", r,
+          r.status_code == 400 and _no_upstream(r),
+          f"no_upstream={_no_upstream(r)} {r.text[:120]!r}")
+    s = _responses_stream(
+        gw, _responses_body(DEEPSEEK_MODEL_ID, "What is 17*23? Answer with the number only.",
+                            stream=True, max_output_tokens=128),
+        label="responses/deepseek/stream", model_id=DEEPSEEK_MODEL_ID, catalog=catalog)
+    terminal, _ = s.terminal
+    _verdict(out, "responses deepseek stream", s.measured.status, s.headers,
+             s.measured.status == 200 and terminal in RESPONSES_TERMINALS
+             and "response.reasoning_text.delta" in s.names,
+             f"last={terminal} reasoning_text.delta="
+             f"{'response.reasoning_text.delta' in s.names} "
+             f"reasoning_tokens={s.measured.usage.reasoning_tokens} "
+             f"out={s.measured.usage.output_tokens}")
+
+
+def responses_case(gw: GatewayServer, *, catalog: Catalog, out=sys.stdout) -> list[Measured]:
+    """Phase F, all of it. Returns the rows for the results table."""
+    rows = responses_openai_case(gw, catalog=catalog, out=out)
+    responses_web_search_case(gw, catalog=catalog, out=out)
+    responses_reasoning_case(gw, catalog=catalog, out=out)
+    responses_deepseek_case(gw, catalog=catalog, out=out)
+    return rows
+
+
 def run(*, spend: bool = True, out=sys.stdout) -> list[Measured]:
     catalog = live_catalog()
     results: list[Measured] = []
@@ -886,6 +1216,8 @@ def run(*, spend: bool = True, out=sys.stdout) -> list[Measured]:
             anthropic_structured_and_adaptive_case(gw, out=out)
             openai_parallel_tools_case(gw, out=out)
             phase_c_routes_case(gw, out=out)
+            # Phase F: the Responses surface (C22). One measured row.
+            results.extend(responses_case(gw, catalog=catalog, out=out))
 
             # ---- Task 3: fallback across two real providers, raw socket ----
             for wl in FALLBACK_WORKLOADS:

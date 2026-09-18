@@ -35,6 +35,12 @@ Since PLAN-2 Phases C, D and E (18 Sep 2026) the route table comes from a
 surface registry, and these surfaces sit beside the two chat ones:
 `GET /v1/models` (served from the catalog, no upstream call),
 `POST /anthropic/v1/messages/count_tokens`, `POST /v1/embeddings`,
+`POST /v1/responses` (the OpenAI Responses API, Phase F: semantic
+`response.*` frames, `response.incomplete`/`response.failed` forwarded as the
+native ending, hosted tools and reasoning items passed through and accounted,
+`background: true` refused, and DeepSeek's stateless endpoint on the same
+surface with `previous_response_id` refused there rather than silently
+dropped),
 `POST /v1/realtime/client_secrets` and `GET /assemblyai/v3/token` (token
 minting with tenant-pinned session config and a per-tenant session cap),
 `POST /v1/audio/speech` (binary or SSE), `POST /v1/audio/transcriptions`
@@ -56,8 +62,8 @@ See [bench/results/live_smoke.md](bench/results/live_smoke.md).
 
 ```bash
 make venv      # uv venv + editable install
-make test      # tier 1: 1249 tests, no sockets, no sleeps.  ~2.2s
-make contract  # tier 2: 213 tests, real sockets + real uvicorn. ~65s
+make test      # tier 1: 1363 tests, no sockets, no sleeps.  ~2.2s
+make contract  # tier 2: 229 tests, real sockets + real uvicorn. ~65s
 make chaos     # tier 3:  22 tests, randomized faults + invariants. ~60s
 make live      # tier 4:  10 tests, REAL providers, real money (~$0.0002)
 make trace     # walk one real stream through every layer

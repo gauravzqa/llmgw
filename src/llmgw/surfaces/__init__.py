@@ -43,8 +43,10 @@ from llmgw.surfaces.embeddings import EMBEDDINGS, EmbeddingsSurface
 from llmgw.surfaces.models import MODELS, ModelsSurface
 from llmgw.surfaces.openai import OpenAIChatSurface
 from llmgw.surfaces.realtime_control import REALTIME_CONTROL, RealtimeControlSurface
+from llmgw.surfaces.responses import OpenAIResponsesSurface
 
 OPENAI_CHAT: Surface = OpenAIChatSurface()
+OPENAI_RESPONSES: Surface = OpenAIResponsesSurface()
 ANTHROPIC_MESSAGES: Surface = AnthropicMessagesSurface()
 
 try:  # Phase D's package; absent on a text-only build.
@@ -54,6 +56,7 @@ except ImportError:  # pragma: no cover - depends on which phases are present
 
 REGISTRY: tuple[Surface, ...] = (
     OPENAI_CHAT,
+    OPENAI_RESPONSES,
     ANTHROPIC_MESSAGES,
     MODELS,
     COUNT_TOKENS,
@@ -125,6 +128,7 @@ __all__ = [
     "EMBEDDINGS",
     "MODELS",
     "OPENAI_CHAT",
+    "OPENAI_RESPONSES",
     "REALTIME_CONTROL",
     "REGISTRY",
     "ROUTES",
@@ -139,6 +143,7 @@ __all__ = [
     "EventKind",
     "ModelsSurface",
     "OpenAIChatSurface",
+    "OpenAIResponsesSurface",
     "RealtimeControlSurface",
     "RequestFacts",
     "Surface",

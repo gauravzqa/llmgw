@@ -576,23 +576,27 @@ def test_the_registry_is_a_closed_set_keyed_by_the_metrics_label():
 
     names = set(SURFACES)
     voice = {s.name for s in VOICE_SURFACES}
-    assert names == {"openai_chat", "anthropic_messages"} | PHASE_C_SURFACES | voice
+    assert names == (
+        {"openai_chat", "openai_responses", "anthropic_messages"} | PHASE_C_SURFACES | voice
+    )
     assert len(REGISTRY) >= len(names)  # voice registers one instance per route
     for name, surface in SURFACES.items():
         assert surface.name == name
         assert set(name) <= set("abcdefghijklmnopqrstuvwxyz_"), name
-    # The two chat surfaces are addressable by upstream path, as before.
-    for name in ("openai_chat", "anthropic_messages"):
+    # The chat surfaces (and Phase F's Responses) are addressable by upstream
+    # path, as before.
+    for name in ("openai_chat", "openai_responses", "anthropic_messages"):
         assert for_path(SURFACES[name].path) is SURFACES[name]
     assert for_path("/v1/nope") is None
     # Every registry name is either known to metrics or a Phase C/D name
     # waiting on `metrics.SURFACES` to widen; and every metrics name that is
-    # not a registry name is one of the two kinds the vocabulary may carry
-    # ahead of its surface (the unbuilt Responses surface, the voice names
-    # that land with their own package).
+    # not a registry name is a voice name that lands with its own package.
+    # `openai_responses` was reserved in the vocabulary ahead of its surface
+    # and is now claimed (PLAN-2 Phase F).
     assert names - set(metrics.SURFACES) <= PHASE_C_SURFACES | voice
+    assert "openai_responses" in names and "openai_responses" in metrics.SURFACES
     ahead = set(metrics.SURFACES) - names
-    assert ahead <= {"openai_responses"} | VOICE_SURFACE_NAMES | PHASE_C_SURFACES, ahead
+    assert ahead <= VOICE_SURFACE_NAMES | PHASE_C_SURFACES, ahead
 
 
 # ============================================================ Phase B3 kinds

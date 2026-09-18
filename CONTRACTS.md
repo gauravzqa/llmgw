@@ -446,3 +446,31 @@ the record from the request and the bytes forwarded and the record says
 `estimated`; `cost_notes` names the estimate. A voice request never records
 zero with a confident basis: an empty Inworld result (`usage: null`) is an
 exact zero because Inworld said so, not because nothing was parsed.
+
+## C22. The Responses surface refuses what it cannot honour and forwards what the provider ended with
+
+`POST /v1/responses` (PLAN-2 Phase F) refuses `background: true` at the
+gateway: 400 `invalid_request`, no upstream call, no breaker evidence. A
+background response is created and then polled by id, and until polling
+routes exist a 200 with `status: "queued"` would hand the client an id the
+gateway cannot resolve. For the same reason a body carrying
+`previous_response_id` or `conversation` is refused (400, no upstream call)
+for a provider whose row says `stateless_responses` -- DeepSeek accepts those
+fields with a 200 and silently drops them, which is worse than a refusal --
+while a plan with a stateful target further down falls through to it.
+Nothing is ever stripped from the body.
+
+On the stream, C2's third row is exact: `response.failed` and `event: error`
+frames upstream sent reach the client byte for byte, the record carries the
+provider's own classification (`in_stream_error`, or `upstream_overloaded`
+when the code says so), and the body then closes. The gateway never
+synthesises a `response.completed` (which would report a cut answer as whole)
+or a `response.failed` the provider did not send. `response.incomplete` is a
+finished turn, not a failure: outcome `completed`, stop reason `length` or
+`content_filter`, usage exact.
+
+*Enforced by:* `tests/contract/test_responses.py`
+(`background_refused_before_upstream`, `stateless_provider_refuses_state`,
+`response_failed_is_forwarded_and_nothing_follows`,
+`error_event_is_forwarded_and_nothing_follows`, `incomplete_is_length`),
+`tests/unit/test_responses_surface.py`.

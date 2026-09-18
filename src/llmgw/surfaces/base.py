@@ -324,6 +324,13 @@ class RequestFacts:
     can never be billed exactly.
     """
 
+    needs_state: bool = False
+    """The body refers to state the provider is expected to hold (Responses
+    `previous_response_id` / `conversation`, PLAN-2 Phase F). Read by the
+    surface's `check_target` once the executor has resolved a target, so a
+    provider that silently drops such state (`ProviderConn.stateless_responses`)
+    is refused before a socket rather than answering without the history."""
+
 
 class Surface(Protocol):
     """One provider dialect. Stateless by construction -- every method takes
@@ -404,6 +411,15 @@ class Surface(Protocol):
         inexact, which is the honest report.
         """
         ...
+
+    # `check_target(facts, target) -> None` is an OPTIONAL hook, deliberately
+    # not a Protocol member: the executor resolves it with `getattr`, and a
+    # surface without it is a surface with nothing to refuse. Declaring it
+    # here would make every chat and buffered surface fail a structural
+    # check for a method they have no reason to carry. A surface that does
+    # define it (Phase F: the Responses surface refusing a body that names
+    # provider-held state bound for a provider with none) raises
+    # `errors.GatewayError` subclasses only, before anything is opened.
 
 
 

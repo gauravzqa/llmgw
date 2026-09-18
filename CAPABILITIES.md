@@ -32,8 +32,9 @@ cannot see** (stop reasons, reasoning and cache-write tokens, server-tool
 usage, upstream request ids, rate-limit headers), **a catalog that has drifted
 from the price lists and model line-ups** (DeepSeek prices off 3 to 12x,
 Sonnet 4.6 context 5x too low, current models absent, one alias retired), and
-**surfaces that do not exist** (`/v1/responses`, `/v1/models`,
-`count_tokens`, embeddings, files, batches). Two of the gaps are correctness
+**surfaces that do not exist** (files, batches; `/v1/models`, `count_tokens`
+and embeddings shipped in Phase C on 16 Sep 2026 and `/v1/responses` in
+Phase F on 18 Sep 2026, see below). Two of the gaps are correctness
 bugs a caller will hit in the first week: a response `model` that cannot be
 sent back, and out-of-money 429s that are retried.
 
@@ -42,7 +43,7 @@ sent back, and out-of-money 429s that are retried.
 | Capability | OpenAI | Anthropic | DeepSeek | Note |
 |---|---|---|---|---|
 | Chat / Messages (streaming and buffered) | S | S | S | `/v1/chat/completions`, `/anthropic/v1/messages`; `model` must be the catalog id |
-| Responses API | U (501) | – | U | `UNIMPLEMENTED_ROUTES`; OpenAI steers reasoning and agent use here |
+| Responses API | S | – | S (stateless) | `surfaces/responses.py` (Phase F, 18 Sep 2026); `background: true` → 400 at the gateway, no upstream call; DeepSeek + `previous_response_id`/`conversation` → 400 because DeepSeek silently drops them (CONTRACTS.md C22) |
 | Models list | U (404) | U | U | Some agent frameworks call it at boot; `/probe` is the gateway's own view |
 | Token counting | – | U | – | Free pre-flight endpoint callers use for budgeting |
 | Embeddings | U | – | – | Cheap buffered surface if wanted |
@@ -73,7 +74,7 @@ sent back, and out-of-money 429s that are retried.
 | `max_tokens` handling | S (`max_completion_tokens` preferred) | P (read, not validated) | P | Used for deadline sizing only |
 | `n > 1` | P, transcript is choice 0 | – | ? | Billing correct (usage is aggregate) |
 | `service_tier`, `inference_geo`, priority | P | P | – | Flex tier vs the 20 s first-event budget; 1.1x geo multiplier not costed |
-| Server / hosted tools (web search, code exec, MCP connector) | P on chat, U on Responses | P | – | Per-call pricing invisible to cost |
+| Server / hosted tools (web search, code exec, MCP connector) | P on chat, S on Responses (counted) | P | – | Responses: `*_call.completed` events / `output[]` items → `server_tool_calls`, with `response.tool_usage.web_search.num_requests` authoritative; on `llmgw_server_tool_calls_total`. Costed only where `ModelSpec.tool_rates` has a rate (Anthropic rows do, OpenAI rows do not yet) |
 | Prediction, verbosity, moderation, metadata, store, logprobs, seed, stop, sampling params | P | P | P | `store` stores under the provider project with the rewritten model |
 | Fine-tuned model ids | U | – | – | Need a catalog row with a price |
 | Body model rewrite | S | S | S | `X-Gw-Body-Modified: 1`; response `model` is the provider's wire id, see gap 1 |
@@ -90,7 +91,7 @@ sent back, and out-of-money 429s that are retried.
 | Non-streaming keep-alive (blank lines before JSON) | – | – | ? | Fake mode settles it |
 | In-stream error inside a 200 | S | S (`overloaded_error` etc.) | S | Failure, not content |
 | Unknown future event types | S (ignored) | S (META) | S | |
-| Responses semantic events | U | – | U | |
+| Responses semantic events | S | – | S | `response.completed`/`response.incomplete` terminal; `response.failed`/`error` forwarded byte-for-byte and classified, never synthesised (C2, C22); no `[DONE]` |
 | Frame size bound | S (1 MiB) | S | S | Logprobs-heavy or base64-audio frames could exceed it |
 | Compression | S (`identity` upstream) | S | S | Finding 24 |
 | HTTP/2 to provider | S | S | S | |
@@ -202,11 +203,12 @@ multi-turn, vision, JSON, DeepSeek as the cheap candidate).
    token budget is invisible until the 429. Add the request id to capture and an
    `X-Gw-Upstream-Request-Id` header; export `remaining` and `reset` as gauges
    per credential. Small to medium.
-10. **Surfaces that do not exist.** `/v1/responses` (501) blocks any caller on
-    the Responses SDK, which OpenAI now recommends for reasoning and hosted
-    tools; `/v1/models`, `count_tokens`, `/v1/embeddings` are 404 and cheap to
-    add as buffered passthroughs. Responses is large (semantic events,
-    `response.failed` ending); the others are small.
+10. **Surfaces that did not exist — closed.** `/v1/models`, `count_tokens` and
+    `/v1/embeddings` shipped in Phase C (16 Sep 2026); `/v1/responses` shipped
+    in Phase F (18 Sep 2026: `surfaces/responses.py`, CONTRACTS.md C22, wire
+    captures in `capabilities/captures-responses.md`, live smoke `responses *`
+    cases). Still missing: files, batches, and the Responses polling routes
+    (`GET /v1/responses/{id}`), which is why `background: true` is a 400.
 11. **Untested shapes.** Anthropic tool round trip, vision, PDF and structured
     outputs on the Anthropic surface; parallel tool calls on any provider;
     DeepSeek non-streaming keep-alive; `/beta/v1` path joining. Each has a named
@@ -256,9 +258,10 @@ prices for per-character products.
   an obvious unit test; together they change what a caller sees in week one.
 - **Second pass, accounting and defaults:** gaps 5, 6, 8, 9, plus
   `include_usage` injection and the 409/413/403 rules.
-- **Third pass, surfaces:** `/v1/models`, `count_tokens`, `/v1/embeddings`
-  as buffered passthroughs; then `/v1/responses` as its own surface; DeepSeek
-  `/anthropic` and `/beta` provider rows; peak/off-peak pricing on `ModelSpec`.
+- **Third pass, surfaces (done 16-18 Sep 2026):** `/v1/models`, `count_tokens`,
+  `/v1/embeddings` as buffered passthroughs; `/v1/responses` as its own
+  surface; DeepSeek `/anthropic` and `/beta` provider rows. Still open:
+  peak/off-peak pricing on `ModelSpec`.
 - **Tests to settle the unknowns** can go in at any point and should go first
   if an Anthropic tool-using caller is imminent.
 

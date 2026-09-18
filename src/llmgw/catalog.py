@@ -153,6 +153,15 @@ class ProviderConn:
     `/beta/v1/chat/completions`. None for every other row. Leading slash,
     no trailing slash; validated at construction."""
 
+    stateless_responses: bool = False
+    """The provider's `/v1/responses` holds no state between calls AND does
+    not say so: DeepSeek answers 200 to a `previous_response_id` or a
+    `conversation` and silently drops it (`capabilities/captures-responses.md`,
+    probe 12b), so the model replies without the history the client thinks it
+    has. When True the Responses surface refuses such a body for this
+    provider with a 400 before any socket (PLAN-2 Phase F). False for OpenAI,
+    which stores responses and 400s an unknown id itself."""
+
     def __post_init__(self) -> None:
         if self.path_prefix is not None and (
             not self.path_prefix.startswith("/") or self.path_prefix.endswith("/")
@@ -336,6 +345,10 @@ PROVIDERS: dict[str, ProviderConn] = {
         base_url="https://api.deepseek.com",
         api_key_env="DEEPSEEK_API_KEY",
         max_concurrency=32,
+        # PLAN-2 Phase F: `/v1/responses` (and `/responses`, identical) is
+        # stateless and swallows `previous_response_id` / `background`
+        # rather than rejecting them (probe 12b/12c, 17 Sep 2026).
+        stateless_responses=True,
     ),
     # Added 16 Sep 2026 (finding 36: a working key to 135 models the catalog
     # could not route to). Same entry the live smoke test had been building
@@ -372,6 +385,7 @@ PROVIDERS: dict[str, ProviderConn] = {
         api_key_env="DEEPSEEK_API_KEY",
         credential_id="deepseek",
         max_concurrency=32,
+        stateless_responses=True,  # same host, same stateless Responses door
     ),
     # ---------------------------------------------------------------------
     # PLAN-2 Phase D/E: voice providers. `kind="openai"` means only "no
@@ -489,6 +503,27 @@ MODELS: dict[str, ModelSpec] = {
             max_output=16_384,
             priced_at="2026-09-16",
             aliases=("gpt-4o-mini-2024-07-18",),
+        ),
+        # PLAN-2 Phase F: the reasoning-capable OpenAI row for the Responses
+        # surface. `gpt-5-nano` answered the 17 Sep 2026 probe
+        # (`capabilities/captures-responses.md` probes 4/4b: snapshot
+        # `gpt-5-nano-2025-08-07`, `reasoning_tokens` inside `output_tokens`,
+        # 400k context per OpenAI's model page). Prices read 2026-09-18 from
+        # https://developers.openai.com/api/docs/pricing (the page
+        # platform.openai.com/docs/pricing now redirects to): $0.05 input,
+        # $0.005 cached input, $0.40 output per 1M tokens.
+        ModelSpec(
+            id="openai.gpt-5-nano",
+            provider="openai",
+            api_model="gpt-5-nano",
+            input_per_m=0.05,
+            cached_input_per_m=0.005,
+            output_per_m=0.40,
+            context_window=400_000,
+            max_output=128_000,
+            can_reason=True,
+            priced_at="2026-09-18",
+            aliases=("gpt-5-nano-2025-08-07",),
         ),
         # Anthropic rates from platform.claude.com/docs/en/about-claude/pricing,
         # read 2026-09-16 (capabilities/anthropic.md §7). Cache WRITE is

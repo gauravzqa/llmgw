@@ -30,6 +30,16 @@ DEEPSEEK_UNKNOWN_MODEL = (
     b'"code":"invalid_request_error"}}'
 )
 
+DEEPSEEK_UNKNOWN_MODEL_2026_09_17 = (
+    b'{"error":{"message":"The supported API model names are deepseek-flash, '
+    b'deepseek-v4-pro, but you passed deepseek-nope.","type":"invalid_request_error",'
+    b'"param":null,"code":"invalid_request_error"}}'
+)
+"""Captured 17 Sep 2026 against `POST /v1/responses` (capabilities/
+captures-responses.md probe 12a). Same envelope as the chat body above with
+the current model list -- and served under `content-type:
+application/octet-stream`, which is why it has its own test."""
+
 OPENAI_UNSUPPORTED_PARAM = (
     b'{"error":{"message":"Unsupported parameter: \'max_tokens\' is not supported '
     b'with this model. Use \'max_completion_tokens\' instead.",'
@@ -51,6 +61,22 @@ OPENAI_UNKNOWN_MODEL = (
 
 
 # ------------------------------------------------- unknown model on a 400
+
+
+def test_a_deepseek_400_under_an_octet_stream_content_type_still_classifies_on_the_body():
+    """DeepSeek's Responses endpoint labels its JSON error bodies
+    `application/octet-stream` (probe 12a). Classification reads the body's
+    shape, never the content type, so the label changes nothing: it is still
+    our config drift (`ModelNotFound`), not the customer's request."""
+    for headers in ({"content-type": "application/octet-stream"}, {}, None):
+        err = E.from_http_status(
+            400, body=DEEPSEEK_UNKNOWN_MODEL_2026_09_17, headers=headers,
+            provider="deepseek", model="deepseek-nope",
+        )
+        assert isinstance(err, E.ModelNotFound), headers
+        assert err.blame is E.Blame.POLICY
+    assert E._is_api_error_body(DEEPSEEK_UNKNOWN_MODEL_2026_09_17)
+
 
 
 @pytest.mark.parametrize(

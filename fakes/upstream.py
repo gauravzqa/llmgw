@@ -189,6 +189,16 @@ MODES: tuple[str, ...] = (
     "inworld-404-code5",
     "elevenlabs-403-voice",
     "assemblyai-403-ratelimit",
+    # PLAN-2 phase F: the Responses wire, on `/v1/responses` of the OpenAI
+    # port only, in the shapes captured live on 17 Sep 2026
+    # (capabilities/captures-responses.md). Bodies live in fakes/responses.py.
+    # `ok` on that route is the happy Responses stream; the error modes above
+    # (`5xx`, `429`, `401`, ...) answer there exactly as on the chat route.
+    "responses-incomplete",
+    "responses-failed",
+    "responses-error-event",
+    "responses-web-search",
+    "responses-reasoning",
 )
 
 PATHS: dict[Surface, str] = {
@@ -214,8 +224,13 @@ _VOICE_ROUTES: tuple[tuple[str, str], ...] = (
     ("/transcribe", "assemblyai-sync"),
 )
 
+RESPONSES_PATH = "/v1/responses"
+"""The Responses route on the OpenAI port. `ok` there is the Responses
+stream, not the chat one: the path picks the wire, the mode picks the fault."""
+
 EXTRA_ROUTES: dict[Surface, tuple[tuple[str, str], ...]] = {
     "openai": (
+        (RESPONSES_PATH, "ok"),
         ("/v1/embeddings", "embeddings"),
         ("/v1/realtime/client_secrets", "client-secrets"),
         ("/v1/realtime/calls/{call_id}/{action}", "realtime-calls"),
@@ -1084,6 +1099,78 @@ async def _voice_or_utility_mode(request: Request, p: Params, hdr: dict[str, str
     return None
 
 
+async def _responses_mode(request: Request, p: Params, hdr: dict[str, str]):
+    """`/v1/responses` on the OpenAI port (PLAN-2 phase F). Returns None for
+    every mode `fakes/responses.py` does not own, so `5xx`, `429`, `401`,
+    `stall-*` and friends behave on this route exactly as on the chat route
+    and the fallback tests need no second vocabulary.
+
+    Two things the chat route does not do, both because the Responses SDK
+    loop depends on them: the `model` must be one the fake KNOWS (a catalog
+    id such as `openai.gpt-4o-mini` that reached upstream unrewritten is a
+    404 `model_not_found` in OpenAI's exact envelope), and the response
+    `model` is the provider's SNAPSHOT id, not the requested one, so a
+    client that echoes it into its next turn exercises the alias table.
+    `previous_response_id` is echoed for the same reason.
+    """
+    from fakes import responses as R
+
+    if p.mode not in R.SERVED_MODES and p.mode != "die-mid-stream":
+        return None
+    try:
+        body = json.loads(await request.body() or b"{}")
+    except ValueError:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    model = body.get("model")
+    if not isinstance(model, str) or model not in R.KNOWN_MODELS:
+        return Response(
+            content=R.model_not_found_body(str(model)), status_code=404,
+            media_type="application/json",
+            headers={**hdr, "x-request-id": "req_fake_responses_404"},
+        )
+    prev = body.get("previous_response_id")
+    prev = prev if isinstance(prev, str) else None
+    cap = body.get("max_output_tokens")
+    cap = cap if isinstance(cap, int) and not isinstance(cap, bool) else None
+    stream = body.get("stream") is True
+    if not stream:
+        payload = R.json_body("ok" if p.mode == "die-mid-stream" else p.mode,
+                              model=model, previous_response_id=prev,
+                              max_output_tokens=cap)
+        return JSONResponse(payload, headers={**hdr, "x-request-id": "req_fake_responses"})
+
+    if p.mode == "die-mid-stream":
+        frames = R.stream_frames("ok", model=model, previous_response_id=prev,
+                                 max_output_tokens=cap)
+        # The opening pair, the item/part openers and `events` deltas -- then
+        # the socket dies, as on the chat route.
+        frames = frames[: 4 + max(p.events, 0)]
+        die = True
+    else:
+        frames = R.stream_frames(p.mode, model=model, previous_response_id=prev,
+                                 max_output_tokens=cap)
+        die = False
+
+    async def gen() -> AsyncIterator[bytes]:
+        STATS.stream_opened()
+        try:
+            for f in frames:
+                await _pace(p.interval)
+                STATS.record_write(p.mode)
+                yield f
+            if die:
+                raise DiedMidStream(f"responses: died after {p.events} deltas")
+        finally:
+            STATS.stream_closed()
+
+    return StreamingResponse(
+        gen(), status_code=200, media_type="text/event-stream",
+        headers={**_SSE_HEADERS, **hdr, "x-request-id": "req_fake_responses"},
+    )
+
+
 def _handler(
     surface: Surface, default_mode: str, *, stats_path: str | None = None,
 ) -> Callable[[Request], Awaitable[Response]]:
@@ -1104,6 +1191,10 @@ def _handler(
         voice = await _voice_or_utility_mode(request, p, hdr)
         if voice is not None:
             return voice
+        if stats_path == RESPONSES_PATH:
+            served = await _responses_mode(request, p, hdr)
+            if served is not None:
+                return served
 
         if p.mode == "schema-400":
             return _raw(surface, 400, "invalid_request_error", "bad schema", hdr)

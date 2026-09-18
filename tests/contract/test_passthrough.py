@@ -1064,18 +1064,24 @@ async def test_metrics_exposes_the_registered_contract(
     assert expected <= families, expected - families
 
 
-async def test_the_responses_surface_is_a_501_that_names_the_reason(
+async def test_the_responses_surface_is_served_rather_than_announced_as_unbuilt(
     gateway: GatewayServer, client: httpx.AsyncClient
 ):
-    """Registered so the answer is "not built" rather than a 404 that reads
-    like a typo. The Responses surface has a real `response.failed` frame to
-    forward on failure (C2), and serving it without one would mean guessing at
-    an ending -- the one thing C2 forbids."""
+    """Until PLAN-2 Phase F this route was a 501 that named the phase,
+    because the surface had a real `response.failed` ending to forward (C2)
+    and nothing existed to forward it. The surface exists now
+    (`surfaces/responses.py`, `tests/contract/test_responses.py`); the route
+    answers with the provider's Response object and the gateway's headers."""
     response = await client.post(
-        f"{gateway.base_url}/v1/responses", json={"model": "fake.echo"}
+        f"{gateway.base_url}/v1/responses",
+        json={"model": "fake.echo", "input": "hi", "max_output_tokens": 16},
     )
-    assert response.status_code == 501
-    assert response.json()["error"]["type"] == "not_implemented"
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["object"] == "response" and body["status"] == "completed"
+    assert response.headers["x-gw-model"] == "fake.echo"
+    assert response.headers["x-gw-served-by"].endswith("fake.echo")
+    assert "not_implemented" not in response.text
 
 
 async def test_a_second_gateway_can_be_built_with_different_bounds(
