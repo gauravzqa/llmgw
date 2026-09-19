@@ -1118,3 +1118,98 @@ def test_multipart_splice_only_touches_the_named_key():
     body = _mp([("modelId", b"inworld.tts-2"), ("model", b"keep-me"), ("file", b"\x00")])
     out, changed = apply_api_model_multipart(body, "inworld-tts-2", key="modelId")
     assert changed and b'name="modelId"\r\n\r\ninworld-tts-2\r\n' in out and b"keep-me" in out
+
+
+# ------------------------------------------------- the model as a HEADER
+#
+# AssemblyAI's sync host routes on `X-AAI-Model` at its load balancer. A
+# surface that declares `model_header` therefore has its api_model written
+# into a request header, and its body -- of whatever kind -- forwarded with
+# no model edit at all, because there is no model in it to edit.
+
+
+def test_the_model_header_carries_the_targets_wire_id():
+    target = catalog_for(conn()).resolve("m-p1")
+    headers = build_headers(target, stream=False, model_header="X-AAI-Model")
+    assert headers["x-aai-model"] == "wire-p1"
+    # And it is absent unless a surface asked for it: no other dialect reads
+    # this header, and a header nobody asked for is a header somebody debugs.
+    assert "x-aai-model" not in build_headers(target, stream=False)
+
+
+def test_an_operator_can_still_override_the_model_header():
+    """Same rule as `anthropic-version`: provider extras and per-request
+    extras are merged last, so a migration can pin the routing value."""
+    target = catalog_for(conn(extra_headers={"X-AAI-Model": "pinned"})).resolve("m-p1")
+    assert build_headers(target, stream=False,
+                         model_header="X-AAI-Model")["x-aai-model"] == "pinned"
+
+
+@pytest.mark.asyncio
+async def test_a_model_header_surface_sends_its_multipart_body_untouched():
+    captured: list[httpx.Request] = []
+    up, _, catalog = rig(conn(), handler=ok_handler(captured))
+    body = _mp([("model", b"do-not-rewrite-me"), ("audio", b"RIFF" + b"\x00" * 32)])
+    req = UpstreamRequest(
+        target=catalog.resolve("m-p1"), body=body, path="/v1/transcribe", stream=False,
+        body_kind="multipart", content_type="multipart/form-data; boundary=b0und",
+        model_header="X-AAI-Model",
+    )
+    async with up.open(req, deadline=deadline(), budgets=budgets()) as stream:
+        assert stream.body_modified is False
+    sent = captured[0]
+    assert sent.read() == body, "byte-for-byte: the model was never in this body"
+    assert sent.headers["x-aai-model"] == "wire-p1"
+    assert b"do-not-rewrite-me" in sent.read()
+
+
+@pytest.mark.asyncio
+async def test_a_model_header_surface_does_not_have_its_json_model_rewritten():
+    """The rule is about the model edit, not about bodies: a JSON body on a
+    header-routed surface keeps its own `model` key, whatever it says."""
+    captured: list[httpx.Request] = []
+    up, _, catalog = rig(conn(), handler=ok_handler(captured))
+    req = UpstreamRequest(
+        target=catalog.resolve("m-p1"), body=b'{"model":"theirs"}', path="/x",
+        stream=False, model_header="X-AAI-Model",
+    )
+    async with up.open(req, deadline=deadline(), budgets=budgets()):
+        pass
+    assert captured[0].read() == b'{"model":"theirs"}'
+    assert captured[0].headers["x-aai-model"] == "wire-p1"
+
+
+# ------------------------------------------ the model NESTED one level down
+
+
+def test_a_dotted_model_key_rewrites_the_nested_field():
+    """Inworld's HTTP STT reads `transcribeConfig.modelId` and discards a
+    top-level `modelId` as an unknown field, so a flat rewrite would send the
+    catalog id AND leave a key the provider ignores."""
+    body = json.dumps({"transcribeConfig": {"modelId": "inworld.stt-1",
+                                            "audioEncoding": "LINEAR16"},
+                       "audioData": {"content": "AAAA"}}).encode()
+    out, changed = apply_api_model(body, "inworld/inworld-stt-1",
+                                   key="transcribeConfig.modelId")
+    assert changed
+    parsed = json.loads(out)
+    assert parsed["transcribeConfig"]["modelId"] == "inworld/inworld-stt-1"
+    assert parsed["transcribeConfig"]["audioEncoding"] == "LINEAR16", "sibling kept"
+    assert parsed["audioData"] == {"content": "AAAA"}, "sibling object kept"
+    assert "modelId" not in parsed, "nothing added at the top level"
+
+
+def test_a_dotted_key_that_already_names_the_wire_model_returns_the_same_bytes():
+    body = json.dumps({"transcribeConfig": {"modelId": "inworld/inworld-stt-1"}}).encode()
+    out, changed = apply_api_model(body, "inworld/inworld-stt-1",
+                                   key="transcribeConfig.modelId")
+    assert not changed and out is body
+
+
+def test_a_dotted_key_creates_the_missing_object_but_never_clobbers_a_scalar():
+    out, changed = apply_api_model(b"{}", "wire", key="a.b")
+    assert changed and json.loads(out) == {"a": {"b": "wire"}}
+    # A path that runs through something that is not an object is left alone:
+    # the surface refused such a body already, and guessing is worse.
+    same, changed2 = apply_api_model(b'{"a": 7}', "wire", key="a.b")
+    assert not changed2 and same == b'{"a": 7}'

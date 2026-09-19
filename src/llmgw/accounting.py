@@ -106,11 +106,12 @@ UNITS: tuple[str, ...] = ("characters", "seconds")
 """Mirrors `metrics.UNITS`; pinned equal by the same test."""
 
 _USAGE_INT_FIELDS = (
-    "characters", "seconds", "audio_input_tokens", "audio_output_tokens",
+    "characters", "audio_input_tokens", "audio_output_tokens",
     "cached_audio_input_tokens", "cache_write_1h_tokens", "reasoning_tokens",
 )
 """The PLAN-2 B3 fields on `surfaces.base.Usage`, read with `getattr` and a
-zero default so a `Usage` that predates them still accounts."""
+zero default so a `Usage` that predates them still accounts. `seconds` is
+NOT among them -- see `_usage_seconds`."""
 
 
 def _usage_int(usage: object, name: str) -> int:
@@ -119,6 +120,27 @@ def _usage_int(usage: object, name: str) -> int:
         return max(0, int(value or 0))
     except (TypeError, ValueError):
         return 0
+
+
+def _usage_seconds(usage: object) -> float:
+    """Audio seconds, keeping the fraction the provider reported.
+
+    Every other unit here is a count and an integer. Duration is not, and
+    `int()` on it TRUNCATES: ElevenLabs Scribe reports `audio_duration_secs:
+    1.84`, AssemblyAI sync reports `audio_duration_ms: 1840`, and both used
+    to be billed as 1 second -- a 46% under-bill on a record flagged
+    `exact`, which is worse than an honest estimate because nothing about it
+    looks wrong. Providers that meter in whole seconds (OpenAI's `usage.
+    seconds`, already rounded up on their side) are unaffected: 2.0 is 2.0.
+    """
+    value = getattr(usage, "seconds", 0)
+    try:
+        seconds = float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if seconds != seconds or seconds in (float("inf"), float("-inf")):  # NaN / inf
+        return 0.0
+    return max(0.0, seconds)
 
 
 def _usage_tool_calls(usage: object) -> dict[str, int]:
@@ -227,9 +249,11 @@ class AccountingRecord:
     number that shows a "cheap" candidate spending its budget on thinking."""
 
     characters: int = 0
-    seconds: int = 0
+    seconds: float = 0.0
     """Non-token units (`metrics.UNITS`), for rows whose `unit` is not
-    tokens. Zero on text models."""
+    tokens. Zero on text models. `seconds` is a FLOAT because duration is
+    not a count: the providers that meter it report fractions and truncating
+    them under-bills every call (`_usage_seconds`)."""
 
     unit: str = "tokens"
     """The billed row's `ModelSpec.unit`; says which of the counts above the
@@ -260,9 +284,9 @@ class AccountingRecord:
         }
 
     @property
-    def units_by_kind(self) -> dict[str, int]:
+    def units_by_kind(self) -> dict[str, float]:
         """The non-token units keyed by `metrics.UNITS`."""
-        return {"characters": self.characters, "seconds": self.seconds}
+        return {"characters": float(self.characters), "seconds": self.seconds}
 
 
 def account(result: ExecutionResult, *, catalog: Catalog) -> AccountingRecord:
@@ -375,7 +399,8 @@ def _account_usage(
     """The dot product, shared by both planes. May raise; callers guard."""
     output_tokens = usage.output_tokens if output_tokens is None else output_tokens
 
-    extra = {name: _usage_int(usage, name) for name in _USAGE_INT_FIELDS}
+    extra: dict[str, float] = {name: _usage_int(usage, name) for name in _USAGE_INT_FIELDS}
+    extra["seconds"] = _usage_seconds(usage)
     tool_calls = _usage_tool_calls(usage)
 
     if target is None:

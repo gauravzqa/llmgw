@@ -189,6 +189,17 @@ MODES: tuple[str, ...] = (
     "inworld-404-code5",
     "elevenlabs-403-voice",
     "assemblyai-403-ratelimit",
+    # The HTTP speech-to-text half, in the shapes established live on 19 Sep
+    # 2026. `assemblyai-sync` is no longer a body-shape fake: it refuses in
+    # the real order (routing header, credential, media type, `audio` part),
+    # and the two 404s it can answer have their own modes because they mean
+    # opposite things and look nothing alike.
+    "assemblyai-sync-elb-404",
+    "assemblyai-sync-badkey-404",
+    "elevenlabs-stt",
+    "elevenlabs-stt-401",
+    "inworld-stt",
+    "inworld-stt-403",
     # PLAN-2 phase F: the Responses wire, on `/v1/responses` of the OpenAI
     # port only, in the shapes captured live on 17 Sep 2026
     # (capabilities/captures-responses.md). Bodies live in fakes/responses.py.
@@ -222,6 +233,9 @@ _VOICE_ROUTES: tuple[tuple[str, str], ...] = (
     ("/v1/text-to-speech/{voice_id}/stream", "elevenlabs-raw"),
     ("/v1/text-to-speech/{voice_id}/stream/with-timestamps", "elevenlabs-ndjson"),
     ("/transcribe", "assemblyai-sync"),
+    ("/v1/transcribe", "assemblyai-sync"),
+    ("/v1/speech-to-text", "elevenlabs-stt"),
+    ("/stt/v1/transcribe", "inworld-stt"),
 )
 
 RESPONSES_PATH = "/v1/responses"
@@ -237,7 +251,8 @@ EXTRA_ROUTES: dict[Surface, tuple[tuple[str, str], ...]] = {
         *_VOICE_ROUTES,
     ),
     "anthropic": (("/v1/messages/count_tokens", "count-tokens"),),
-    "assemblyai": (("/v3/token", "assemblyai-token"),),
+    "assemblyai": (("/v3/token", "assemblyai-token"),
+                   ("/v1/transcribe", "assemblyai-sync")),
     "audio": tuple(r for r in _VOICE_ROUTES if r[0] != PATHS["audio"]),
 }
 """Routes beyond each port's primary one, with the mode a request gets when
@@ -1191,6 +1206,22 @@ async def _voice_or_utility_mode(request: Request, p: Params, hdr: dict[str, str
         return await V.assemblyai_token(request, hdr)
     if m == "assemblyai-sync":
         return await V.assemblyai_sync(request, hdr)
+    if m == "assemblyai-sync-elb-404":
+        await request.body()
+        return V.assemblyai_elb_404(hdr)
+    if m == "assemblyai-sync-badkey-404":
+        await request.body()
+        return V.assemblyai_sync_badkey(hdr)
+    if m == "elevenlabs-stt":
+        return await V.elevenlabs_stt(request, hdr)
+    if m == "elevenlabs-stt-401":
+        await request.body()
+        return V.elevenlabs_stt_401(hdr)
+    if m == "inworld-stt":
+        return await V.inworld_stt(request, hdr)
+    if m == "inworld-stt-403":
+        await request.body()
+        return V.inworld_stt_403(hdr)
     if m == "assemblyai-403-ratelimit":
         return V.assemblyai_403_ratelimit(hdr)
     if m == "inworld-400-code3":

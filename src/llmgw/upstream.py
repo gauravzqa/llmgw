@@ -155,7 +155,23 @@ class UpstreamRequest:
     integration): `model` for every chat and text surface, `modelId` for
     Inworld, `model_id` for ElevenLabs. `apply_api_model` rewrites THIS key;
     rewriting `model` into an Inworld body would leave the catalog id under
-    `modelId` and add a stray key the provider rejects."""
+    `modelId` and add a stray key the provider rejects. A DOTTED key
+    (`transcribeConfig.modelId`) names one level of nesting, which is where
+    Inworld's HTTP STT keeps its model."""
+    model_header: str | None = None
+    """The REQUEST HEADER the target's `api_model` is written into, for the
+    one dialect that routes on a header instead of on the body.
+
+    AssemblyAI's sync host puts the model in `X-AAI-Model`, and it is read by
+    the AWS load balancer in front of the application: without a value that
+    host serves, the ELB answers `404 Not found` as `text/plain` and no
+    application code runs (captures-sarvam-assemblyai.md §1.4b, reproduced
+    live 19 Sep 2026). `model_key` cannot express that -- it names a place in
+    a body, and this model is not in the body at all.
+
+    When it is set the body's model is never rewritten, on ANY body kind:
+    the model lives in exactly one place, and an edit to a body that does not
+    carry the model would be an unannounced edit for no purpose."""
     include_usage_injectable: bool = True
     """Whether `stream_options.include_usage` may be injected into this body
     (finding 27). True for the OpenAI chat dialect; False for every voice
@@ -387,6 +403,7 @@ def build_headers(
     stream: bool,
     extra: Mapping[str, str] | None = None,
     content_type: str | None = None,
+    model_header: str | None = None,
 ) -> dict[str, str]:
     """Auth and content headers for one attempt, per provider *auth scheme*.
 
@@ -396,6 +413,13 @@ def build_headers(
     client's own for a multipart or raw body (the boundary lives in it) and
     `application/json` otherwise; the old code forced JSON, which is why a
     multipart transcription upload could not transit (PLAN-2 B4).
+
+    `model_header` is the routing-header case (`UpstreamRequest.model_header`):
+    the target's `api_model` is written into that header, BEFORE the provider
+    and per-request extras, so an operator can still override it the way they
+    can override `anthropic-version`. It is a header and not a body edit
+    because on AssemblyAI's sync host the model is read by the load balancer,
+    which never sees the body.
 
     A missing credential raises `PolicyError` rather than sending an
     unauthenticated request and letting the provider answer 401. The 401 costs
@@ -434,6 +458,8 @@ def build_headers(
         headers["authorization"] = f"Basic {key}"
     else:
         headers["authorization"] = f"Bearer {key}"
+    if model_header:
+        headers[model_header.lower()] = target.model.api_model
     # Provider extras then per-request extras, both last so an operator can
     # override anything above -- including `anthropic-version`, which is the
     # header most likely to need pinning during a provider migration.
@@ -487,6 +513,18 @@ def apply_extra_body(body: bytes, extra_body: Mapping[str, object]) -> tuple[byt
     return rendered.encode("utf-8"), True
 
 
+def _set_nested(root: dict[str, Any], path: list[str], value: str) -> dict[str, Any]:
+    """`root` with `path` set to `value`, copying only the objects on the
+    path. Missing intermediate objects are created; a non-object on the path
+    is replaced, which only happens on a body the surface already accepted."""
+    head, rest = path[0], path[1:]
+    if not rest:
+        return {**root, head: value}
+    child = root.get(head)
+    inner = child if isinstance(child, dict) else {}
+    return {**root, head: _set_nested(inner, rest, value)}
+
+
 def apply_api_model(body: bytes, api_model: str, key: str = "model") -> tuple[bytes, bool]:
     """The client's `model` becomes the model THIS target's API answers to.
 
@@ -525,11 +563,29 @@ def apply_api_model(body: bytes, api_model: str, key: str = "model") -> tuple[by
     Applied BEFORE `apply_extra_body`, so a provider that deliberately pins a
     `model` in its `extra_body` still wins -- the same ordering, and the same
     reason, as `build_headers` merging provider extras last.
+
+    A DOTTED `key` names a nested field: Inworld's HTTP STT spells its model
+    `transcribeConfig.modelId` and rejects the flat spelling, so a top-level
+    rewrite would send the catalog id and add a key the provider ignores.
+    Only the objects along the path are copied; every sibling keeps its
+    original object, and a path that runs through a non-object is left alone
+    rather than clobbered (the surface already refused such a body).
     """
     parsed = parse_json_object(body)  # raises errors.InvalidRequest
-    if parsed.get(key) == api_model:
-        return body, False
-    merged: dict[str, Any] = {**parsed, key: api_model}
+    path = key.split(".")
+    if len(path) == 1:
+        if parsed.get(key) == api_model:
+            return body, False
+        merged: dict[str, Any] = {**parsed, key: api_model}
+    else:
+        node: Any = parsed
+        for step in path[:-1]:
+            node = node.get(step) if isinstance(node, dict) else None
+            if node is not None and not isinstance(node, dict):
+                return body, False
+        if isinstance(node, dict) and node.get(path[-1]) == api_model:
+            return body, False
+        merged = _set_nested(parsed, path, api_model)
     try:
         rendered = json.dumps(merged, ensure_ascii=False, separators=(",", ":"))
     except (TypeError, ValueError, RecursionError) as exc:
@@ -930,9 +986,11 @@ class Upstream:
         deadline.check(**ctx)
         url = join_url(provider.base_url, req.path,
                        prefix=getattr(provider, "path_prefix", None))
+        model_header = getattr(req, "model_header", None)
         headers = build_headers(
             target, stream=req.stream, extra=req.extra_headers,
             content_type=req.content_type if req.body_kind != "json" else None,
+            model_header=model_header,
         )
         # The body edits, in this order, and one flag for all of them -- and
         # ONLY for JSON bodies. A multipart upload or a raw audio body has no
@@ -943,12 +1001,18 @@ class Upstream:
         # then the target's request defaults for keys the client left out
         # (B5), then `extra_body` last so an operator's explicit pin still
         # overrides everything above, then the usage opt-in.
+        #
+        # A surface that routes on `model_header` is the exception to the
+        # model edit specifically: its model is in a header, so there is no
+        # model in the body to rewrite, on either body kind.
         body = req.body
         body_modified = False
         defaulted: tuple[str, ...] = ()
         if req.body_kind == "json":
             model_key = getattr(req, "model_key", "model") or "model"
-            body, renamed = apply_api_model(body, target.model.api_model, key=model_key)
+            renamed = False
+            if not model_header:
+                body, renamed = apply_api_model(body, target.model.api_model, key=model_key)
             defaults = (req.request_defaults if req.request_defaults is not None
                         else _request_defaults_of(target))
             body, defaulted = apply_request_defaults(body, defaults)
@@ -958,11 +1022,11 @@ class Upstream:
                     and getattr(req, "include_usage_injectable", True)):
                 body, injected = apply_include_usage(body)
             body_modified = renamed or bool(defaulted) or merged or injected
-        elif req.body_kind == "multipart":
+        elif req.body_kind == "multipart" and not model_header:
             # The one edit a multipart body gets: the model form field, so a
             # catalog id names the same target it does on the JSON surfaces.
             body, body_modified = apply_api_model_multipart(
-                body, target.model.api_model, key=req.model_key,
+                body, target.model.api_model, key=req.model_key or "model",
             )
 
         try:

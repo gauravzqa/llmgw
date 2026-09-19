@@ -10,7 +10,7 @@ Repo: `/Users/sanjay/PREP/Evo/llmgw` @ `bc1d065`. Fit legend: **Proxyable today*
 |---|---|---|---|---|---|
 | Streaming STT `wss://streaming.assemblyai.com/v3/ws` (+ `.us.` / `.eu.`) | STR, ZONES | WebSocket, binary audio in / JSON events out; data plane | **Needs new transport** | `server/app.py:238-239,286` only HTTP routes; no websocket route anywhere; `upstream.py:12,565-572` is `httpx.AsyncClient` (no WS client) | The product the Layrs voice agent actually uses |
 | Temporary token `GET https://streaming.assemblyai.com/v3/token?expires_in_seconds=1..600&max_session_duration_seconds=60..10800` | TOK | REST JSON; control plane per session | **Proxyable today** (buffered) | a buffered surface like the non-stream chat path; response is `{"token"}` | One-time-use token; the natural place for a gateway to mint per-tenant tokens with a capped `max_session_duration_seconds` (= the drain grace) |
-| Sync STT `POST https://sync.assemblyai.com/transcribe` (+ `.us.` / `.eu.`) | SYNC | HTTP, raw PCM body (16 kHz mono s16le), ≤120 s audio, ≤40 MB, one JSON back, ~134 ms p50 claimed | **Proxyable today** with two changes | request body cap 4 MiB (`config.py:395`) vs 40 MB; body is binary not JSON (`app.py` reads `model` from a JSON body via `surfaces/base.py:295 require_model`) | Best fit for a gateway: request/response, deadline semantics unchanged, `first_event == total` |
+| Sync STT `POST https://sync.assemblyai.com/v1/transcribe` (`/transcribe` is an alias; + `.us.` / `.eu.`) | SYNC | HTTP, **multipart/form-data with an `audio` part** (raw PCM is allowed only as that part, with an optional `config` part), **`X-AAI-Model` mandatory**, ≤120 s audio, ≤40 MB, one JSON back, ~450 ms measured for 1.8 s of audio | **Built and working** (`assemblyai_sync`, 19 Sep 2026) | request body cap 4 MiB (`config.py:395`) vs 40 MB; body is binary not JSON (`app.py` reads `model` from a JSON body via `surfaces/base.py:295 require_model`) | Best fit for a gateway: request/response, deadline semantics unchanged, `first_event == total` |
 | Pre-recorded `POST /v2/transcript`, `GET /v2/transcript/{id}`, `POST /v2/upload` (`api.assemblyai.com`, `api.eu.assemblyai.com`) | TX | REST JSON + binary upload; async job, poll or webhook; control-plane-ish | **Proxyable today** for submit/poll (buffered JSON); upload blocked by the 4 MiB cap | `config.py:395` | Polling loops through a gateway waste admission slots; webhook completion is the sane path |
 | Webhooks (`webhook_url`, `webhook_auth_header_name/value`) | WH | outbound POST from AssemblyAI `{transcript_id,status}`, 10 s window, 10 retries, 4xx = permanent | **Not a gateway concern** (inbound receiver) | — | Fixed source IPs 44.238.19.20 (US) / 54.220.25.36 (EU) |
 | LLM Gateway `POST https://llm-gateway.assemblyai.com/v1/chat/completions` (+ `.eu.`) | LLMGW | OpenAI-compatible chat; SSE streaming (OpenAI models); tools, structured outputs, prompt caching; 25+ models | **Proxyable today** as a `ProviderConn(kind="openai")` row | `catalog.py` provider table; `surfaces/openai.py` | A competitor gateway; proxying it would be double-gatewaying. Relevant only as a fallback provider row |
@@ -46,7 +46,7 @@ Repo: `/Users/sanjay/PREP/Evo/llmgw` @ `bc1d065`. Fit legend: **Proxyable today*
 | capability | AssemblyAI (doc) | protocol/unit | llmgw fit | evidence | note |
 |---|---|---|---|---|---|
 | `Authorization: <key>` (raw key, **no `Bearer`**) on REST and WS | STR, TX, LLMGW | header | `upstream.py:315-316 build_headers` emits `Bearer` for `kind="openai"`; a new `ProviderKind` or an `auth_scheme` field is needed | `catalog.py` ProviderConn has `kind` + `extra_headers` only | `extra_headers={"authorization": key}` is blocked by design (`NEVER_FORWARDED`, `config.py:109-117`), so this is a code change not config |
-| `token=` query param (temporary, one-time, ≤600 s to first use, session cap ≤3 h) | TOK | WS query | Proxyable today (mint via buffered surface) | — | Credential leaves the gateway only as a short-lived token: the right shape for browser callers |
+| `token=` query param (temporary, REUSABLE — not one-time, probe A5f; ≤600 s to first use, session cap ≤3 h, capped by `max_session_duration_seconds`) | TOK | WS query | Proxyable today (mint via buffered surface) | — | Credential leaves the gateway only as a short-lived token: the right shape for browser callers |
 | `AssemblyAI-Version` header (optional pin; `Begin.configuration.api_version` echoes, e.g. `2025-05-12`) | STR | header | forward-list entry | `config.py:104` forward allowlist | Analogue of `anthropic-version` |
 | Regions: global edge, `.us.`, `.eu.` for streaming, sync and REST; LLM Gateway EU lacks OpenAI models | ZONES, SYNC, LLMGW | base URL | one `ProviderConn` per region | — | Data-residency routing is a policy-file concern |
 | Account-level limits shared across all keys of an account | LIM | — | maps to llmgw's credential-scoped breaker/limiter | `breaker.py` credential scope (FAILURE-MODES row 8) | Per-project isolation does not exist provider-side |
@@ -123,3 +123,42 @@ Cannot be done in the current app at all: anything over `wss://` (Starlette supp
 - `min_end_of_turn_silence_when_confident` is a deprecated alias of `min_turn_silence` (STR lists only `min_turn_silence`); the harness already renamed, the upgrade notes say the repo "emits this warning today" — verify no remaining callers (`harness/dsa/runner.py` ~L260 per the upgrade plan).
 - `end_of_turn_confidence_threshold` applies to Universal-Streaming models only (STR); if the model is ever switched to `universal-3-5-pro`, the Layrs EoT tuning (0.7 / 160 / 2400) partly stops applying and `mode` + `interruption_delay` become the knobs.
 - No AssemblyAI references in the repo point at deprecated endpoints (v2 realtime is gone; the plugin uses v3).
+
+
+---
+
+## Corrections applied 19 Sep 2026
+
+Everything in this file above was a documentation sweep with no key. A live
+key exists now, and `capabilities/captures-sarvam-assemblyai.md` §1 is the
+authority where the two disagree. The claims disproved, in the order they
+appear:
+
+1. **§1 "raw PCM body".** A raw body is a 415. The body is
+   `multipart/form-data` with a part named `audio`; raw PCM may be that
+   part's payload, with an optional `config` part
+   `{"sample_rate":16000,"channels":1}`.
+2. **§1 path.** `/v1/transcribe`, not `/transcribe` — though the short form
+   is a live alias and both answer 200.
+3. **§1 said nothing about `X-AAI-Model`,** which is MANDATORY and is read by
+   the AWS load balancer: without it, or with a model this host does not
+   serve (`universal-2` is one), the reply is `404 Not found`, `text/plain`,
+   `server: awselb/2.0`, and no application code runs.
+4. **The 403-means-rate-limit rule** on the sync host describes a response it
+   does not send. A bad key there is a **404** with
+   `application/problem+json` and `detail: "Invalid API key"`. The
+   `assemblyai-sync` row now says `forbidden_means="auth"` and `errors.py`
+   reads that body. On `api.assemblyai.com` a bad key is a plain 401; the
+   403 rate limit remains documented-only and is marked unverified in the
+   catalog.
+5. **§4 "one-time" token.** Not one-time: the same token opened a second
+   session cleanly (probe A5f).
+6. **§5 "Sync STT errors … not documented".** All five are captured and are
+   RFC 7807 (`{status,title,detail}` under `application/problem+json`); they
+   are fixtures in `tests/unit/test_real_error_bodies.py`.
+7. **Billing.** Sync reports `audio_duration_ms` in EXACT milliseconds (1840
+   for a 1.84 s file); the async product reports `audio_duration` in whole
+   seconds rounded up. Two products, two rounding rules, one price table.
+8. **No TTS.** AssemblyAI has no text-to-speech product; `/v2/tts` and
+   `/v1/speech` both 404.
+9. **§6 pricing** ($0.45/h sync) is still correct at 2026-09-18.

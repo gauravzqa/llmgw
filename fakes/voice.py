@@ -187,14 +187,85 @@ async def assemblyai_token(request: Request, hdr: dict[str, str]) -> Response:
     )
 
 
+AAI_MODEL_HEADER = "x-aai-model"
+AAI_SYNC_MODELS: frozenset[str] = frozenset({"universal-3-5-pro"})
+"""The models `sync.assemblyai.com` actually routes. `universal-2` is a real
+AssemblyAI model and is NOT one of them -- asking for it is a load-balancer
+404, verified live (probe A4e)."""
+
+
+def _problem(status: int, title: str, detail: str, hdr: dict[str, str]) -> Response:
+    """RFC 7807, the shape every application error on the sync host takes."""
+    return Response(
+        json.dumps({"status": status, "title": title, "detail": detail}),
+        status_code=status, headers=hdr, media_type="application/problem+json",
+    )
+
+
+def assemblyai_elb_404(hdr: dict[str, str]) -> Response:
+    """What the AWS load balancer answers when `X-AAI-Model` names nothing it
+    routes: `text/plain`, two words, and `server: awselb/2.0`. No application
+    code ran, so there is no JSON and nothing about the request is echoed."""
+    return Response("Not found", status_code=404,
+                    headers={**hdr, "server": "awselb/2.0"}, media_type="text/plain")
+
+
+def assemblyai_sync_badkey(hdr: dict[str, str]) -> Response:
+    """A bad key on the sync host is a 404, not a 401 (probe A4g)."""
+    return _problem(404, "Not Found", "Invalid API key", hdr)
+
+
+def multipart_part(body: bytes, content_type: str | None, name: str) -> bytes | None:
+    """The payload of the form part called `name`, or None. Small and
+    deliberate: the fakes need to see the `audio` part to answer like the
+    real service, and nothing more."""
+    boundary = None
+    for piece in (content_type or "").split(";"):
+        piece = piece.strip()
+        if piece.lower().startswith("boundary="):
+            boundary = piece[len("boundary="):].strip('"')
+    if not boundary:
+        return None
+    needle = f'name="{name}"'.encode()
+    for part in body.split(b"--" + boundary.encode("latin-1"))[1:]:
+        if part.startswith(b"--"):
+            break
+        head, sep, payload = part.partition(b"\r\n\r\n")
+        if not sep or needle not in head:
+            continue
+        return payload[:-2] if payload.endswith(b"\r\n") else payload
+    return None
+
+
 async def assemblyai_sync(request: Request, hdr: dict[str, str]) -> Response:
+    """The sync transcribe endpoint, in the order the real one refuses:
+    routing header at the load balancer, then credential, then body kind,
+    then the `audio` part (probes A3a, A4a-h)."""
+    model = request.headers.get(AAI_MODEL_HEADER, "")
+    if model not in AAI_SYNC_MODELS:
+        return assemblyai_elb_404(hdr)
     if not has_raw_auth(request):
-        return assemblyai_401(hdr)
+        return assemblyai_sync_badkey(hdr)
     raw = await request.body()
-    # 16 kHz mono s16le: 32,000 bytes per second, so ms = bytes / 32.
+    ct = request.headers.get("content-type", "")
+    if not ct.lower().startswith("multipart/form-data"):
+        return _problem(415, "Unsupported Media Type",
+                        "request must be multipart/form-data with an `audio` part and an "
+                        "optional `config` part", hdr)
+    audio = multipart_part(raw, ct, "audio")
+    if audio is None:
+        return _problem(400, "Bad Request", "request must include an `audio` file part", hdr)
+    if not audio:
+        return _problem(400, "Bad Audio", "truncated WAV: ", hdr)
+    # 16 kHz mono s16le: 32,000 bytes per second, so ms = bytes / 32. Exact
+    # milliseconds, never rounded -- that is the sync product's meter.
+    pcm = audio[WAV_HEADER_BYTES:] if audio[:4] == b"RIFF" else audio
     return JSONResponse(
-        {"text": "hello from the sync fake", "audio_duration_ms": len(raw) // 32,
-         "request_time_ms": 12, "session_id": _hex(16)},
+        {"text": "hello from the sync fake",
+         "words": [{"text": "hello", "confidence": 0.99}],
+         "confidence": 0.99,
+         "audio_duration_ms": len(pcm) // 32,
+         "session_id": _hex(16), "request_time_ms": 12.5},
         headers=hdr,
     )
 
@@ -332,6 +403,71 @@ async def inworld_sync(request: Request, hdr: dict[str, str]) -> Response:
     )
 
 
+INWORLD_STT_MODELS: frozenset[str] = frozenset({"inworld/inworld-stt-1"})
+
+
+async def inworld_stt(request: Request, hdr: dict[str, str]) -> Response:
+    """`POST /stt/v1/transcribe`: protojson in, one JSON object out with
+    `usage.transcribedAudioMs`. The refusal ladder is the real one, walked
+    live on 19 Sep 2026 -- unknown fields are DISCARDED, so a wrong name
+    surfaces as the validation error for the field that is now missing."""
+    body = await json_body(request)
+    audio_data = body.get("audioData") or body.get("audio_data")
+    if not isinstance(audio_data, dict):
+        return JSONResponse({"code": 3, "message": "audio_data is required", "details": []},
+                            status_code=400, headers={**hdr, "x-inworld-request-id": _hex(32)})
+    config = body.get("transcribeConfig") or body.get("transcribe_config")
+    if not isinstance(config, dict):
+        return JSONResponse(
+            {"code": 3, "message": "invalid transcribe config: transcribe_config is required",
+             "details": []},
+            status_code=400, headers={**hdr, "x-inworld-request-id": _hex(32)})
+    model = config.get("modelId") or config.get("model_id")
+    if not model:
+        return JSONResponse(
+            {"code": 3, "message": "invalid transcribe config: model_id is required",
+             "details": []},
+            status_code=400, headers={**hdr, "x-inworld-request-id": _hex(32)})
+    if model not in INWORLD_STT_MODELS:
+        return JSONResponse(
+            {"code": 3, "message": f'Unsupported model "{model}". Supported models: '
+                                   "https://docs.inworld.ai/docs/tutorial-integrations/stt/"
+                                   "supported-models", "details": []},
+            status_code=400, headers={**hdr, "x-inworld-request-id": _hex(32)})
+    content = audio_data.get("content")
+    if not isinstance(content, str) or not content:
+        return JSONResponse({"code": 3, "message": "audio data is required", "details": []},
+                            status_code=400, headers={**hdr, "x-inworld-request-id": _hex(32)})
+    try:
+        decoded = base64.b64decode(content, validate=True)
+    except (ValueError, TypeError):
+        return JSONResponse(
+            {"code": 3, "message": "proto: invalid value for bytes field content",
+             "details": []},
+            status_code=400, headers={**hdr, "x-inworld-request-id": _hex(32)})
+    if decoded[:4] != b"RIFF":
+        # Raw PCM is refused: the service wants a container it can read.
+        return JSONResponse(
+            {"code": 3, "message": "unsupported audio format - only WAV, MP3, OGG, FLAC, "
+                                   "M4A, and WebM are supported", "details": []},
+            status_code=400, headers={**hdr, "x-inworld-request-id": _hex(32)})
+    ms = len(decoded[WAV_HEADER_BYTES:]) // 32
+    return JSONResponse(
+        {"transcription": {"transcript": "hello from the inworld stt fake", "isFinal": True,
+                           "wordTimestamps": [], "voiceProfile": None,
+                           "silenceDurationMs": 0},
+         "usage": {"transcribedAudioMs": ms, "modelId": model}},
+        headers={**hdr, "x-inworld-request-id": _hex(32)},
+    )
+
+
+def inworld_stt_403(hdr: dict[str, str]) -> Response:
+    """Inworld's bad-credential answer, gRPC status 7 under a 403."""
+    return JSONResponse({"code": 7, "message": "Invalid authorization credentials",
+                         "details": []}, status_code=403,
+                        headers={**hdr, "x-inworld-request-id": _hex(32)})
+
+
 def inworld_400_code3(hdr: dict[str, str], model_id: str = "inworld-tts-999") -> Response:
     return JSONResponse({"code": 3, "message": f"model_id: {model_id} is not supported.",
                          "details": []}, status_code=400,
@@ -394,6 +530,69 @@ async def elevenlabs_ndjson(request: Request, hdr: dict[str, str], *, events: in
                                       "request-id": _hex(24)})
 
 
+ELEVENLABS_STT_MODELS: frozenset[str] = frozenset(
+    {"scribe_v1", "scribe_v1_experimental", "scribe_v2", "scribe_v2_medical"}
+)
+"""Enumerated by the provider's own 400 on an unknown `model_id` (live,
+19 Sep 2026). A catalog id lands here, which is how we know the gateway's
+multipart rewrite ran."""
+
+
+async def elevenlabs_stt(request: Request, hdr: dict[str, str]) -> Response:
+    """`POST /v1/speech-to-text`: multipart in, one JSON object out with
+    `audio_duration_secs` -- exact, unrounded -- plus the `character-cost`
+    and `fiat-cost-before-overages` headers the real service sends (live
+    19 Sep 2026). The duration is derived from the file part so a test can
+    assert the gateway billed the provider's own number."""
+    raw = await request.body()
+    ct = request.headers.get("content-type", "")
+    model = (multipart_part(raw, ct, "model_id") or b"").decode("utf-8", "replace").strip()
+    if not model:
+        return JSONResponse(
+            {"detail": [{"type": "missing", "loc": ["body", "model_id"],
+                         "msg": "Field required", "input": None}]},
+            status_code=422, headers={**hdr, "x-trace-id": _hex(32)},
+        )
+    if model not in ELEVENLABS_STT_MODELS:
+        return JSONResponse(
+            {"detail": {"type": "validation_error", "code": "unsupported_model",
+                        "message": f"'{model}' is not a valid model_id. Available models: "
+                                   "'scribe_v1', 'scribe_v1_experimental', 'scribe_v2', "
+                                   "'scribe_v2_medical'",
+                        "status": "invalid_model_id", "param": "model_id"}},
+            status_code=400, headers={**hdr, "x-trace-id": _hex(32)},
+        )
+    audio = multipart_part(raw, ct, "file")
+    if audio is None:
+        return JSONResponse(
+            {"detail": {"type": "validation_error", "code": "invalid_parameters",
+                        "message": "Must provide either file or a URL parameter.",
+                        "status": "invalid_parameters", "param": "file"}},
+            status_code=400, headers={**hdr, "x-trace-id": _hex(32)},
+        )
+    pcm = audio[WAV_HEADER_BYTES:] if audio[:4] == b"RIFF" else audio
+    seconds = round(len(pcm) / 32_000, 2)
+    return JSONResponse(
+        {"language_code": "eng", "language_probability": 0.93,
+         "text": "hello from the scribe fake",
+         "words": [{"text": "hello", "start": 0.12, "end": 0.46, "type": "word"}],
+         "audio_duration_secs": seconds, "transcription_id": _hex(20)},
+        headers={**hdr, "character-cost": str(max(1, int(seconds))),
+                 "fiat-cost-before-overages": f"{seconds * 0.22 / 3600:.4f}",
+                 "fiat-currency": "usd", "x-trace-id": _hex(32)},
+    )
+
+
+def elevenlabs_stt_401(hdr: dict[str, str]) -> Response:
+    """A bad key on the speech-to-text route is a plain 401 -- unlike the TTS
+    host's 400, which is why both shapes are in the fakes."""
+    return JSONResponse(
+        {"detail": {"type": "authentication_error", "code": "unauthorized",
+                    "message": "Invalid API key", "status": "invalid_api_key"}},
+        status_code=401, headers={**hdr, "x-trace-id": _hex(32)},
+    )
+
+
 def elevenlabs_403_voice(hdr: dict[str, str]) -> Response:
     # The legacy `detail.status` shape, still emitted alongside the newer
     # `detail.type/code` (capabilities/voice-elevenlabs.md §5).
@@ -405,13 +604,19 @@ def elevenlabs_403_voice(hdr: dict[str, str]) -> Response:
 
 
 __all__ = [
+    "AAI_MODEL_HEADER",
+    "AAI_SYNC_MODELS",
+    "ELEVENLABS_STT_MODELS",
     "INWORLD_EMPTY_LINE",
     "INWORLD_LINE_BYTES_DEFAULT",
     "INWORLD_LINE_BYTES_REAL",
+    "INWORLD_STT_MODELS",
     "RAW_CHUNK_BYTES",
     "WAV_HEADER_BYTES",
     "assemblyai_403_ratelimit",
+    "assemblyai_elb_404",
     "assemblyai_sync",
+    "assemblyai_sync_badkey",
     "assemblyai_token",
     "audio_bytes",
     "client_secrets",
@@ -420,13 +625,18 @@ __all__ = [
     "elevenlabs_ndjson",
     "elevenlabs_ndjson_lines",
     "elevenlabs_raw",
+    "elevenlabs_stt",
+    "elevenlabs_stt_401",
     "embeddings",
     "has_raw_auth",
     "inworld_400_code3",
     "inworld_404_code5",
     "inworld_lines",
     "inworld_ndjson",
+    "inworld_stt",
+    "inworld_stt_403",
     "inworld_sync",
+    "multipart_part",
     "openai_stt_json",
     "openai_stt_sse_frames",
     "openai_tts_sse_frames",

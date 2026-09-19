@@ -24,8 +24,10 @@ from llmgw.surfaces.voice import (
     AUDIO_SPEECH,
     AUDIO_SPEECH_SSE,
     AUDIO_TRANSCRIPTION,
+    ELEVENLABS_STT,
     ELEVENLABS_TTS,
     ELEVENLABS_TTS_TIMESTAMPS,
+    INWORLD_STT,
     INWORLD_TTS,
     VOICE_ROUTES,
     VOICE_SURFACES,
@@ -367,10 +369,93 @@ def test_assemblyai_sync_bills_audio_duration_and_takes_no_json_body():
     ASSEMBLYAI_SYNC.usage_from_body(
         {"text": "hi", "audio_duration_ms": 2500, "request_time_ms": 134}, usage)
     assert usage.seconds == 2.5 and usage.exact
-    assert ASSEMBLYAI_SYNC.body == "raw" and ASSEMBLYAI_SYNC.upstream_path == "/transcribe"
+    # Multipart with an `audio` part at `/v1/transcribe`, and the model in
+    # `X-AAI-Model`: the three things whose absence made every call a 404.
+    assert ASSEMBLYAI_SYNC.body == "multipart"
+    assert ASSEMBLYAI_SYNC.upstream_path == "/v1/transcribe"
+    assert ASSEMBLYAI_SYNC.model_header == "X-AAI-Model"
+    assert ASSEMBLYAI_SYNC.model_key is None, "the model is not in the body at all"
+    for route in ("/assemblyai/v1/transcribe", "/assemblyai/transcribe"):
+        assert ASSEMBLYAI_SYNC.upstream_path_for(route) == "/v1/transcribe"
     with pytest.raises(errors.InvalidRequest):
         ASSEMBLYAI_SYNC.parse_request(b"\x00" * 10)
     assert ASSEMBLYAI_SYNC.classify(ev("{}")) is EventKind.META
     bad = Usage()
     ASSEMBLYAI_SYNC.usage_from_body({"audio_duration_ms": -5}, bad)
     assert bad.exact is False
+
+
+# ----------------------------------------------------------- elevenlabs_stt
+
+
+def test_elevenlabs_stt_bills_the_duration_the_provider_reported():
+    """`audio_duration_secs` is exact and NOT rounded: 1.84 for a file
+    AssemblyAI independently measured at 1840 ms. OpenAI's duration usage is
+    rounded up before the provider reports it and `ceil_seconds` honours
+    that; doing the same here would invent 160 ms of audio on every call."""
+    usage = Usage()
+    ELEVENLABS_STT.usage_from_body(
+        {"text": "hi", "audio_duration_secs": 1.84, "transcription_id": "x"}, usage)
+    assert usage.seconds == 1.84 and usage.exact
+
+
+def test_elevenlabs_stt_is_multipart_with_the_model_in_a_form_field():
+    assert ELEVENLABS_STT.body == "multipart" and ELEVENLABS_STT.framing == "raw"
+    assert ELEVENLABS_STT.model_key == "model_id"
+    assert ELEVENLABS_STT.model_header is None, "this one really is in the body"
+    assert ELEVENLABS_STT.upstream_path_for("/elevenlabs/v1/speech-to-text") == (
+        "/v1/speech-to-text")
+    with pytest.raises(ValueError):
+        ELEVENLABS_STT.upstream_path_for("/elevenlabs/v1/text-to-speech/v/stream")
+    with pytest.raises(errors.InvalidRequest):
+        ELEVENLABS_STT.parse_request(b"--boundary\r\n")
+
+
+def test_elevenlabs_stt_never_raises_on_a_body_it_cannot_read():
+    for payload in ({}, {"audio_duration_secs": None}, {"audio_duration_secs": "1.8"},
+                    {"audio_duration_secs": True}, {"audio_duration_secs": -3}):
+        usage = Usage()
+        ELEVENLABS_STT.usage_from_body(payload, usage)
+        assert usage == Usage(), payload
+
+
+# -------------------------------------------------------------- inworld_stt
+
+
+def test_inworld_stt_reads_the_nested_model_and_the_millisecond_meter():
+    facts = INWORLD_STT.parse_request(json.dumps({
+        "transcribeConfig": {"modelId": "inworld.stt-1", "audioEncoding": "LINEAR16"},
+        "audioData": {"content": "AAAA"}}).encode())
+    assert facts.model == "inworld.stt-1" and facts.stream is False
+    # The snake_case spelling protojson also accepts.
+    facts2 = INWORLD_STT.parse_request(json.dumps({
+        "transcribe_config": {"model_id": "inworld.stt-1"}}).encode())
+    assert facts2.model == "inworld.stt-1"
+    usage = Usage()
+    INWORLD_STT.usage_from_body(
+        {"transcription": {"transcript": "hi"},
+         "usage": {"transcribedAudioMs": 1840, "modelId": "inworld/inworld-stt-1"}}, usage)
+    assert usage.seconds == 1.84 and usage.exact
+
+
+def test_inworld_stt_refuses_a_body_that_names_no_model():
+    for body in (b"{}", b'{"audioData":{"content":"AAAA"}}',
+                 b'{"transcribeConfig":{"modelId":"  "}}', b'{"transcribeConfig":[]}'):
+        with pytest.raises(errors.InvalidRequest):
+            INWORLD_STT.parse_request(body)
+
+
+def test_inworld_stt_classifies_its_grpc_error_codes():
+    busy = INWORLD_STT.error_from_event(jev({"code": 8, "message": "slow down"}))
+    assert isinstance(busy, errors.UpstreamOverloaded)
+    other = INWORLD_STT.error_from_event(jev({"code": 3, "message": "audio_data is required"}))
+    assert isinstance(other, errors.InStreamError)
+    assert INWORLD_STT.error_from_event(ev(b"\x00\x01")) is None
+
+
+def test_inworld_stt_accounting_never_raises():
+    for payload in ({}, {"usage": None}, {"usage": {"transcribedAudioMs": "1840"}},
+                    {"usage": []}):
+        usage = Usage()
+        INWORLD_STT.usage_from_body(payload, usage)
+        assert usage == Usage(), payload

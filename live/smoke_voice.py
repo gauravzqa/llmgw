@@ -2,8 +2,14 @@
 
 Spends real money (fractions of a cent) and needs real keys. Each case runs
 only when its provider's key is present in the environment and SKIPS
-otherwise -- ElevenLabs and AssemblyAI keys were absent on 18 Sep 2026, so
-those cases print SKIP and do not fail the run. Never prints a key.
+otherwise. Never prints a key.
+
+The speech-to-text cases are fed by a text-to-speech case: one Inworld TTS
+call through the gateway produces a 16 kHz mono WAV that AssemblyAI,
+ElevenLabs Scribe and Inworld STT all transcribe. That keeps the run
+self-contained -- no checked-in audio fixture to rot -- and it is a second
+assertion for free, because three independent providers measure the same
+file and must agree on its duration.
 
 What is asserted per case: the status, the framing the client actually
 received (content type, and for streams the frame shape), the meter the
@@ -56,6 +62,15 @@ incumbent = "openai.gpt-4o-mini-tts"
 """
 
 TEXT = "The quick brown fox jumps over the lazy dog."
+SHORT = "Gateway check."
+"""One short sentence for ElevenLabs: the free tier has 10,000 characters for
+the month, and every TTS call spends from it."""
+
+ELEVENLABS_DEFAULT_VOICE = "EXAVITQu4vr4xnSDxMaL"
+"""Sarah, a PREMADE voice. The old default here (`21m00Tcm4TlvDq8ikWAM`) is a
+LIBRARY voice, and on 19 Sep 2026 the free tier answered it with a 402,
+`paid_plan_required`: free users may not use library voices via the API.
+"""
 
 
 def _metric(text: str, name: str, **labels: str) -> float:
@@ -79,9 +94,42 @@ class Case:
         self.gw = gw
         self.out = out
         self.spend = 0.0
+        self._clip: bytes | None = None
 
     def metrics(self) -> str:
         return httpx.get(f"{self.gw.base_url}/metrics", timeout=10).text
+
+    # -------------------------------------------------- speech-to-text input
+
+    def clip(self) -> bytes | None:
+        """A real 16 kHz mono WAV, spoken by Inworld TTS through the gateway.
+
+        Cached for the run: three transcription cases share one file, which
+        is both cheaper and stronger evidence -- they must all report the
+        same duration for it."""
+        if self._clip is not None:
+            return self._clip or None
+        if not _has("INWORLD_API_KEY"):
+            self._clip = b""
+            return None
+        body = {"modelId": "inworld.tts-2-flash", "text": TEXT, "voiceId": "Ashley",
+                "audioConfig": {"audioEncoding": "LINEAR16", "sampleRateHertz": 16000}}
+        r = httpx.post(f"{self.gw.base_url}/inworld/tts/v1/voice", json=body, timeout=60)
+        if r.status_code != 200:
+            _print(f"  stt-input: FAIL (inworld tts {r.status_code})", self.out)
+            self._clip = b""
+            return None
+        try:
+            audio = base64.b64decode(r.json()["audioContent"])
+        except (ValueError, KeyError, TypeError):
+            self._clip = b""
+            return None
+        self.spend += 15.0 * len(TEXT) / 1e6
+        self._clip = audio
+        seconds = max(0, len(audio) - 44) / 32_000
+        _print(f"  stt-input: {len(audio)} B WAV, {seconds:.2f}s, spoken by "
+               f"inworld.tts-2-flash through the gateway", self.out)
+        return audio
 
     # ------------------------------------------------------------ OpenAI TTS
 
@@ -221,16 +269,51 @@ class Case:
                f"{'PASS' if r.status_code == 200 else 'FAIL'} (a 200 with usage null is "
                f"Inworld's answer to empty text)", self.out)
 
+    def inworld_stt(self) -> None:
+        """HTTP STT. The model is NESTED at `transcribeConfig.modelId`, which
+        is the only place this API reads it; the bill is
+        `usage.transcribedAudioMs`."""
+        if not _has("INWORLD_API_KEY"):
+            _print("  inworld-stt: SKIP (no INWORLD_API_KEY)", self.out)
+            return
+        audio = self.clip()
+        if audio is None:
+            _print("  inworld-stt: SKIP (no speech-to-text input)", self.out)
+            return
+        before = _metric(self.metrics(), "llmgw_units_total", unit="seconds",
+                         model="inworld.stt-1")
+        body = {"transcribeConfig": {"modelId": "inworld.stt-1",
+                                     "audioEncoding": "LINEAR16",
+                                     "sampleRateHertz": 16000, "numberOfChannels": 1,
+                                     "language": "en-US"},
+                "audioData": {"content": base64.b64encode(audio).decode()}}
+        r = httpx.post(f"{self.gw.base_url}/inworld/stt/v1/transcribe", json=body,
+                       timeout=90)
+        payload = r.json() if r.status_code == 200 else {}
+        usage = payload.get("usage") or {}
+        ms = usage.get("transcribedAudioMs")
+        after = _metric(self.metrics(), "llmgw_units_total", unit="seconds",
+                        model="inworld.stt-1")
+        billed = after - before
+        agree = ms is not None and abs(billed - ms / 1000) <= 0.01 * max(ms / 1000, 1)
+        text = str((payload.get("transcription") or {}).get("transcript", ""))[:48]
+        _print(f"  inworld-stt: {r.status_code} transcribedAudioMs={ms} "
+               f"wire_model={usage.get('modelId')!r} billed_seconds={billed:g} "
+               f"text={text!r} -> "
+               f"{'PASS' if r.status_code == 200 and agree else 'FAIL'}", self.out)
+        if ms:
+            self.spend += 0.15 * (ms / 1000) / 3600
+
     # ------------------------------------------------------------- ElevenLabs
 
     def elevenlabs_stream(self) -> None:
         if not _has("ELEVENLABS_API_KEY"):
             _print("  elevenlabs-stream: SKIP (no ELEVENLABS_API_KEY)", self.out)
             return
-        voice = os.environ.get("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")
+        voice = os.environ.get("ELEVENLABS_VOICE_ID", ELEVENLABS_DEFAULT_VOICE)
         before = _metric(self.metrics(), "llmgw_units_total", unit="characters",
                          model="elevenlabs.flash-v2-5")
-        body = {"text": TEXT, "model_id": "elevenlabs.flash-v2-5"}
+        body = {"text": SHORT, "model_id": "elevenlabs.flash-v2-5"}
         url = (f"{self.gw.base_url}/elevenlabs/v1/text-to-speech/{voice}/stream"
                "?output_format=mp3_22050_32")
         with httpx.stream("POST", url, json=body, timeout=60) as r:
@@ -239,30 +322,63 @@ class Case:
         after = _metric(self.metrics(), "llmgw_units_total", unit="characters",
                         model="elevenlabs.flash-v2-5")
         billed = after - before
-        _print(f"  elevenlabs-stream: {status} {ct} bytes={total} "
-               f"billed_characters={billed:g} (character-cost header; needs the server's "
-               f"usage_from_headers hook) -> "
-               f"{'PASS' if status == 200 and total > 0 else 'FAIL'}", self.out)
-        self.spend += 50.0 * len(TEXT) / 1e6
+        ok = status == 200 and total > 0 and billed > 0
+        _print(f"  elevenlabs-tts: {status} {ct} bytes={total} "
+               f"billed_characters={billed:g} (the `character-cost` response header, "
+               f"read before the first audio byte) -> {'PASS' if ok else 'FAIL'}", self.out)
+        self.spend += 50.0 * len(SHORT) / 1e6
+
+    def elevenlabs_stt(self) -> None:
+        """Scribe. Multipart, `model_id` before the `file` part, and the bill
+        is `audio_duration_secs` from the response body."""
+        if not _has("ELEVENLABS_API_KEY"):
+            _print("  elevenlabs-stt: SKIP (no ELEVENLABS_API_KEY)", self.out)
+            return
+        audio = self.clip()
+        if audio is None:
+            _print("  elevenlabs-stt: SKIP (no speech-to-text input)", self.out)
+            return
+        before = _metric(self.metrics(), "llmgw_units_total", unit="seconds",
+                         model="elevenlabs.scribe-v2")
+        r = httpx.post(f"{self.gw.base_url}/elevenlabs/v1/speech-to-text",
+                       data={"model_id": "elevenlabs.scribe-v2"},
+                       files={"file": ("clip.wav", audio, "audio/wav")}, timeout=90)
+        payload = r.json() if r.status_code == 200 else {}
+        secs = payload.get("audio_duration_secs")
+        after = _metric(self.metrics(), "llmgw_units_total", unit="seconds",
+                        model="elevenlabs.scribe-v2")
+        billed = after - before
+        agree = secs is not None and abs(billed - secs) <= 0.01 * max(secs, 1)
+        text = str(payload.get("text", ""))[:48]
+        _print(f"  elevenlabs-stt: {r.status_code} audio_duration_secs={secs} "
+               f"billed_seconds={billed:g} text={text!r} -> "
+               f"{'PASS' if r.status_code == 200 and agree else 'FAIL'}", self.out)
+        if secs:
+            self.spend += 0.22 * secs / 3600
 
     # ------------------------------------------------------------- AssemblyAI
 
     def assemblyai_sync(self) -> None:
+        """Multipart with an `audio` part, at `/v1/transcribe`, with the
+        catalog id in `?model=` so the gateway can write the wire id into
+        `X-AAI-Model`. Any one of those three missing is a 404."""
         if not _has("ASSEMBLYAI_API_KEY"):
             _print("  assemblyai-sync: SKIP (no ASSEMBLYAI_API_KEY)", self.out)
             return
-        pcm = _tone_pcm16(seconds=2, rate=16_000)
+        audio = self.clip() or _tone_wav(seconds=2)
         before = _metric(self.metrics(), "llmgw_units_total", unit="seconds",
                          model="assemblyai.sync")
-        r = httpx.post(f"{self.gw.base_url}/assemblyai/transcribe?model=assemblyai.sync",
-                       content=pcm, headers={"content-type": "audio/pcm"}, timeout=60)
-        ms = r.json().get("audio_duration_ms") if r.status_code == 200 else None
+        r = httpx.post(f"{self.gw.base_url}/assemblyai/v1/transcribe?model=assemblyai.sync",
+                       files={"audio": ("clip.wav", audio, "audio/wav")}, timeout=90)
+        payload = r.json() if r.status_code == 200 else {}
+        ms = payload.get("audio_duration_ms")
         after = _metric(self.metrics(), "llmgw_units_total", unit="seconds",
                         model="assemblyai.sync")
         billed = after - before
         agree = ms is not None and abs(billed - ms / 1000) <= 0.01 * max(ms / 1000, 1)
+        text = str(payload.get("text", ""))[:48]
         _print(f"  assemblyai-sync: {r.status_code} audio_duration_ms={ms} "
-               f"billed_seconds={billed:g} -> "
+               f"billed_seconds={billed:g} text={text!r} -> "
                f"{'PASS' if r.status_code == 200 and agree else 'FAIL'}", self.out)
         if ms:
             self.spend += 0.0075 * ms / 1000 / 60
@@ -323,7 +439,10 @@ def run(*, spend: bool = True, out=sys.stdout) -> float:
             case.inworld_sync()
             case.inworld_empty_text()
             case.elevenlabs_stream()
+            # Everything below transcribes the clip the first caller mints.
             case.assemblyai_sync()
+            case.elevenlabs_stt()
+            case.inworld_stt()
             _print(f"\nESTIMATED SPEND: ${case.spend:.6f}", out)
             return case.spend
         finally:

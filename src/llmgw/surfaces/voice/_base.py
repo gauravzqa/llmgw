@@ -23,7 +23,13 @@ reuse the template's params) and `forward_query` (whether the client's query
 string travels upstream -- ElevenLabs carries `output_format` there). And
 one for the model rewrite: `model_key`, because Inworld spells the model
 `modelId` and ElevenLabs `model_id`; `upstream.apply_api_model` targets
-`model` unless told otherwise.
+`model` unless told otherwise. A dotted `model_key` names one level of
+nesting (`transcribeConfig.modelId`, Inworld's HTTP STT).
+
+`model_header` is the fifth, and the only one no text surface could ever
+need: AssemblyAI's sync host routes on `X-AAI-Model` at the load balancer,
+so its model is in a header and never in the body. A surface that sets it
+gets its body forwarded untouched.
 
 `include_usage_injectable = False`: the OpenAI-dialect `stream_options.
 include_usage` injection is a chat-completions fact, and these surfaces ride
@@ -130,7 +136,8 @@ class VoiceSurface:
     framing: Framing = "raw"
     body: Literal["json", "multipart", "raw"] = "json"
     default_profile: str | None = None
-    model_key: str = "model"
+    model_key: str | None = "model"
+    model_header: str | None = None
     include_usage_injectable: bool = False
 
     # ------------------------------------------------------------ protocol

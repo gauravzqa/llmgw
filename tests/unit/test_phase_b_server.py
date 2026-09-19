@@ -328,6 +328,37 @@ def test_multipart_without_a_boundary_or_model_is_a_400_before_upstream():
         )
 
 
+def test_a_multipart_surface_whose_model_is_a_header_reads_the_query_instead():
+    """`assemblyai_sync` sends multipart, but its model goes upstream in
+    `X-AAI-Model` and is not in the body at all. Scanning the form fields for
+    it would fail closed on every correct request, and asking the caller to
+    add a `model` part would put a part in the upload that the provider never
+    asked for."""
+    surface = _Surface("multipart")
+    surface.model_header = "X-AAI-Model"
+    body = _multipart({"audio": b"RIFF...."})
+    facts = appmod.facts_for_body(
+        surface, body, _scope(query=b"model=assemblyai.sync"),
+        content_type="multipart/form-data; boundary=B0UNDARY",
+    )
+    assert (facts.model, facts.stream) == ("assemblyai.sync", False)
+    facts = appmod.facts_for_body(
+        surface, body, _scope(**{"X-Gw-Model": "assemblyai.sync"}),
+        content_type="multipart/form-data; boundary=B0UNDARY",
+    )
+    assert facts.model == "assemblyai.sync"
+    # Still fails closed, and still needs the boundary: a body the gateway
+    # cannot route is not a body it forwards and lets the provider bill.
+    with pytest.raises(E.InvalidRequest, match="X-Gw-Model"):
+        appmod.facts_for_body(
+            surface, body, _scope(),
+            content_type="multipart/form-data; boundary=B0UNDARY",
+        )
+    with pytest.raises(E.InvalidRequest, match="boundary"):
+        appmod.facts_for_body(surface, body, _scope(query=b"model=x"),
+                              content_type="text/plain")
+
+
 def test_facts_for_raw_bodies_come_from_the_query_or_the_header():
     facts = appmod.facts_for_body(
         _Surface("raw"), b"\x00", _scope(query=b"model=m%2E1&stream=true"),

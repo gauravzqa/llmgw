@@ -215,6 +215,41 @@ def test_seconds_are_priced_through_per_minute():
     assert rec.seconds == 90
 
 
+def test_fractional_seconds_keep_their_fraction_all_the_way_to_the_bill():
+    """Duration is the one unit here that is not a count.
+
+    ElevenLabs Scribe reports `audio_duration_secs: 1.84`; AssemblyAI sync
+    reports `audio_duration_ms: 1840`. Both are EXACT, and both used to be
+    truncated to 1 second by the integer read that every other unit needs --
+    a 46% under-bill on a record flagged `exact`, which is worse than an
+    honest estimate because nothing about it looks wrong.
+    """
+    cat = voice_catalog()
+    rec = account(result_for(cat, "stt.minutes", usage_like(seconds=1.84)), catalog=cat)
+    assert rec.seconds == pytest.approx(1.84)
+    assert rec.cost_usd == pytest.approx(1.84 / 60 * 0.0045)
+    assert rec.units_by_kind["seconds"] == pytest.approx(1.84)
+
+
+def test_a_whole_second_meter_is_unchanged_by_that():
+    """OpenAI rounds its duration up before reporting it, so its records must
+    look exactly as they did."""
+    cat = voice_catalog()
+    rec = account(result_for(cat, "stt.minutes", usage_like(seconds=3)), catalog=cat)
+    assert rec.seconds == 3 and rec.cost_usd == pytest.approx(3 / 60 * 0.0045)
+
+
+def test_a_nonsense_duration_is_zero_and_never_raises():
+    cat = voice_catalog()
+    for bad in (None, float("nan"), float("inf"), -5.0, object(), "not a number"):
+        rec = account(result_for(cat, "stt.minutes", usage_like(seconds=bad)), catalog=cat)
+        assert rec.seconds == 0, bad
+    # A numeric string still parses, exactly as it did through the integer
+    # read: leniency here was never the bug.
+    rec = account(result_for(cat, "stt.minutes", usage_like(seconds="1.84")), catalog=cat)
+    assert rec.seconds == pytest.approx(1.84)
+
+
 def test_a_seconds_row_needs_per_minute_and_a_token_row_may_not_have_it():
     with pytest.raises(ValueError, match="per_minute"):
         ModelSpec(id="x", provider="openai", api_model="x", unit="seconds",

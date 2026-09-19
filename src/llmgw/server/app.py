@@ -2045,7 +2045,9 @@ def facts_for_body(
     """`RequestFacts` for any body kind (PLAN-2 B4).
 
     `json` asks the surface, exactly as before. `multipart` scans the leading
-    form fields for `model` and `stream` (`scan_multipart_fields`); `raw`
+    form fields for `model` and `stream` (`scan_multipart_fields`) -- unless
+    the surface declares a `model_header`, in which case its model is not in
+    the body at all and is read from the query string; `raw`
     reads `?model=` or `X-Gw-Model` and `?stream=`. Both non-JSON kinds fail
     closed with `InvalidRequest` when no model is named, because a request
     the gateway cannot route is not one it should forward and let the
@@ -2066,24 +2068,41 @@ def facts_for_body(
                 f"{surface.name} expects a multipart/form-data body with a boundary; "
                 f"got content-type {content_type!r}"
             )
-        fields = scan_multipart_fields(body, boundary, wanted=frozenset({"model", "stream"}))
-        model = fields.get("model")
+        if getattr(surface, "model_header", None):
+            # The model is a ROUTING HEADER upstream (`assemblyai_sync`'s
+            # `X-AAI-Model`), so the client's multipart body has no model
+            # field to scan for and adding one would be a part the provider
+            # never asked for. Read it where a `raw` body reads it.
+            return _facts_from_query(surface, scope)
+        # The dialect's own spelling, the same key `apply_api_model_multipart`
+        # splices on the way out: OpenAI's transcription route calls it
+        # `model`, ElevenLabs' Scribe route calls it `model_id`. Scanning for
+        # `model` on the latter fails closed on every correct request.
+        key = getattr(surface, "model_key", "model") or "model"
+        fields = scan_multipart_fields(body, boundary, wanted=frozenset({key, "stream"}))
+        model = fields.get(key)
         if not model:
             raise errors.InvalidRequest(
-                f"no `model` form field in the first {MULTIPART_SCAN_BYTES} bytes of "
+                f"no `{key}` form field in the first {MULTIPART_SCAN_BYTES} bytes of "
                 f"the multipart body; put the text fields before the file part"
             )
         return RequestFacts(model=model, stream=_truthy(fields.get("stream")))
     if kind == "raw":
-        model = (query_param(scope, MODEL_QUERY_PARAM)
-                 or header_value(scope, MODEL_REQUEST_HEADER))
-        if not model:
-            raise errors.InvalidRequest(
-                f"{surface.name} takes a raw body; name the model with ?model=<id> "
-                f"or the X-Gw-Model header"
-            )
-        return RequestFacts(model=model, stream=_truthy(query_param(scope, b"stream")))
+        return _facts_from_query(surface, scope)
     raise errors.PolicyError(f"surface {surface.name!r} declares unknown body kind {kind!r}")
+
+
+def _facts_from_query(surface: Surface, scope: Scope) -> RequestFacts:
+    """`?model=` or `X-Gw-Model`, for a body the gateway must not read: a raw
+    audio body, or a multipart one whose model travels in a header."""
+    model = (query_param(scope, MODEL_QUERY_PARAM)
+             or header_value(scope, MODEL_REQUEST_HEADER))
+    if not model:
+        raise errors.InvalidRequest(
+            f"{surface.name} does not read its model from the body; name it with "
+            f"?model=<id> or the X-Gw-Model header"
+        )
+    return RequestFacts(model=model, stream=_truthy(query_param(scope, b"stream")))
 
 
 class ModelsEndpoint:

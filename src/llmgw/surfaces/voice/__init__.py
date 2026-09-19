@@ -26,10 +26,12 @@ from llmgw.surfaces.voice._base import VoiceRequestFacts, VoiceSurface
 from llmgw.surfaces.voice.assemblyai_sync import AssemblyAISyncSurface
 from llmgw.surfaces.voice.audio_speech import AudioSpeechSurface
 from llmgw.surfaces.voice.audio_transcription import AudioTranscriptionSurface
+from llmgw.surfaces.voice.elevenlabs_stt import ElevenLabsSTTSurface
 from llmgw.surfaces.voice.elevenlabs_tts import (
     ElevenLabsTimestampsSurface,
     ElevenLabsTTSSurface,
 )
+from llmgw.surfaces.voice.inworld_stt import InworldSTTSurface
 from llmgw.surfaces.voice.inworld_tts import InworldTTSSurface
 
 AUDIO_SPEECH: Surface = AudioSpeechSurface()                  # binary by default
@@ -38,7 +40,9 @@ AUDIO_TRANSCRIPTION: Surface = AudioTranscriptionSurface()      # + /translation
 INWORLD_TTS: Surface = InworldTTSSurface()                      # /voice and /voice:stream
 ELEVENLABS_TTS: Surface = ElevenLabsTTSSurface()                # buffered and /stream
 ELEVENLABS_TTS_TIMESTAMPS: Surface = ElevenLabsTimestampsSurface()  # unregistered
-ASSEMBLYAI_SYNC: Surface = AssemblyAISyncSurface()
+ELEVENLABS_STT: Surface = ElevenLabsSTTSurface()                # Scribe, multipart
+INWORLD_STT: Surface = InworldSTTSurface()                      # /stt/v1/transcribe
+ASSEMBLYAI_SYNC: Surface = AssemblyAISyncSurface()              # /v1/transcribe
 
 VOICE_SURFACES: tuple[Surface, ...] = (
     AUDIO_SPEECH,
@@ -46,9 +50,11 @@ VOICE_SURFACES: tuple[Surface, ...] = (
     INWORLD_TTS,
     ELEVENLABS_TTS,
     ELEVENLABS_TTS_TIMESTAMPS,
+    ELEVENLABS_STT,
+    INWORLD_STT,
     ASSEMBLYAI_SYNC,
 )
-"""What the registry mounts: five names, nine routes."""
+"""What the registry mounts: eight names, thirteen routes."""
 
 VOICE_ROUTES: dict[str, Surface] = {
     route: surface for surface in VOICE_SURFACES for route in surface.routes
@@ -60,16 +66,20 @@ __all__ = [
     "AUDIO_SPEECH",
     "AUDIO_SPEECH_SSE",
     "AUDIO_TRANSCRIPTION",
+    "ELEVENLABS_STT",
     "ELEVENLABS_TTS",
     "ELEVENLABS_TTS_TIMESTAMPS",
+    "INWORLD_STT",
     "INWORLD_TTS",
     "VOICE_ROUTES",
     "VOICE_SURFACES",
     "AssemblyAISyncSurface",
     "AudioSpeechSurface",
     "AudioTranscriptionSurface",
+    "ElevenLabsSTTSurface",
     "ElevenLabsTTSSurface",
     "ElevenLabsTimestampsSurface",
+    "InworldSTTSurface",
     "InworldTTSSurface",
     "VoiceRequestFacts",
     "VoiceSurface",

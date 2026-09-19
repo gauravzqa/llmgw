@@ -1082,6 +1082,7 @@ class Executor:
             content_type=content_type,
             request_defaults=request_defaults,
             model_key=getattr(surface, "model_key", "model") or "model",
+            model_header=getattr(surface, "model_header", None),
             include_usage_injectable=bool(getattr(surface, "include_usage_injectable", True)),
         )
         ctx = {

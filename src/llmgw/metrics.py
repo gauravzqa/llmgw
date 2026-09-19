@@ -73,6 +73,13 @@ SURFACES: tuple[str, ...] = (
     "elevenlabs_tts",
     "elevenlabs_tts_timestamps",
     "assemblyai_sync",
+    # The HTTP speech-to-text half of the same two providers, added once the
+    # request shapes were established live (19 Sep 2026). `_stt` and not a
+    # reuse of the `_tts` label: the unit differs (audio seconds against
+    # characters), so a dashboard that summed them would be summing two
+    # currencies.
+    "elevenlabs_stt",
+    "inworld_stt",
     # PLAN-G: the WebSocket plane. One name per product dialect, `_ws`-
     # suffixed where an HTTP surface of the same provider already exists, so
     # `llmgw_requests_total{surface="inworld_tts"}` keeps meaning the HTTP

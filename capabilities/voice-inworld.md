@@ -51,7 +51,7 @@ Doc URLs used: DOCS https://docs.inworld.ai · TTS https://docs.inworld.ai/tts/t
 | TTS stream `POST /tts/v1/voice:stream` | JS, LK-TTS, PC; `[live]` | **NDJSON**: `content-type: application/json`, `transfer-encoding: chunked`, one object per `\n`-terminated line, no blank lines, trailing newline, no terminator, ends on close. Line shape `{"result":{"audioContent":"<b64>","usage":{"processedCharactersCount":N,"modelId":"…"},"timestampInfo":{…}?}}`: `usage` is **inside `result` on every line**, with the character count on the first line and `0` on the rest. `[live]` 19 chars LINEAR16: 5 lines, 121 KB wire, 90 KB audio, TTFB 360 ms, total 777 ms; 1,900 chars: 123 lines, 7.06 MB wire, 5.28 MB audio, TTFB 372 ms, total 6.4 s; steady-state line = 48,044 decoded bytes (1.0 s of 24 kHz 16-bit) = 64,161 wire bytes | **Needs new transport (framing)** | `pump.py:198` constructs `SSEParser` unconditionally; `sse.py:330-357` appends every line to `_raw` and treats `{"result"…` as an unknown field, never dispatching. `[live]` confirmed by feeding the captured bytes to `SSEParser`: 0 events on every stream; `FrameTooLarge` at 1,052,672 cumulative bytes (line 19 of the long stream) | See "What the SSE parser does with NDJSON" below: bytes are copied to the client, but the progress clock never ticks and the frame bound trips. A per-line frame bound of 1 MiB is generous: the largest line seen was 64 KB (PCM) and 15 KB (MP3) |
 | TTS WebSocket `wss://api.inworld.ai/tts/v1/voice:streamBidirectional` | LK-TTS, PC (docs page gated) | WS JSON: client `create` / `send_text` / `flush_context` / `close_context` with `contextId`; server `contextCreated` / `audioChunk` / `flushCompleted` / `contextClosed` / `error`; ≤5 contexts per socket | **Needs new transport (WebSocket)** | no `websocket` anywhere in `src/llmgw` (grep); Starlette app is HTTP routes only (`app.py:2488-2505`) | This is what the LiveKit plugin Layrs runs uses in production |
 | Voices: list `GET /tts/v1/voices`, clone `POST /voices/v1/voices:clone`, design, publish, update, delete | QS, LK-TTS | REST JSON | **Not a gateway concern** (control plane) | — | Clone bodies carry base64 samples; if ever proxied the 4 MiB request cap (`config.py:395`) bites |
-| STT sync `POST /stt/v1/transcribe` | STT; `[source: inworld-api-examples stt/python/example_stt.py:53-69,97-111]` | REST JSON in: `{"modelId","audioEncoding":"AUTO_DETECT","language","audioData":{"content":<b64>}}`; JSON out: `transcription.transcript`, `transcription.wordTimestamps[]`, `usage.transcribedAudioMs`, `usage.modelId`; ~16 MB max | **Proxyable today** as buffered (with cap raised) + **Needs new accounting** (audio ms is in the response) | `config.py:395` 4 MiB < 16 MB | Layrs does not use sync STT. Inworld's own example uses `modelId: "groq/whisper-large-v3"`, so that model id is live (corrects the doc delta below) |
+| STT sync `POST /stt/v1/transcribe` | STT; `[source: inworld-api-examples stt/python/example_stt.py:53-69,97-111]` | REST JSON in: `{"transcribeConfig":{"modelId","audioEncoding","sampleRateHertz","numberOfChannels","language"},"audioData":{"content":<b64>}}` — **the flat spelling in the example is REJECTED, see the corrections at the end of this file**; JSON out: `transcription.transcript`, `transcription.wordTimestamps[]`, `usage.transcribedAudioMs`, `usage.modelId`; ~16 MB max | **Built and working** (`inworld_stt`, 19 Sep 2026): buffered, `usage.transcribedAudioMs` is the exact meter | `config.py:395` 4 MiB < 16 MB | Layrs does not use sync STT. Inworld's own example uses `modelId: "groq/whisper-large-v3"`, so that model id is live (corrects the doc delta below) |
 | STT streaming `wss://api.inworld.ai/stt/v1/transcribe:streamBidirectional` | STT, LK-STT | WS JSON: first message `transcribeConfig`, then `{"audioChunk":{"content":"<b64 pcm>"}}`, `endTurn`, `closeStream`; server events START/INTERIM/FINAL/END_OF_SPEECH, `RECOGNITION_USAGE` every 5 s | **Needs new transport (WebSocket)** | as above | Production STT path for Layrs |
 | Realtime API (speech-to-speech) | RT; `[source: inworld-api-examples realtime/python/websockets/basic/server.py:24-26]` | WebSocket `wss://api.inworld.ai/api/v1/realtime/session?key=<client key>&protocol=realtime`, `Authorization: Basic`, OpenAI Realtime protocol "with extensions"; plus WebRTC; composes STT+LLM+TTS | **Needs new transport**; arguably **Not a gateway concern** | — | Session tokens or JWT; per-session concurrency; the LLM inside it is Inworld's Router, not yours |
 | LLM Router (OpenAI-compatible chat completions at `https://api.inworld.ai/v1/chat/completions`) | ROUTER; `[live]` | REST/SSE, `model` + `models[]` fallback array | **Proxyable today** as one more `ProviderConn(kind="openai")` | `catalog.py:60` `ProviderKind = openai|anthropic`; `upstream.py:316` bearer; `[live]` fake-key `POST /v1/chat/completions` → `401 Unauthorized` (plain text, no `x-inworld-request-id`: a different auth stack from TTS); `GET /v1/models` → 404 `{"code":5,"message":"Not Found"}` | Direct overlap with llmgw (fallback, cost routing, A/B). If used, exactly one layer must own retries — PLAN §3 contract 5, `X-Gw-No-Retry`. No model-list endpoint at that path, so `make probe` cannot reconcile against it |
@@ -243,3 +243,55 @@ Source-verified shapes (no live call):
 - TTS WebSocket client messages (`tts.py:389-432`): `{"create":{"modelId","voiceId","audioConfig":{…},"bufferCharThreshold":120,"maxBufferDelayMs":3000,"language"?,"timestampType"?,"applyTextNormalization"?,"deliveryMode"?,"autoMode":true},"contextId"}`, `{"send_text":{"text"},"contextId"}`, `{"flush_context":{},"contextId"}`, `{"close_context":{},"contextId"}`; server: `result.contextCreated`, `result.audioChunk{audioContent,timestampInfo}`, `result.flushCompleted`, `result.contextClosed`, `result.status{code,message}`, or top-level `error{code,message}`.
 - STT WebSocket (`stt.py:244-283, 405-465`): first message `{"transcribeConfig":{"modelId","audioEncoding":"LINEAR16","sampleRateHertz","numberOfChannels","language","endOfTurnConfidenceThreshold","inworldSttV1Config":{"minEndOfTurnSilenceWhenConfident","vadThreshold"?},"voiceProfileConfig"?}}`, then `{"audioChunk":{"content":<b64 pcm>}}`, `{"endTurn":{}}`, `{"closeStream":{}}`; server `result.speechStarted`, `result.transcription{transcript,isFinal,voiceProfile?}`, `result.status`.
 - Token mint (`mint_jwt.py:21-50`): `POST /auth/v1/tokens/token:generate`, `Authorization: IW1-HMAC-SHA256 ApiKey=…,DateTime=…,Nonce=…,Signature=…`, body `{"key","resources":["workspaces/…"]}` → `{token,type,expirationTime,sessionId}`.
+
+
+---
+
+## Corrections applied 19 Sep 2026 (HTTP STT)
+
+The sync STT row (§1) was written from Inworld's own Python example and had
+the request shape wrong, which is how yesterday's probe concluded the
+endpoint "rejects our bodies". It does not; the body was wrong. What the
+live walk established:
+
+1. **The model is NESTED.** The documented flat body
+   `{"modelId", "audioEncoding", "language", "audioData": {...}}` is a **400
+   `invalid transcribe config: transcribe_config is required`** (retested
+   19 Sep). The accepted shape is:
+
+   ```json
+   {"transcribeConfig": {"modelId": "inworld/inworld-stt-1",
+                         "audioEncoding": "LINEAR16",
+                         "sampleRateHertz": 16000,
+                         "numberOfChannels": 1,
+                         "language": "en-US"},
+    "audioData": {"content": "<base64 of a WAV/MP3/OGG/FLAC/M4A/WebM file>"}}
+   ```
+
+   `audioEncoding: "AUTO_DETECT"` is accepted too, and
+   `modelId: "groq/whisper-large-v3"` really is live there (1839 ms against
+   `inworld/inworld-stt-1`'s 1840 ms for the same file).
+2. **Unknown fields are DISCARDED, not rejected.** That is why every wrong
+   spelling surfaces as the validation error for whatever field is now
+   missing, and why `{"audio_data": "<b64>"}` produced `proto: syntax error
+   (line 1:15)`: `audio_data` is the right name but it is a MESSAGE, so a
+   string value fails at exactly the column the value starts on.
+3. **The body is protojson only.** A multipart upload is parsed as JSON and
+   dies on the boundary (`invalid character '-' in numeric literal`); there
+   is no multipart form of this endpoint.
+4. **Raw PCM is refused**: `unsupported audio format - only WAV, MP3, OGG,
+   FLAC, M4A, and WebM are supported`. A container is required, unlike the
+   streaming socket, which takes bare PCM chunks.
+5. **`POST /stt/v1/recognize` does not exist** (404 `page not found`).
+6. The error ladder, each from a real 400: `audio_data is required` →
+   `invalid transcribe config: transcribe_config is required` →
+   `invalid transcribe config: model_id is required` → `invalid transcribe
+   config: audio_encoding is required and must not be
+   AUDIO_ENCODING_UNSPECIFIED` → `audio data is required`. A WAV of pure
+   digital silence is a **500** `{"code":13,"message":"proxy has failed to
+   process your request"}`.
+7. **Credentials**: bad key **403** `{"code":7}`, missing key **401**
+   `{"code":16}` with the `InworldStatus` detail. Both classify as
+   `AuthenticationFailed` under the row's default `forbidden_means`.
+8. **§6 STT pricing** ($0.15/h on-demand) is confirmed on inworld.ai/pricing
+   at 19 Sep 2026; the catalog row is `inworld.stt-1`.

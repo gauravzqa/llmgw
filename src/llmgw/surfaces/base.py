@@ -375,6 +375,13 @@ class Surface(Protocol):
     """HTTP methods the routes accept. `("POST",)` for every dialect that
     carries a body; `("GET",)` for a listing or a token mint."""
 
+    model_header: str | None
+    """The request header the target's `api_model` is written into, or None
+    for every dialect that carries its model in the body. Set only by
+    `assemblyai_sync`, whose `X-AAI-Model` is read by the load balancer in
+    front of the API (see `upstream.UpstreamRequest.model_header`). When it
+    is set the body is never rewritten for the model."""
+
     forward_query: bool
     """Forward the client's query string upstream verbatim. Credential-looking
     keys (`token`, `key`, `api_key`, `xi-api-key`) are refused with a 400
@@ -685,6 +692,8 @@ class BufferedSurface:
     model_key: str | None = "model"
     """Top-level body key naming the model, or None when the body never
     carries one (then `fixed_model` is required)."""
+    model_header: str | None = None
+    """See `Surface.model_header`. None for every buffered text surface."""
     fixed_model: str | None = None
     """Catalog id to route to when the body names no model."""
     accounts: bool = True

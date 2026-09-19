@@ -15,7 +15,7 @@ Repo facts every row leans on: routes are exactly two `POST` JSON paths (`server
 | TTS `POST …/stream/with-timestamps` | …/text-to-speech/stream-with-timestamps | JSON in, stream of JSON objects (`audio_base64`, `alignment`) | Proxyable: newline-delimited JSON, not SSE; parser needs a NDJSON mode | `sse.py` SSE-only | Base64 inflates bytes 33% |
 | TTS WebSocket `wss …/stream-input` | …/text-to-speech/v-1-text-to-speech-voice-id-stream-input | WS, JSON text frames both ways, base64 audio | Needs new transport | no WS | The LLM-to-speech path real-time agents use |
 | TTS multi-context WS `…/multi-stream-input` | …/v-1-text-to-speech-voice-id-multi-stream-input | WS, `context_id` per stream | Needs new transport | — | One socket, many interleaved utterances |
-| STT batch `POST /v1/speech-to-text` (Scribe v2) | …/speech-to-text/convert | multipart (`file` ≤ 3–5 GB) or `source_url`, JSON out; `webhook: true` → 202 | Not proxyable as-is (multipart stripped) ; JSON-URL form Proxyable (buffered) + hours accounting | `upstream.py:309`, `config.py:119`, `config.py:395` 4 MiB | Data plane but batch-shaped |
+| STT batch `POST /v1/speech-to-text` (Scribe v2) | …/speech-to-text/convert | multipart (`file` ≤ 3–5 GB) or `source_url`, JSON out; `webhook: true` → 202 | **Built and working** (`elevenlabs_stt`, 19 Sep 2026): multipart transits since PLAN-2 B4, and `audio_duration_secs` in the response is the exact hours meter | `upstream.py:309`, `config.py:119`, `config.py:395` 4 MiB | Data plane but batch-shaped |
 | STT realtime `wss /v1/speech-to-text/realtime` (Scribe v2 Realtime, ~150 ms) | …/speech-to-text/v-1-speech-to-text-realtime | WS, base64 PCM in, JSON transcripts out | Needs new transport + hours accounting | — | The live-interview STT path |
 | Speech-to-speech `POST /v1/speech-to-speech/{voice_id}[/stream]` | …/speech-to-speech/stream | multipart audio in, binary audio out | Not proxyable (multipart) | same | |
 | Agents Platform `wss /v1/convai/conversation` (+ WebRTC via conversation token, signed URLs) | …/agents-platform/api-reference/agents-platform/websocket | WS/WebRTC, full duplex, JSON + base64 PCM/µ-law | Needs new transport; arguably not a gateway concern (it is a competing agent runtime) | — | Replaces LLM+TTS+STT; per-minute billing |
@@ -140,3 +140,44 @@ Lower: `request-id` needed for prosody stitching is stripped; `/v1/user/subscrip
 - The error reference now documents a structured `detail.type/code` body; older help-center pages and many SDK snippets still reference `detail.status` (`too_many_concurrent_requests`, `system_busy`). Read both.
 - `voice-agent/.env.example` lists both `ELEVENLABS_API_KEY` and `ELEVEN_API_KEY`; the official SDKs read `ELEVENLABS_API_KEY`. Drop the other to avoid two names for one secret.
 - Several documented paths 404 (`/docs/api-reference/introduction` content is the SDK page; `/docs/troubleshooting/errors`, `/docs/agents-platform/api-reference/conversational-ai/websocket`); the live ones are `/docs/eleven-api/resources/errors`, `/docs/agents-platform/api-reference/agents-platform/websocket`, `/docs/api-reference/speech-to-text/v-1-speech-to-text-realtime`.
+
+
+---
+
+## Corrections applied 19 Sep 2026
+
+The first live calls with a real key. What this sweep got wrong:
+
+1. **"Not proxyable as-is (multipart stripped)"** for `POST /v1/speech-to-text`
+   has been false since PLAN-2 B4: multipart bodies transit byte-for-byte
+   with the client's boundary, and the `model_id` text field is spliced to
+   the wire id by `apply_api_model_multipart`. The surface is
+   `elevenlabs_stt`.
+2. **"duration is known from the response (`words[].end`)"** — no derivation
+   is needed. The response carries **`audio_duration_secs`** at the top
+   level (1.84 for a file AssemblyAI measured at 1840 ms), exact and NOT
+   rounded. The other top-level keys are `language_code`,
+   `language_probability`, `text`, `words[]`, `transcription_id`.
+   The response ALSO carries `character-cost`, `fiat-cost-before-overages`
+   and `fiat-currency` headers — ElevenLabs' own credit meter, which this
+   file never mentions and which the gateway deliberately does not bill on
+   for a per-hour row.
+3. **"India residency base is the right pick for Layrs"** is wrong for this
+   account. `api.in.residency.elevenlabs.io` answers **400
+   `{"detail":{"type":"authentication_error","code":"invalid_api_key"}}`** to
+   the same key `api.elevenlabs.io` accepts, on both TTS and STT: residency
+   endpoints need a residency-enabled (Enterprise) key. The `elevenlabs`
+   provider row now points at the global host. Revisit if the account is
+   ever upgraded.
+4. **A bad key is NOT always a 400.** `POST /v1/speech-to-text` answers a bad
+   key with a plain **401** (`detail.code: "unauthorized"`), unlike the TTS
+   host's 400 that `errors._AUTH_400_HINTS` exists for. Both shapes are now
+   fixtures.
+5. **Free-tier voices.** A library voice (e.g. `21m00Tcm4TlvDq8ikWAM`) is a
+   **402 `paid_plan_required`** on the free tier; the premade voices from
+   `GET /v1/voices` work. The live smoke's default voice changed for this.
+6. **§6 pricing.** Scribe v2 at $0.22/h is confirmed on
+   elevenlabs.io/pricing/api (19 Sep 2026), the same rate on every plan from
+   Free to Business. The catalog row is `elevenlabs.scribe-v2`.
+7. The available `model_id`s, from the provider's own 400: `scribe_v1`,
+   `scribe_v1_experimental`, `scribe_v2`, `scribe_v2_medical`.

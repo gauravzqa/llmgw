@@ -279,8 +279,10 @@ class Collectors:
             kind=self._one_of(kind, M.TOKEN_KINDS, "kind", m),
         ).inc(n)
 
-    def units(self, *, provider: str, model: str, unit: str, n: int) -> None:
-        """`llmgw_units_total`: characters or seconds billed (PLAN-2 B3)."""
+    def units(self, *, provider: str, model: str, unit: str, n: float) -> None:
+        """`llmgw_units_total`: characters or seconds billed (PLAN-2 B3).
+        `n` is a float because audio seconds are fractional on every provider
+        that reports them exactly; characters are whole and arrive as such."""
         if n <= 0:
             return
         m = "llmgw_units_total"

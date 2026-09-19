@@ -282,3 +282,173 @@ def test_passthrough_for_every_other_class_is_unchanged():
     """The new rule is opt-in per class; nothing else may have moved."""
     assert E.UpstreamOverloaded("x", upstream_status=529).client_status == 529
     assert E.RateLimited("x", upstream_status=429).client_status == 429
+
+
+# ------------------------------------- AssemblyAI sync: a 404 that is a key
+#
+# Captured live 18 Sep 2026 (captures-sarvam-assemblyai.md §1.3) and
+# reproduced 19 Sep 2026 against `sync.assemblyai.com`. Every application
+# error on that host is RFC 7807 under `application/problem+json`; the load
+# balancer in front of it answers `text/plain`. That split is the ONLY thing
+# separating "the gateway's key is dead" from "the routing header named a
+# model this host does not serve", because both are 404.
+
+AAI_SYNC_BAD_KEY_404 = b'{"status": 404, "title": "Not Found", "detail": "Invalid API key"}'
+
+AAI_SYNC_ELB_404 = b"Not found"
+"""`text/plain`, `server: awselb/2.0`: no `X-AAI-Model`, or one the sync host
+does not route (`universal-2` is one). The application never ran."""
+
+AAI_SYNC_415 = (
+    b'{"status": 415, "title": "Unsupported Media Type", "detail": "request must be '
+    b'multipart/form-data with an `audio` part and an optional `config` part"}'
+)
+
+AAI_SYNC_400_NO_AUDIO_PART = (
+    b'{"status": 400, "title": "Bad Request", "detail": "request must include an '
+    b'`audio` file part"}'
+)
+
+AAI_SYNC_400_BAD_AUDIO = (
+    b'{"status": 400, "title": "Bad Audio", "detail": "truncated WAV: "}'
+)
+
+PROBLEM_JSON = {"content-type": "application/problem+json"}
+
+
+def test_a_404_that_says_invalid_api_key_is_a_credential_failure():
+    """The surface 404'd for a year for an unrelated reason, and the day the
+    key expires it will 404 again with a completely different meaning. Under
+    the status-only rule that second 404 reads as `UpstreamServerError`:
+    retried against the same dead key, blamed on AssemblyAI's health, and
+    paging someone about a vendor outage that is an expired credential."""
+    err = E.from_http_status(404, body=AAI_SYNC_BAD_KEY_404, headers=PROBLEM_JSON,
+                             provider="assemblyai-sync", model="assemblyai.sync")
+    assert isinstance(err, E.AuthenticationFailed)
+    assert err.health is E.Health.FAILURE
+    assert err.health_scope is E.HealthScope.CREDENTIAL
+    assert err.retry_same is False
+    # 404 is not in `passthrough_statuses`: telling the caller "not found"
+    # about our own rejected key is the misfiling the rule exists to undo.
+    assert err.client_status == 401
+
+
+def test_the_rule_reads_the_body_even_when_the_content_type_is_missing():
+    """A proxy that strips or rewrites `content-type` must not turn a dead
+    credential back into a vendor outage. The RFC 7807 envelope is evidence
+    on its own."""
+    err = E.from_http_status(404, body=AAI_SYNC_BAD_KEY_404, headers=None,
+                             provider="assemblyai-sync")
+    assert isinstance(err, E.AuthenticationFailed)
+
+
+def test_the_load_balancers_404_is_still_not_a_credential_and_not_a_model():
+    """The other 404 on the same host, same status, same path: `text/plain`
+    from `awselb/2.0`. It is neither our key nor a missing model -- it is a
+    routing fault in front of the API, and `UpstreamServerError` is the
+    honest answer because the API never saw the request."""
+    err = E.from_http_status(404, body=AAI_SYNC_ELB_404,
+                             headers={"content-type": "text/plain; charset=utf-8",
+                                      "server": "awselb/2.0"},
+                             provider="assemblyai-sync", model="assemblyai.sync")
+    assert isinstance(err, E.UpstreamServerError)
+    assert not isinstance(err, E.AuthenticationFailed)
+    assert not isinstance(err, E.ModelNotFound)
+
+
+@pytest.mark.parametrize(
+    "body", [AAI_SYNC_415, AAI_SYNC_400_NO_AUDIO_PART, AAI_SYNC_400_BAD_AUDIO],
+    ids=["415-media-type", "400-no-audio-part", "400-bad-audio"],
+)
+def test_the_other_problem_json_bodies_are_not_dragged_into_the_auth_rule(body):
+    """The counterweight. Four of the five captured bodies on this host are
+    RFC 7807 too; only the one whose `detail` says so is a credential."""
+    err = E.from_http_status(404, body=body, headers=PROBLEM_JSON, provider="assemblyai-sync")
+    assert not isinstance(err, E.AuthenticationFailed)
+
+
+def test_a_problem_document_with_no_detail_string_is_not_matched():
+    """`detail` is required to be a string in RFC 7807, and the rule reads
+    it. A document that omits it cannot say anything about a credential."""
+    err = E.from_http_status(404, body=b'{"status":404,"title":"Not Found"}',
+                             headers=PROBLEM_JSON, provider="p")
+    assert not isinstance(err, E.AuthenticationFailed)
+    assert E._is_problem_json(PROBLEM_JSON, b'{"status":404,"title":"Not Found"}')
+    assert not E._is_problem_json(None, b'{"status":404,"title":"Not Found"}')
+
+
+def test_the_new_rule_survives_a_body_it_cannot_parse():
+    """It runs on an error path, on bytes we did not write."""
+    for body in (b"<html>404</html>", b"", b"[1,2,3]", b'{"detail": {"x": 1}}'):
+        err = E.from_http_status(404, body=body, headers=PROBLEM_JSON, provider="p")
+        assert not isinstance(err, E.AuthenticationFailed), body
+    assert E._problem_detail(b"not json") == ""
+    assert E._problem_detail(None) == ""
+
+
+# ------------------------------------------- ElevenLabs speech-to-text, 2026-09-19
+#
+# The Scribe route answers a bad key with a plain 401, unlike the TTS host's
+# 400 above. Both shapes are kept so a future change to `_AUTH_400_HINTS`
+# cannot quietly stop covering one of them.
+
+ELEVENLABS_STT_BAD_KEY_401 = (
+    b'{"detail":{"type":"authentication_error","code":"unauthorized",'
+    b'"message":"Invalid API key","status":"invalid_api_key",'
+    b'"request_id":"08402ba39df886b270f1c4b4f3e1f94d"}}'
+)
+
+ELEVENLABS_STT_UNSUPPORTED_MODEL_400 = (
+    b'{"detail":{"type":"validation_error","code":"unsupported_model",'
+    b'"message":"\'elevenlabs.scribe-v1\' is not a valid model_id. Available models: '
+    b'\'scribe_v1\', \'scribe_v1_experimental\', \'scribe_v2\', \'scribe_v2_medical\'",'
+    b'"status":"invalid_model_id","param":"model_id"}}'
+)
+"""What the provider says when the gateway forgets to rewrite the catalog id
+into `model_id`. It names a model, so it is our config drift, not the
+caller's bad request."""
+
+
+def test_elevenlabs_scribe_rejects_a_bad_key_with_a_plain_401():
+    err = E.from_http_status(401, body=ELEVENLABS_STT_BAD_KEY_401, provider="elevenlabs")
+    assert isinstance(err, E.AuthenticationFailed)
+    assert err.client_status == 401
+
+
+def test_a_catalog_id_that_reached_elevenlabs_scribe_is_our_config_drift():
+    err = E.from_http_status(400, body=ELEVENLABS_STT_UNSUPPORTED_MODEL_400,
+                             provider="elevenlabs", model="elevenlabs.scribe-v2")
+    assert isinstance(err, E.ModelNotFound)
+    assert err.blame is E.Blame.POLICY
+
+
+# ------------------------------------------------ Inworld speech-to-text, 2026-09-19
+
+INWORLD_STT_BAD_KEY_403 = (
+    b'{"code":7,"message":"Invalid authorization credentials","details":[]}'
+)
+
+INWORLD_STT_UNSUPPORTED_MODEL_400 = (
+    b'{"code":3,"message":"Unsupported model \\"inworld.stt-1\\". Supported models: '
+    b'https://docs.inworld.ai/docs/tutorial-integrations/stt/supported-models",'
+    b'"details":[]}'
+)
+
+INWORLD_STT_MISSING_AUDIO_400 = b'{"code":3,"message":"audio_data is required","details":[]}'
+
+
+def test_inworld_stt_bad_credential_is_a_403_that_means_auth():
+    """The `inworld` row leaves `forbidden_means` at its default, and that is
+    right here: this 403 is the credential, not a plan or a rate limit."""
+    err = E.from_http_status(403, body=INWORLD_STT_BAD_KEY_403, provider="inworld")
+    assert isinstance(err, E.AuthenticationFailed)
+    assert err.health_scope is E.HealthScope.CREDENTIAL
+
+
+def test_inworld_stt_unknown_model_is_config_drift_and_a_missing_part_is_not():
+    drift = E.from_http_status(400, body=INWORLD_STT_UNSUPPORTED_MODEL_400,
+                               provider="inworld", model="inworld.stt-1")
+    assert isinstance(drift, E.ModelNotFound)
+    client = E.from_http_status(400, body=INWORLD_STT_MISSING_AUDIO_400, provider="inworld")
+    assert isinstance(client, E.InvalidRequest)
+    assert not isinstance(client, E.ModelNotFound)

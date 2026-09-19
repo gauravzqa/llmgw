@@ -416,9 +416,14 @@ PROVIDERS: dict[str, ProviderConn] = {
     "elevenlabs": ProviderConn(
         id="elevenlabs",
         kind="openai",
-        # India residency: nearest to the Fly `sin` region and to Layrs'
-        # users; the global host is api.elevenlabs.io.
-        base_url="https://api.in.residency.elevenlabs.io",
+        # The global host. It was `api.in.residency.elevenlabs.io` (nearest
+        # to the Fly `sin` region) until a live probe on 19 Sep 2026 showed
+        # that host answering 400 `{"detail":{"type":"authentication_error",
+        # "code":"invalid_api_key"}}` to the SAME key the global host accepts,
+        # on both TTS and STT: a residency endpoint needs a residency-enabled
+        # (Enterprise) key, which this account does not have. Routing to a
+        # host that rejects our credential is not latency, it is downtime.
+        base_url="https://api.elevenlabs.io",
         api_key_env="ELEVENLABS_API_KEY",
         auth_scheme="header",
         auth_header="xi-api-key",
@@ -430,8 +435,10 @@ PROVIDERS: dict[str, ProviderConn] = {
         # plan is known.
         max_concurrency=8,
     ),
-    # AssemblyAI: one key, three hosts. The REST host answers its rate limit
-    # with a 403 (20k requests / 5 min), the streaming host is WebSocket
+    # AssemblyAI: one key, three hosts. The REST host is documented to answer
+    # its rate limit with a 403 (20k requests / 5 min) -- UNVERIFIED: the
+    # only credential fault ever observed there was a plain 401 (probe A7b),
+    # and no probe has provoked the 403. The streaming host is WebSocket
     # (Phase G), the sync host is the one HTTP product that fits a gateway.
     # `auth_scheme="raw"`: the bare key in `Authorization`, no scheme word.
     "assemblyai": ProviderConn(
@@ -460,7 +467,13 @@ PROVIDERS: dict[str, ProviderConn] = {
         api_key_env="ASSEMBLYAI_API_KEY",
         credential_id="assemblyai",
         auth_scheme="raw",
-        forbidden_means="rate_limit",
+        # NOT `rate_limit`: this host never sends a 403 at all. A bad key
+        # here is a 404 with `application/problem+json` and `detail:
+        # "Invalid API key"` (captures-sarvam-assemblyai.md probe A4g,
+        # reproduced 19 Sep 2026), which `errors.from_http_status` reads as
+        # `AuthenticationFailed`. The old value described a response that
+        # does not exist.
+        forbidden_means="auth",
         max_concurrency=16,
     ),
     # The fake upstreams from fakes/upstream.py, wired in by tests and by the
@@ -908,6 +921,45 @@ MODELS: dict[str, ModelSpec] = {
             default_profile="tts",
         ),
         ModelSpec(
+            # ElevenLabs Scribe speech-to-text: $0.22 per hour of audio =
+            # $0.0036667 per minute, the same rate on every plan from Free to
+            # Business (https://elevenlabs.io/pricing/api, read 2026-09-19).
+            # The meter is `audio_duration_secs` in the response body, exact
+            # and unrounded. `scribe_v2` is the current model; the endpoint
+            # also serves `scribe_v1`, `scribe_v1_experimental` and
+            # `scribe_v2_medical`, which are separate products and would each
+            # need their own row rather than an alias on this one.
+            id="elevenlabs.scribe-v2",
+            provider="elevenlabs",
+            api_model="scribe_v2",
+            input_per_m=0.0,
+            output_per_m=0.0,
+            unit="seconds",
+            per_minute=0.22 / 60,
+            context_window=0,
+            max_output=0,
+            priced_at="2026-09-19",
+        ),
+        ModelSpec(
+            # Inworld STT over HTTP: $0.15 per hour of audio on-demand =
+            # $0.0025 per minute ($0.10/h on Creator through Growth;
+            # inworld.ai/pricing, read 2026-09-19 -- the on-demand rate is
+            # the upper bound, as for the TTS rows above). The meter is
+            # `usage.transcribedAudioMs`, exact milliseconds. `api_model`
+            # carries the provider's `inworld/`-prefixed spelling and is
+            # rewritten into the NESTED `transcribeConfig.modelId`.
+            id="inworld.stt-1",
+            provider="inworld",
+            api_model="inworld/inworld-stt-1",
+            input_per_m=0.0,
+            output_per_m=0.0,
+            unit="seconds",
+            per_minute=0.0025,
+            context_window=0,
+            max_output=0,
+            priced_at="2026-09-19",
+        ),
+        ModelSpec(
             # $0.05 per 1k characters; the ~280 ms conversational v3 tier,
             # WebSocket-first but served over HTTP too.
             id="elevenlabs.v3-conversational",
@@ -923,9 +975,16 @@ MODELS: dict[str, ModelSpec] = {
         ),
         ModelSpec(
             # $0.45 per hour of audio = $0.0075 per minute; `audio_duration_ms`
-            # in the response (capabilities/voice-assemblyai.md §6, pricing
-            # page 2026-09-16). The sync endpoint takes no model parameter;
-            # the id exists so the gateway has a row to price against.
+            # in the response, exact milliseconds (assemblyai.com/products/
+            # sync-speech-to-text, still $0.45/h at 2026-09-18).
+            #
+            # `api_model` is LOAD-BEARING, and the comment that used to stand
+            # here -- "the sync endpoint takes no model parameter; the id
+            # exists so the gateway has a row to price against" -- was false.
+            # The endpoint requires `X-AAI-Model`, the surface emits this
+            # string into it (`AssemblyAISyncSurface.model_header`), and a
+            # model the sync host does not serve (`universal-2` is one) is a
+            # load-balancer 404 before any application code runs.
             id="assemblyai.sync",
             provider="assemblyai-sync",
             api_model="universal-3-5-pro",

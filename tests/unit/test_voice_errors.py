@@ -131,8 +131,15 @@ def test_elevenlabs_429_without_retry_after_is_a_neutral_rate_limit():
 def test_assemblyai_403_is_a_rate_limit_on_its_rows():
     for pid in ("assemblyai", "assemblyai-streaming", "assemblyai-sync"):
         row = DEFAULT_CATALOG.providers[pid]
-        assert row.forbidden_means == "rate_limit" and row.auth_scheme == "raw"
+        assert row.auth_scheme == "raw"
         assert row.key() == "assemblyai", "one account, one credential, one breaker"
+    # The sync host is the exception, and it is not a preference: that host
+    # has never been observed to answer 403 at all -- a bad key there is a
+    # 404 with an RFC 7807 body (probe A4g). `rate_limit` there described a
+    # response the provider does not send.
+    for pid in ("assemblyai", "assemblyai-streaming"):
+        assert DEFAULT_CATALOG.providers[pid].forbidden_means == "rate_limit"
+    assert DEFAULT_CATALOG.providers["assemblyai-sync"].forbidden_means == "auth"
     err = E.from_http_status(403, body=body({"error": "Too many requests"}),
                              provider="assemblyai", forbidden_means="rate_limit")
     assert isinstance(err, E.RateLimited)

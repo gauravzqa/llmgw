@@ -1101,6 +1101,53 @@ _BILLING_400_HINT = "reached your specified api usage limits"
 # a status that means another, and only the body says which.
 _AUTH_400_HINTS = ("authentication_error", "invalid_api_key")
 
+# AssemblyAI's sync host answers a bad credential with a **404**, not a 401
+# or a 403: `{"status":404,"title":"Not Found","detail":"Invalid API key"}`
+# under `application/problem+json` (captured live, probe A4g, reproduced
+# 2026-09-19). On that host a 404 is genuinely ambiguous -- the same status
+# is what the AWS load balancer returns for an `X-AAI-Model` it does not
+# route, as `text/plain` with no body shape at all -- so the two are
+# separated by the RFC 7807 envelope and the `detail` string, and by nothing
+# else. Without this rule a revoked key reads as `UpstreamServerError`
+# (retry the same target, blame the provider's health) or, if the 404 body
+# rule ever widened, as `ModelNotFound` (blame our catalog). Both send
+# somebody hunting the wrong thing while the fix is a new key.
+_PROBLEM_JSON_TYPE = "application/problem+json"
+_PROBLEM_AUTH_HINTS = ("invalid api key", "invalid api token", "invalid credentials")
+
+
+def _is_problem_json(headers: Mapping[str, str] | None, body: bytes | None) -> bool:
+    """An RFC 7807 problem document: the content type says so, or the body is
+    a JSON object with exactly that envelope's required keys. Both, because
+    the content type is the provider's claim and the shape is the evidence."""
+    if headers:
+        for key, value in headers.items():
+            if str(key).lower() == "content-type" and _PROBLEM_JSON_TYPE in str(value).lower():
+                return True
+    if not body:
+        return False
+    try:
+        parsed = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return False
+    return (isinstance(parsed, dict) and "status" in parsed and "title" in parsed
+            and isinstance(parsed.get("detail"), str))
+
+
+def _problem_detail(body: bytes | None) -> str:
+    """The `detail` string of a problem document, lowercased; "" if absent.
+    Never raises -- this runs on an error path, on bytes we did not write."""
+    if not body:
+        return ""
+    try:
+        parsed = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return ""
+    if not isinstance(parsed, dict):
+        return ""
+    detail = parsed.get("detail")
+    return detail.lower() if isinstance(detail, str) else ""
+
 
 def _looks_like_billing(detail: str) -> bool:
     return any(code in detail for code in _BILLING_429_CODES)
@@ -1115,6 +1162,8 @@ _UNKNOWN_MODEL_HINTS = (
     "no such model",
     "supported api model names",   # DeepSeek's phrasing, verified live
     "model_id:",                   # Inworld: "model_id: X is not supported." (live, 16 Sep)
+    "unsupported model",           # Inworld STT: 'Unsupported model "x".' (live, 19 Sep)
+    "valid model_id",              # ElevenLabs Scribe: "'x' is not a valid model_id."
 )
 
 
@@ -1200,6 +1249,16 @@ def from_http_status(
     if status == 402:
         return InsufficientCredits(detail or "insufficient credits", **kw)
     if status == 404:
+        # Before anything else: a 404 that is an RFC 7807 document SAYING the
+        # credential is bad. AssemblyAI's sync host is the only provider in
+        # the catalog that does this, and it is not a model fault, not the
+        # edge, and not retryable against the same key.
+        if _is_problem_json(headers, body):
+            problem = _problem_detail(body)
+            if any(hint in problem for hint in _PROBLEM_AUTH_HINTS):
+                return AuthenticationFailed(
+                    problem or "upstream rejected the gateway's credential (404)", **kw,
+                )
         # Only an API error object means "the model is not here". A 404 with
         # an HTML page, plain text or no body at all is the provider's EDGE
         # answering, not its API: OpenAI's did so intermittently on 18 Sep
