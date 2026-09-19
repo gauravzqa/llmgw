@@ -463,6 +463,39 @@ PROVIDERS: dict[str, ProviderConn] = {
         forbidden_means="rate_limit",
         max_concurrency=16,
     ),
+    # Sarvam: one host, no version prefix, four HTTP products (TTS buffered
+    # and chunked, STT, STT-translate) plus an OpenAI-compatible
+    # `/v1/chat/completions` that `openai_chat` serves unchanged
+    # (capabilities/sarvam.md, verified live 19 Sep 2026).
+    #
+    # `auth_scheme="bearer"`: the DOCUMENTED credential header is
+    # `api-subscription-key: <key>`, and `Authorization: Bearer <key>` is
+    # accepted identically -- probe 5 of capabilities/captures-sarvam-
+    # assemblyai.md §2 (a 200 with a normal transcript), re-confirmed on chat
+    # 19 Sep 2026 with both header forms answering 200. Bearer is the
+    # existing code path, so Sarvam needs no new credential machinery at all.
+    #
+    # `forbidden_means="auth"`: unlike AssemblyAI's REST host, a Sarvam 403
+    # really is a bad or missing credential (`invalid_api_key_error`, probes
+    # 10b/10c), so it belongs on the credential breaker.
+    #
+    # `scrub_error_bodies="auth"` (the default, stated because the choice was
+    # made rather than inherited): twelve captured error bodies were checked
+    # for credential reflection and none echoed the key or its 4- or
+    # 8-character prefix, so the wider `"all"` policy Inworld needs is not
+    # warranted here.
+    "sarvam": ProviderConn(
+        id="sarvam",
+        kind="openai",
+        base_url="https://api.sarvam.ai",
+        api_key_env="SARVAM_API_KEY",
+        auth_scheme="bearer",
+        forbidden_means="auth",
+        scrub_error_bodies="auth",
+        # No published concurrency limit and no rate-limit headers on any
+        # observed response; sized like the other voice rows until one shows.
+        max_concurrency=16,
+    ),
     # The fake upstreams from fakes/upstream.py, wired in by tests and by the
     # local dev config. Present in the shipped catalog on purpose: a test
     # target that needs a special code path is a test target that proves
@@ -968,6 +1001,133 @@ MODELS: dict[str, ModelSpec] = {
             context_window=0,
             max_output=0,
             priced_at="2026-09-16",
+        ),
+        # -----------------------------------------------------------------
+        # Sarvam. Every rate below is a CONVERSION, and that is the first
+        # thing to know about these five rows.
+        #
+        # Sarvam publishes in INR only, and for speech it publishes by
+        # SERVICE rather than by model: text-to-speech is Rs 3.00 per 1,000
+        # characters however you spell the model, and speech-to-text is
+        # Rs 30.00 per hour ("billed per second"). No per-model rate exists
+        # for `bulbul:v3` against `bulbul:v4-flash`, or for `saaras:v3`
+        # against `saaras:v4`, so every Sarvam speech row here carries the
+        # SAME number and will keep doing so until Sarvam splits the table.
+        # A row that looks per-model but is really per-service is worth
+        # saying out loud: nobody should read a difference into two rows
+        # that agree, and nobody should "fix" one of them in isolation.
+        # The language-model rows ARE published per model.
+        #
+        # Source: https://www.sarvam.ai/api-pricing and
+        # https://docs.sarvam.ai/api/getting-started/pricing, both read
+        # 2026-09-19. Converted at Rs 88.5 / USD (the rate of 2026-09-18,
+        # carried forward from capabilities/captures-sarvam-assemblyai.md
+        # §2.3 so every Sarvam row uses one rate).
+        #
+        # The catalog has no currency field and this is not the place to
+        # invent one, so the caveat lives here as prose: these USD figures
+        # are only as current as that exchange rate. `priced_at` records
+        # when the RUPEE figure was checked; a move in INR/USD makes the
+        # stored dollars wrong while `priced_at` still looks fresh, which is
+        # exactly the "fresh and wrong" failure this module's header
+        # describes. Re-derive on every price sweep, not only when Sarvam
+        # changes a number.
+        ModelSpec(
+            # Rs 3.00 / 1,000 chars = Rs 3,000 / 1M = USD 33.90 / 1M chars.
+            # `bulbul:v2` is deliberately absent: it is deprecated and
+            # answers 400 ("Model 'bulbul:v2' has been deprecated. Please
+            # use 'bulbul:v3' instead.", live 19 Sep 2026), so a row for it
+            # would be a row that can only fail.
+            id="sarvam.bulbul-v3",
+            provider="sarvam",
+            api_model="bulbul:v3",
+            input_per_m=33.90,
+            output_per_m=0.0,
+            unit="characters",
+            # `text: String should have at most 2500 characters` (probe 10k).
+            context_window=2_500,
+            max_output=0,
+            priced_at="2026-09-19",
+            default_profile="tts",
+        ),
+        ModelSpec(
+            # The low-latency tier. Same service rate -- no per-model price
+            # is published (see the block comment above). Its speaker names
+            # are a different set from `bulbul:v3`'s (`aayan_hi_conversational`
+            # and friends, live 19 Sep 2026); the gateway forwards `speaker`
+            # untouched, so that is the caller's business.
+            id="sarvam.bulbul-v4-flash",
+            provider="sarvam",
+            api_model="bulbul:v4-flash",
+            input_per_m=33.90,
+            output_per_m=0.0,
+            unit="characters",
+            context_window=2_500,
+            max_output=0,
+            priced_at="2026-09-19",
+            default_profile="tts",
+        ),
+        ModelSpec(
+            # Rs 30.00 / hour = Rs 0.50 / minute = USD 0.00565 / minute.
+            # The same rate covers `/speech-to-text` and
+            # `/speech-to-text-translate`; only diarization (Rs 45/hour) is
+            # priced differently, and the gateway exposes no diarizing route.
+            id="sarvam.saaras-v3",
+            provider="sarvam",
+            api_model="saaras:v3",
+            input_per_m=0.0,
+            output_per_m=0.0,
+            unit="seconds",
+            per_minute=0.00565,
+            context_window=0,
+            max_output=0,
+            priced_at="2026-09-19",
+        ),
+        ModelSpec(
+            # `/speech-to-text` ONLY. `/speech-to-text-translate` serves a
+            # different model set and 400s on this id ("Input should be
+            # 'saaras:v2.5', 'saaras:v3', 'saaras:v1', 'saaras:v2',
+            # 'saaras:flash' or 'saaras:turbo'", live 19 Sep 2026) -- the
+            # captures file did not say so, and a caller who assumes the two
+            # routes take the same ids finds out at the provider. The
+            # catalog cannot express "this model on that route", so the
+            # constraint is written down here rather than enforced.
+            id="sarvam.saaras-v4",
+            provider="sarvam",
+            api_model="saaras:v4",
+            input_per_m=0.0,
+            output_per_m=0.0,
+            unit="seconds",
+            per_minute=0.00565,
+            context_window=0,
+            max_output=0,
+            priced_at="2026-09-19",
+        ),
+        ModelSpec(
+            # Rs 29.28 in / Rs 10.98 cached in / Rs 73.20 out per 1M tokens
+            # = USD 0.3308 / 0.1241 / 0.8271 at Rs 88.5 / USD. Served over an
+            # OpenAI-compatible `/v1/chat/completions` with SSE, a usage-only
+            # final chunk and `data: [DONE]`, so `openai_chat` carries it with
+            # no new surface (verified live 19 Sep 2026).
+            #
+            # `sarvam-m` -- the id this row was planned around -- is GONE:
+            # "Model 'sarvam-m' has been deprecated. Please use one of the
+            # available models instead: sarvam-105b,
+            # sarvam-105b-conversations." `GET /v1/models` lists those two and
+            # nothing else, which also makes Sarvam the rare voice-adjacent
+            # provider `live/probe.py` can reconcile.
+            id="sarvam.sarvam-105b",
+            provider="sarvam",
+            api_model="sarvam-105b",
+            input_per_m=0.3308,
+            cached_input_per_m=0.1241,
+            output_per_m=0.8271,
+            context_window=128_000,
+            max_output=8_192,
+            # Emits `reasoning_content` deltas and a `usage.reasoning_tokens`
+            # count unprompted; there is no effort knob to name.
+            can_reason=True,
+            priced_at="2026-09-19",
         ),
         ModelSpec(
             id="fake.echo",

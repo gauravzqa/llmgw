@@ -77,6 +77,81 @@ OPENAI_UNKNOWN_MODEL = (
     b'"code":"model_not_found"}}'
 )
 
+# ---------------------------------------------------------------- Sarvam
+# Captured 19 Sep 2026 against api.sarvam.ai with the key in the gitignored
+# .env; the `request_id` values are the real ones and carry no credential.
+# Sarvam has ONE error envelope for every product and every status --
+# `{"error": {"message", "code", "request_id"}}` -- which sounds like it
+# makes classification easy and does the opposite: the same `code`,
+# `invalid_request_error`, covers a malformed body, an unknown model and a
+# retired model, so only the MESSAGE separates the client's fault from ours.
+
+SARVAM_BAD_KEY_403 = (
+    b'{"error":{"message":"Invalid or missing authentication credentials",'
+    b'"code":"invalid_api_key_error",'
+    b'"request_id":"20260919_7652c94f-f890-482e-9094-3d721521ec21"}}'
+)
+"""Sarvam, 403. A bad key AND a missing header both land here -- which is
+why the provider row says `forbidden_means="auth"` rather than AssemblyAI's
+`rate_limit`."""
+
+SARVAM_TTS_UNKNOWN_MODEL_400 = (
+    b'{"error":{"message":"Validation Error(s):\\n- model: Input should be '
+    b"'bulbul:v2', 'bulbul:v3-beta', 'bulbul:v3' or 'bulbul:v4-flash'\","
+    b'"code":"invalid_request_error",'
+    b'"request_id":"20260919_00d0ba64-ef42-41f6-9e17-1fb00d238936"}}'
+)
+
+SARVAM_STT_UNKNOWN_MODEL_400 = (
+    b'{"error":{"message":"body.model : Input should be \'saarika:v2.5\', '
+    b"'saaras:v3', 'saaras:v3-realtime', 'saaras:v4', 'saaras:v4-multispk', "
+    b'\'saarika:v1\', \'saarika:v2\' or \'saarika:flash\'",'
+    b'"code":"invalid_request_error",'
+    b'"request_id":"20260919_13a4a73c-6f5d-4d66-b39f-263daee9a6cb"}}'
+)
+"""The same fault, spelled differently, two routes apart. `- model:` on
+text-to-speech, `body.model :` -- with a space before the colon -- on
+speech-to-text. A single substring rule would have caught exactly one."""
+
+SARVAM_CHAT_UNKNOWN_MODEL_400 = (
+    b'{"error":{"message":"body.model : Value error, Input \'sarvam-nope\' '
+    b'should be one of sarvam-105b, sarvam-105b-conversations",'
+    b'"code":"invalid_request_error",'
+    b'"request_id":"20260919_6b758343-0413-4045-b30d-2617b1a6f96f"}}'
+)
+"""And a third spelling on the OpenAI-compatible chat route."""
+
+SARVAM_DEPRECATED_MODEL_400 = (
+    b'{"error":{"message":"Model \'sarvam-m\' has been deprecated. Please use '
+    b'one of the available models instead: sarvam-105b, '
+    b'sarvam-105b-conversations.","code":"invalid_request_error",'
+    b'"request_id":"20260919_12bfede6-f49c-4883-8fc6-c0a3620ac723"}}'
+)
+"""The one that caught this repo out: `sarvam-m` was the model the Sarvam
+work was planned around, and on the day it was built the id was gone."""
+
+SARVAM_TTS_DEPRECATED_MODEL_400 = (
+    b'{"error":{"message":"Model \'bulbul:v2\' has been deprecated. Please use '
+    b'\'bulbul:v3\' instead.","code":"invalid_request_error",'
+    b'"request_id":"20260919_51f6e2ea-f314-4c35-b878-89e4cba35ff4"}}'
+)
+
+SARVAM_EMPTY_TEXT_400 = (
+    b'{"error":{"message":"\'text\' cannot be empty",'
+    b'"code":"invalid_request_error",'
+    b'"request_id":"20260919_fa98ecc0-1668-485d-bd49-843528fb9212"}}'
+)
+"""The control: a 400 that really is the caller's. Inworld answers the same
+request with a 200 and a null usage, which is why this one is worth keeping
+next to the others."""
+
+SARVAM_NOT_FOUND_404 = (
+    b'{"error":{"message":"Not Found","code":"not_found_error",'
+    b'"request_id":"20260919_b7a56cc2-f7ba-4982-9f80-0ffa8b4c3f7c"}}'
+)
+"""An unknown PATH (`POST /text-to-speech:stream`, the colon form). A
+perfectly well-formed API error object that says nothing about a model."""
+
 
 # ------------------------------------------------- unknown model on a 400
 
@@ -282,3 +357,116 @@ def test_passthrough_for_every_other_class_is_unchanged():
     """The new rule is opt-in per class; nothing else may have moved."""
     assert E.UpstreamOverloaded("x", upstream_status=529).client_status == 529
     assert E.RateLimited("x", upstream_status=429).client_status == 429
+
+
+# ------------------------------------------------------------------ Sarvam
+
+
+def test_a_sarvam_403_is_the_credential_and_opens_the_credential_circuit():
+    """403 means different things at different vendors -- AssemblyAI's REST
+    host answers its rate limit with one, ElevenLabs its plan denials. At
+    Sarvam it really is the key, which is what `forbidden_means="auth"` on
+    the provider row says, and what makes the credential breaker correct
+    here and wrong there."""
+    err = E.from_http_status(
+        403, body=SARVAM_BAD_KEY_403, provider="sarvam", credential_id="sarvam",
+        forbidden_means="auth",
+    )
+    assert isinstance(err, E.AuthenticationFailed)
+    assert err.health is E.Health.FAILURE
+    assert err.health_scope is E.HealthScope.CREDENTIAL
+    assert err.retry_same is False
+    assert err.client_status == 403
+
+
+def test_a_missing_credential_header_lands_on_the_same_403_body():
+    """Sarvam does not distinguish "wrong key" from "no key": probes 10b and
+    10c returned this byte-for-byte. So the gateway cannot either, and must
+    not try to read a distinction out of the message."""
+    err = E.from_http_status(403, body=SARVAM_BAD_KEY_403, provider="sarvam")
+    assert isinstance(err, E.AuthenticationFailed)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [SARVAM_TTS_UNKNOWN_MODEL_400, SARVAM_STT_UNKNOWN_MODEL_400,
+     SARVAM_CHAT_UNKNOWN_MODEL_400],
+    ids=["tts", "stt", "chat"],
+)
+def test_every_sarvam_unknown_model_400_is_our_config_drift(body):
+    """Three products, three spellings of one fault, one meaning: the
+    catalog names a model Sarvam does not serve. Left as a generic
+    `InvalidRequest` it would blame the caller for our table and would not
+    try the next target."""
+    err = E.from_http_status(400, body=body, provider="sarvam", model="x")
+    assert isinstance(err, E.ModelNotFound)
+    assert err.blame is E.Blame.POLICY
+    assert err.health is E.Health.FAILURE
+    assert err.try_next is True
+    assert err.retry_same is False
+
+
+@pytest.mark.parametrize(
+    "body", [SARVAM_DEPRECATED_MODEL_400, SARVAM_TTS_DEPRECATED_MODEL_400],
+    ids=["chat", "tts"],
+)
+def test_a_retired_sarvam_model_is_the_same_kind_of_drift_as_an_unknown_one(body):
+    """`sarvam-m` and `bulbul:v2` both existed when they were written down
+    and both 400 now. "The id you have is no longer served" is the same
+    operator signal as "the id you have never existed", and the same
+    recovery: fix the row, try another target meanwhile."""
+    err = E.from_http_status(400, body=body, provider="sarvam", model="x")
+    assert isinstance(err, E.ModelNotFound)
+    assert err.blame is E.Blame.POLICY
+
+
+def test_sarvams_empty_text_400_is_still_the_clients_fault():
+    """The counterweight. Sarvam uses one `code` for every 400, so the
+    unknown-model rule reads the message -- and must not swallow the
+    messages that really are about the request."""
+    err = E.from_http_status(400, body=SARVAM_EMPTY_TEXT_400, provider="sarvam")
+    assert isinstance(err, E.InvalidRequest)
+    assert not isinstance(err, E.ModelNotFound)
+    assert err.blame is E.Blame.CLIENT
+
+
+def test_a_sarvam_404_names_the_path_not_the_model():
+    """`POST /text-to-speech:stream` is a 404 and `/text-to-speech/stream` is
+    a 200. The difference is a typo in OUR surface, and the body says so
+    (`not_found_error`, message "Not Found", no model mentioned anywhere).
+    Read as `ModelNotFound` it would send the executor shopping the request
+    around every fallback for a path none of them has either, and point the
+    operator at a model id that was never wrong."""
+    err = E.from_http_status(404, body=SARVAM_NOT_FOUND_404, provider="sarvam",
+                             model="sarvam.bulbul-v3")
+    assert isinstance(err, E.UpstreamServerError)
+    assert not isinstance(err, E.ModelNotFound)
+
+
+def test_anthropics_not_found_error_404_is_still_a_missing_model():
+    """The rule above keys on the `code` field, not on `type`. Anthropic
+    spells its UNKNOWN MODEL 404 with `error.type == "not_found_error"`, and
+    that one really is a missing model -- the two must not collide."""
+    body = (b'{"type":"error","error":{"type":"not_found_error",'
+            b'"message":"model: claude-9-imaginary"}}')
+    err = E.from_http_status(404, body=body, provider="anthropic", model="x")
+    assert isinstance(err, E.ModelNotFound)
+
+
+def test_no_sarvam_error_body_carries_a_credential_fragment():
+    """Twelve captured bodies were checked for key reflection and none echoed
+    one, which is the evidence behind `scrub_error_bodies="auth"` rather
+    than Inworld's wider `"all"`. This test does not re-derive that -- it
+    pins the fixtures, so a future editor cannot paste an unscrubbed body in
+    beside them."""
+    for body in (SARVAM_BAD_KEY_403, SARVAM_TTS_UNKNOWN_MODEL_400,
+                 SARVAM_STT_UNKNOWN_MODEL_400, SARVAM_CHAT_UNKNOWN_MODEL_400,
+                 SARVAM_DEPRECATED_MODEL_400, SARVAM_TTS_DEPRECATED_MODEL_400,
+                 SARVAM_EMPTY_TEXT_400, SARVAM_NOT_FOUND_404):
+        text = body.decode()
+        assert text.startswith('{"error":{"message":')
+        assert "api-subscription-key" not in text
+        assert "Bearer" not in text
+        # The only opaque token in a Sarvam error is its request id, and it
+        # is always `<date>_<uuid>`.
+        assert '"request_id":"2026' in text

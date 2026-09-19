@@ -1115,6 +1115,29 @@ _UNKNOWN_MODEL_HINTS = (
     "no such model",
     "supported api model names",   # DeepSeek's phrasing, verified live
     "model_id:",                   # Inworld: "model_id: X is not supported." (live, 16 Sep)
+    # Sarvam, verified live 19 Sep 2026. It answers an unknown model with a
+    # 400 and a pydantic validation string that enumerates the models it
+    # does serve, and the enumeration is spelled THREE ways across its
+    # products -- so all three are listed rather than one loose substring:
+    #
+    #   TTS   "Validation Error(s):\n- model: Input should be 'bulbul:v2',
+    #          'bulbul:v3-beta', 'bulbul:v3' or 'bulbul:v4-flash'"
+    #   STT   "body.model : Input should be 'saarika:v2.5', 'saaras:v3', ..."
+    #   chat  "body.model : Value error, Input 'sarvam-nope' should be one
+    #          of sarvam-105b, sarvam-105b-conversations"
+    #
+    # Without them a stale Sarvam catalog row reads as the CLIENT's bad
+    # request: no fallback, no config-drift signal, and the customer blamed.
+    "model: input should be",
+    "model : input should be",
+    "model : value error",
+    # And a model that USED to exist: "Model 'bulbul:v2' has been
+    # deprecated. Please use 'bulbul:v3' instead." / "Model 'sarvam-m' has
+    # been deprecated..." (both live, 19 Sep 2026). A retired id is catalog
+    # drift by another name -- our config points at something the provider
+    # no longer serves -- so it lands in the same class, which is the one
+    # that tries the next target instead of telling the caller off.
+    "has been deprecated",
 )
 
 
@@ -1200,6 +1223,26 @@ def from_http_status(
     if status == 402:
         return InsufficientCredits(detail or "insufficient credits", **kw)
     if status == 404:
+        # A provider that names its own routing fault gets believed. Sarvam
+        # answers an unknown PATH with a perfectly well-formed API error
+        # object -- `{"error":{"message":"Not Found","code":"not_found_error",
+        # "request_id":...}}`, live 19 Sep 2026 -- which the rule below reads
+        # as "the model is not here". It is not: `/text-to-speech:stream` is
+        # a 404 and `/text-to-speech/stream` is a 200, and the difference is
+        # ours, not the catalog's. Calling it `ModelNotFound` sends the
+        # executor shopping the request around every fallback for a path
+        # none of them has either, and tells the operator to fix a model id
+        # that was never wrong.
+        #
+        # `code`, deliberately, not `type`: Anthropic spells its UNKNOWN
+        # MODEL 404 with `error.type == "not_found_error"`, and that one
+        # really is a missing model. `_error_hints` keeps `type` out of
+        # `detail`, so the two do not collide.
+        if "not_found_error" in detail and not _looks_like_unknown_model(detail):
+            return UpstreamServerError(
+                f"404 from {provider or 'upstream'} naming the PATH, not a model "
+                f"(routing fault: the surface's upstream_path does not exist)", **kw,
+            )
         # Only an API error object means "the model is not here". A 404 with
         # an HTML page, plain text or no body at all is the provider's EDGE
         # answering, not its API: OpenAI's did so intermittently on 18 Sep

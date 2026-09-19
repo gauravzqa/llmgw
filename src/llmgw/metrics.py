@@ -73,6 +73,15 @@ SURFACES: tuple[str, ...] = (
     "elevenlabs_tts",
     "elevenlabs_tts_timestamps",
     "assemblyai_sync",
+    # Sarvam's four HTTP speech routes. Four names rather than one because
+    # the framing (buffered JSON against chunked audio/pcm), the body kind
+    # (JSON against multipart) and the unit (characters against seconds) all
+    # differ between them; Sarvam's text model rides `openai_chat`, so it
+    # adds no name here.
+    "sarvam_tts",
+    "sarvam_tts_stream",
+    "sarvam_stt",
+    "sarvam_stt_translate",
     # PLAN-G: the WebSocket plane. One name per product dialect, `_ws`-
     # suffixed where an HTTP surface of the same provider already exists, so
     # `llmgw_requests_total{surface="inworld_tts"}` keeps meaning the HTTP

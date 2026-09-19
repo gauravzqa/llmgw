@@ -2039,6 +2039,32 @@ def _estimate_unmetered(surface: Any, result: Any, facts: Any) -> None:
             setattr(usage, name, value)
 
 
+def _surface_cost_notes(surface: Any, facts: Any, result: Any) -> tuple[str, ...]:
+    """A surface's own explanation of why its bill reads the way it does.
+
+    `accounting` can only note what the PRICER noticed -- a kind that fell
+    back to another kind's rate. It cannot know that a provider reports no
+    meter at all, because that fact lives in the dialect, not in the
+    arithmetic. Sarvam is the case that forced the hook: four HTTP routes
+    that bill per character and per second and report neither, so every one
+    of their records needs a line saying where the number came from.
+    Without it the record is an `estimated` basis with no reason attached,
+    which is the thing an invoice dispute cannot use.
+
+    Never raises, and returns nothing for the surfaces that have no hook --
+    the notes are a description of the bill, and a bug in the description
+    must not become a bug in the response.
+    """
+    hook = getattr(surface, "cost_notes", None)
+    if hook is None:
+        return ()
+    usage = getattr(getattr(result, "pump", None), "usage", None)
+    try:
+        return tuple(str(note) for note in (hook(facts, usage) or ()))
+    except Exception:  # noqa: BLE001 - billing never breaks serving
+        return ()
+
+
 def facts_for_body(
     surface: Surface, body: bytes, scope: Scope, *, content_type: str | None
 ) -> RequestFacts:
@@ -2050,10 +2076,49 @@ def facts_for_body(
     closed with `InvalidRequest` when no model is named, because a request
     the gateway cannot route is not one it should forward and let the
     provider bill.
+
+    A non-JSON surface may then REFINE what this function worked out, via an
+    optional `facts_from_body(facts, body, content_type)`. Routing is settled
+    before the hook runs and the hook cannot change it: its only job is to
+    add request-side billing detail that neither the form fields nor the
+    query string carry -- Sarvam's speech-to-text reading the duration out of
+    the uploaded WAV's own header, because Sarvam bills per second and
+    reports none. A hook that raises is ignored and the unrefined facts
+    stand; an estimate is never worth a 500.
     """
     kind = getattr(surface, "body", "json")
     if kind == "json":
         return surface.parse_request(body)
+    return _refine_facts(surface, _routing_facts(surface, body, scope,
+                                                 content_type=content_type),
+                         body, content_type)
+
+
+def _refine_facts(
+    surface: Any, facts: RequestFacts, body: bytes, content_type: str | None
+) -> RequestFacts:
+    hook = getattr(surface, "facts_from_body", None)
+    if hook is None:
+        return facts
+    try:
+        refined = hook(facts, body, content_type)
+    except Exception:  # noqa: BLE001 - an estimate never breaks a request
+        return facts
+    if not isinstance(refined, RequestFacts) or refined.model != facts.model:
+        # A hook that changed the routing key is a hook with a bug, and the
+        # bug must not become a request routed somewhere the scan did not
+        # say. Keep what the scan decided.
+        return facts
+    return refined
+
+
+def _routing_facts(
+    surface: Surface, body: bytes, scope: Scope, *, content_type: str | None
+) -> RequestFacts:
+    """The model and stream flag for a non-JSON body: the scan, and nothing
+    else. Split out of `facts_for_body` so the refinement hook above wraps
+    exactly the routing decision and cannot be confused with it."""
+    kind = getattr(surface, "body", "json")
     fixed = getattr(surface, "fixed_model", None)
     if fixed:
         # A surface with one target and no model in the request (a token
@@ -2774,6 +2839,13 @@ class PassthroughEndpoint:
         try:
             _estimate_unmetered(self._surface, result, exchange.request_facts)
             rec = accounting.account(result, catalog=gw.config.catalog)
+            surface_notes = _surface_cost_notes(
+                self._surface, exchange.request_facts, result
+            )
+            if surface_notes:
+                rec = dataclasses.replace(
+                    rec, cost_notes=(*surface_notes, *rec.cost_notes)
+                )
             provider, model = rec.provider, rec.model
             outcome = rec.outcome.value
             stop_reason = rec.stop_reason
