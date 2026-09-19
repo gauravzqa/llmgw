@@ -251,8 +251,18 @@ class Usage:
 
     characters: int = 0
     """Billable characters (text-to-speech providers bill per character).
-    Inworld reports the exact count on the first stream line; ElevenLabs in a
-    response header. Zero means not reported, never "free"."""
+    Inworld reports the exact count on the first stream line; for ElevenLabs
+    it is the text we forwarded, because the number in its header is credits
+    (see `provider_credits`). Zero means not reported, never "free"."""
+
+    provider_credits: int = 0
+    """A provider's own internal unit, when it reports one that is NOT what
+    it bills in. ElevenLabs' `character-cost` header is credits: Flash v2.5
+    spends half a credit per character while the API price list is in dollars
+    per character, so the two differ by exactly the model's credit multiplier.
+    Recorded for reconciliation against an invoice and never priced -- a
+    number in the wrong unit is worse than no number, because it looks
+    like the right one."""
 
     seconds: float = 0.0
     """Billable audio seconds (transcription providers bill per minute or

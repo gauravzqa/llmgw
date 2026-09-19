@@ -71,6 +71,12 @@ class ElevenLabsTTSSurface(VoiceSurface):
 
     name = "elevenlabs_tts"
     routes = (_ROUTES[0], _ROUTES[1])
+    """Class default. `__init__` narrows it to the ONE route this variant
+    serves, because the variant decides whether the response is buffered or
+    chunked and a single instance cannot be both. Registering one instance
+    per route is the same shape `inworld_tts` uses for `/voice` and
+    `:stream`, and the metric name is shared on purpose: two routes of one
+    product are one line on a dashboard."""
     forward_query = True
     framing = "raw"
     body = "json"
@@ -86,6 +92,19 @@ class ElevenLabsTTSSurface(VoiceSurface):
             )
         self.variant = variant
         self._voice_id = voice_id
+        # The route this instance serves, and only it. Serving both from a
+        # `stream` instance made `parse_request` report `stream=True` for the
+        # buffered route, so a caller that asked for a whole body got a
+        # chunked one with no `content-length` -- correct audio, correct
+        # bill, wrong shape, and the one thing the buffered route exists to
+        # provide.
+        self.routes = (_CLIENT_PREFIX + _UPSTREAM_BASE + _SUFFIX[variant],)
+        # A name per variant, matching `sarvam_tts` / `sarvam_tts_stream`:
+        # a buffered call and a streamed one are different operational
+        # objects -- one has a time-to-first-byte and can be cut mid-body,
+        # the other cannot -- and the name is the metric label.
+        if variant == "stream":
+            self.name = "elevenlabs_tts_stream"
         template = _UPSTREAM_BASE + _SUFFIX[variant]
         self.upstream_path = self._pin(template)
         self.path = self.upstream_path
@@ -134,9 +153,55 @@ class ElevenLabsTTSSurface(VoiceSurface):
             return EventKind.CONTENT
         return EventKind.META
 
+    def usage_estimate(self, facts: RequestFacts) -> Usage:
+        """The bill: characters of text we forwarded.
+
+        ElevenLabs states a number in `character-cost`, but it is credits
+        (see `usage_from_headers`), and the price list is dollars per
+        character. So the billable quantity is the text itself -- known
+        exactly, because we sent it -- and the basis stays `estimated`
+        because the PROVIDER never reported it. Honest either way: the
+        dollar figure is right, and the record does not claim ElevenLabs
+        agreed to it.
+        """
+        usage = Usage()
+        usage.characters = int(getattr(facts, "characters", 0) or 0)
+        return usage
+
+    def cost_notes(self, facts: Any, usage: Usage | None) -> tuple[str, ...]:
+        """Say why the bill is characters rather than the number the provider
+        put in a header, because the two differ by the model's credit
+        multiplier and the difference is the whole invoice on flash models."""
+        chars = int(getattr(facts, "characters", 0) or 0)
+        credits = int(getattr(usage, "provider_credits", 0) or 0) if usage else 0
+        note = (f"billed from the {chars} characters sent; ElevenLabs prices "
+                f"the API in dollars per character and reports no character "
+                f"count of its own")
+        if credits:
+            note += (f" (its `character-cost` header read {credits}, which is "
+                     f"CREDITS -- the flash models spend half a credit per "
+                     f"character)")
+        return (note,)
+
     def usage_from_headers(self, headers: Mapping[str, str], usage: Usage) -> None:
-        """`character-cost` is the bill. Header names are case-insensitive
-        on the wire; accept either spelling of the mapping."""
+        """Read `character-cost`, and do NOT bill it.
+
+        It is a CREDIT count, not a character count. Flash v2.5 costs half a
+        credit per character, so a 14-character request reports 7 -- measured
+        twice, ratio 0.50 both times (19 Sep 2026). ElevenLabs bills API usage
+        "in US dollars, not credits", at $0.05 per 1,000 CHARACTERS for
+        Flash/Turbo (elevenlabs.io/pricing/api), which is the rate this row
+        carries. So billing the header against that rate charges half of what
+        the call costs, and nothing about the record looks wrong: it reads
+        `exact`, because a provider did state a number -- just not the one the
+        price is per.
+
+        The characters therefore come from the request text, which we know
+        exactly because we forwarded it, and the credit figure is kept beside
+        them for reconciliation against an invoice. The multilingual models
+        cost one credit per character, which is why this hid: there the two
+        numbers are equal.
+        """
         try:
             value = headers.get(CHARACTER_COST_HEADER)
             if value is None:
@@ -149,9 +214,7 @@ class ElevenLabsTTSSurface(VoiceSurface):
             count = as_int(int(str(value).strip()))
             if count is None:
                 return
-            usage.characters = max(count, 0)
-            usage.input_exact = True
-            usage.output_exact = True
+            usage.provider_credits = max(count, 0)
         except (ValueError, TypeError):
             usage.parse_failures += 1
         except Exception:  # noqa: BLE001

@@ -163,6 +163,25 @@ class AudioSpeechSurface(VoiceSurface):
     def stop_reason_from_body(self, payload: dict[str, Any]) -> str | None:
         return None
 
+    def cost_notes(self, facts: Any, usage: Usage | None) -> tuple[str, ...]:
+        """Why this bill is an estimate, on the record rather than in a
+        docstring nobody reads during an invoice dispute.
+
+        The binary mode carries no usage at all -- not in the body, not in a
+        header -- so the number beside it is derived from the request. An
+        `estimated` basis with no reason attached is the one shape a dispute
+        cannot use: it says the figure is uncertain without saying what it
+        was uncertain about.
+        """
+        if getattr(facts, "framing", None) == "sse":
+            return ()
+        chars = int(getattr(facts, "characters", 0) or 0)
+        return (
+            f"binary text-to-speech reports no usage; billed from the "
+            f"{chars} characters sent, at the calibrated ratio in "
+            f"`usage_estimate` (about 3.6 audio tokens per character)",
+        )
+
     def usage_estimate(self, facts: RequestFacts) -> Usage:
         """The bill for a binary stream OpenAI never metered (C21).
 

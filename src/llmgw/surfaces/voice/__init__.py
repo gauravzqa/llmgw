@@ -44,7 +44,8 @@ AUDIO_SPEECH: Surface = AudioSpeechSurface()                  # binary by defaul
 AUDIO_SPEECH_SSE: Surface = AudioSpeechSurface(framing="sse")  # same route, per-request
 AUDIO_TRANSCRIPTION: Surface = AudioTranscriptionSurface()      # + /translations
 INWORLD_TTS: Surface = InworldTTSSurface()                      # /voice and /voice:stream
-ELEVENLABS_TTS: Surface = ElevenLabsTTSSurface()                # buffered and /stream
+ELEVENLABS_TTS: Surface = ElevenLabsTTSSurface("buffered")      # whole body
+ELEVENLABS_TTS_STREAM: Surface = ElevenLabsTTSSurface("stream")  # chunked
 ELEVENLABS_TTS_TIMESTAMPS: Surface = ElevenLabsTimestampsSurface()  # unregistered
 ELEVENLABS_STT: Surface = ElevenLabsSTTSurface()                # Scribe, multipart
 INWORLD_STT: Surface = InworldSTTSurface()                      # /stt/v1/transcribe
@@ -59,6 +60,7 @@ VOICE_SURFACES: tuple[Surface, ...] = (
     AUDIO_TRANSCRIPTION,
     INWORLD_TTS,
     ELEVENLABS_TTS,
+    ELEVENLABS_TTS_STREAM,
     ELEVENLABS_TTS_TIMESTAMPS,
     ELEVENLABS_STT,
     INWORLD_STT,
@@ -89,6 +91,7 @@ __all__ = [
     "AUDIO_TRANSCRIPTION",
     "ELEVENLABS_STT",
     "ELEVENLABS_TTS",
+    "ELEVENLABS_TTS_STREAM",
     "ELEVENLABS_TTS_TIMESTAMPS",
     "INWORLD_STT",
     "INWORLD_TTS",

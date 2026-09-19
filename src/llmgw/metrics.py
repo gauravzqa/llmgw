@@ -71,6 +71,7 @@ SURFACES: tuple[str, ...] = (
     "audio_transcription",
     "inworld_tts",
     "elevenlabs_tts",
+    "elevenlabs_tts_stream",
     "elevenlabs_tts_timestamps",
     "assemblyai_sync",
     # The HTTP speech-to-text half of the same two providers, added once the

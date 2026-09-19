@@ -40,7 +40,7 @@ async def test_inworld_stream_is_sent_the_wire_model_under_model_id(gateway, cli
     assert echoed == "inworld-tts-2-flash", f"fake saw modelId={echoed!r}"
 
 
-async def test_elevenlabs_character_cost_header_is_the_exact_bill(gateway, client):
+async def test_elevenlabs_bills_the_characters_sent_not_the_credit_header(gateway, client):
     text = "twelve chars"
     before = _metric(await _metrics(client, gateway), "llmgw_units_total",
                      unit="characters", model="elevenlabs.flash-v2-5")
@@ -54,10 +54,16 @@ async def test_elevenlabs_character_cost_header_is_the_exact_bill(gateway, clien
             pass
     after = _metric(await _metrics(client, gateway), "llmgw_units_total",
                     unit="characters", model="elevenlabs.flash-v2-5")
-    assert after - before == len(text), "the header's count, read before the body"
-    exact = _metric(await _metrics(client, gateway), "llmgw_cost_usd_total",
-                    basis="exact", model="elevenlabs.flash-v2-5")
-    assert exact > 0
+    assert after - before == len(text), (
+        "the characters we forwarded -- NOT `character-cost`, which counts "
+        "credits and reads half of this on the flash models"
+    )
+    estimated = _metric(await _metrics(client, gateway), "llmgw_cost_usd_total",
+                        basis="estimated", model="elevenlabs.flash-v2-5")
+    assert estimated > 0, (
+        "and billed `estimated`: the dollar figure is right, but ElevenLabs "
+        "never stated a character count, so the record must not claim it did"
+    )
 
 
 async def test_binary_tts_is_billed_estimated_from_the_request(gateway, client):

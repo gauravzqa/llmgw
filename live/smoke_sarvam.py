@@ -95,6 +95,23 @@ def _print(line: str, out) -> None:
     print(line, file=out, flush=True)
 
 
+def _gw(headers, model: str, *, rewritten: bool = True) -> tuple[bool, str]:
+    """`x-gw-served-by`, `x-gw-model` and the rewrite warrant, checked.
+
+    `x-gw-model` must be the CATALOG id -- `sarvam.bulbul-v3`, never
+    `bulbul:v3`. A surface that reports the wire id here is one that will
+    bill against whichever row the provider's spelling happens to match, and
+    on Sarvam the two spellings are not even the same shape. `rewritten` is
+    True for every Sarvam route: the catalog id is spliced into the JSON body
+    (TTS) or the multipart `model` field (STT), so the bytes that left are
+    not the bytes that arrived and `x-gw-body-modified: 1` says so."""
+    served = headers.get("x-gw-served-by", "-")
+    got = headers.get("x-gw-model", "-")
+    mod = headers.get("x-gw-body-modified", "-")
+    ok = got == model and served.endswith("/" + model) and (mod == "1") == rewritten
+    return ok, f"served_by={served} x-gw-model={got} body-modified={mod}"
+
+
 def wav_duration(data: bytes) -> float:
     """Seconds declared by a RIFF/WAVE body, for checking the gateway's own
     estimate against an independent reading of the same header."""
@@ -153,15 +170,16 @@ class Case:
             self.clip = audio
         billed = _metric(self.metrics(), "llmgw_units_total", unit="characters",
                          model="sarvam.bulbul-v3") - before
+        head_ok, head = _gw(r.headers, "sarvam.bulbul-v3")
         ok = (r.status_code == 200 and audio[:4] == b"RIFF"
-              and billed == len(TEXT) and "usage" not in payload)
+              and billed == len(TEXT) and "usage" not in payload and head_ok)
         self._verdict(
             "sarvam-tts-sync",
             ok,
             f"{r.status_code} wav={len(audio)}B riff={audio[:4] == b'RIFF'} "
-            f"t={elapsed:.3f}s served_by={r.headers.get('x-gw-served-by')} "
-            f"provider_meter=none billed_characters={billed:g} "
-            f"(estimated from {len(TEXT)} request chars)",
+            f"t={elapsed:.3f}s {head} "
+            f"provider_meter=none billed_characters={billed:g} basis=estimated "
+            f"(from {len(TEXT)} request chars)",
         )
         self.spend += TTS_PER_M_CHARS * len(TEXT) / 1e6
 
@@ -184,17 +202,18 @@ class Case:
                 total += len(chunk)
             status = r.status_code
             ctype = r.headers.get("content-type", "")
-            served = r.headers.get("x-gw-served-by")
+            head_ok, head = _gw(r.headers, "sarvam.bulbul-v3")
         billed = _metric(self.metrics(), "llmgw_units_total", unit="characters",
                          model="sarvam.bulbul-v3") - before
         ok = (status == 200 and ctype.startswith("audio/") and total > 0
-              and billed == len(TEXT))
+              and billed == len(TEXT) and head_ok)
         self._verdict(
             "sarvam-tts-stream",
             ok,
             f"{status} {ctype} chunks={chunks} bytes={total} "
-            f"ttfb={first if first is None else round(first, 3)}s served_by={served} "
-            f"billed_characters={billed:g} (no terminal frame; body ends on close)",
+            f"ttfb={first if first is None else round(first, 3)}s {head} "
+            f"provider_meter=none billed_characters={billed:g} basis=estimated "
+            f"(no terminal frame; body ends on close)",
         )
         self.spend += TTS_PER_M_CHARS * len(TEXT) / 1e6
 
@@ -231,22 +250,62 @@ class Case:
                          model=model) - before
         transcript = payload.get("transcript")
         has_meter = any(k in payload for k in ("usage", "duration", "audio_duration"))
+        head_ok, head = _gw(r.headers, model)
         ok = (r.status_code == 200 and isinstance(transcript, str) and transcript
-              and not has_meter and abs(billed - round(declared)) <= 1)
+              and not has_meter and abs(billed - round(declared)) <= 1 and head_ok)
         if translate:
             ok = ok and "diarized_transcript" in payload
         self._verdict(
             name,
             ok,
             f"{r.status_code} t={elapsed:.3f}s transcript={transcript!r} "
-            f"served_by={r.headers.get('x-gw-served-by')} provider_meter=none "
-            f"billed_seconds={billed:g} (estimated from the WAV header's "
+            f"{head} provider_meter=none "
+            f"billed_seconds={billed:g} basis=estimated (from the WAV header's "
             f"{declared:.2f}s)"
             + (f" diarized={payload.get('diarized_transcript')!r}" if translate else ""),
         )
         self.spend += STT_PER_MINUTE * declared / 60
 
     # ------------------------------------------------------------------ text
+
+    def chat_buffered(self) -> None:
+        """The same row with `stream: false`.
+
+        A separate case because it is a different code path end to end -- the
+        buffered sink, `usage_from_body` instead of `apply_usage`, a
+        `content-length` the gateway computed itself -- and because "Sarvam
+        text works" is not proven by the streaming half alone. The bill must
+        come out the same way: the provider's own `usage` block, exact."""
+        before_in = _metric(self.metrics(), "llmgw_tokens_total", kind="input",
+                            model="sarvam.sarvam-105b")
+        body = {"model": "sarvam.sarvam-105b", "stream": False, "max_tokens": 24,
+                "messages": [{"role": "user", "content": "Reply with the word OK."}]}
+        t0 = time.perf_counter()
+        r = httpx.post(f"{self.gw.base_url}/v1/chat/completions", json=body,
+                       timeout=60)
+        elapsed = time.perf_counter() - t0
+        payload = r.json() if r.status_code == 200 else {}
+        usage = payload.get("usage") if isinstance(payload, dict) else None
+        choices = payload.get("choices") if isinstance(payload, dict) else None
+        after_in = _metric(self.metrics(), "llmgw_tokens_total", kind="input",
+                           model="sarvam.sarvam-105b")
+        billed_in = after_in - before_in
+        provider_in = (usage or {}).get("prompt_tokens")
+        head_ok, head = _gw(r.headers, "sarvam.sarvam-105b")
+        ctype = r.headers.get("content-type", "")
+        ok = (r.status_code == 200 and ctype.startswith("application/json")
+              and bool(choices) and provider_in is not None
+              and billed_in == provider_in and head_ok)
+        self._verdict(
+            "sarvam-chat-buffered",
+            ok,
+            f"{r.status_code} {ctype} bytes={len(r.content)} t={elapsed:.3f}s "
+            f"{head} provider_usage={usage} billed_input={billed_in:g} basis=exact "
+            f"content_length={r.headers.get('content-length')}",
+        )
+        if usage:
+            self.spend += (CHAT_IN_PER_M * usage.get("prompt_tokens", 0) / 1e6
+                           + CHAT_OUT_PER_M * usage.get("completion_tokens", 0) / 1e6)
 
     def chat(self) -> None:
         """Sarvam's `sarvam-105b` over the EXISTING `openai_chat` surface.
@@ -261,7 +320,7 @@ class Case:
             raw = b"".join(r.iter_raw())
             status = r.status_code
             ctype = r.headers.get("content-type", "")
-            served = r.headers.get("x-gw-served-by")
+            head_ok, head = _gw(r.headers, "sarvam.sarvam-105b")
         elapsed = time.perf_counter() - t0
         done = raw.rstrip().endswith(b"data: [DONE]")
         usage = None
@@ -280,12 +339,13 @@ class Case:
         billed_in = after_in - before_in
         provider_in = (usage or {}).get("prompt_tokens")
         agree = provider_in is not None and billed_in == provider_in
-        ok = status == 200 and ctype.startswith("text/event-stream") and done and agree
+        ok = (status == 200 and ctype.startswith("text/event-stream") and done
+              and agree and head_ok)
         self._verdict(
-            "sarvam-chat",
+            "sarvam-chat-streamed",
             ok,
-            f"{status} {ctype} bytes={len(raw)} done={done} t={elapsed:.3f}s "
-            f"served_by={served} provider_usage={usage} billed_input={billed_in:g} "
+            f"{status} {ctype} bytes={len(raw)} done={done} ttfb_total={elapsed:.3f}s "
+            f"{head} provider_usage={usage} billed_input={billed_in:g} basis=exact "
             f"(openai_chat surface, no Sarvam-specific code)",
         )
         if usage:
@@ -334,13 +394,74 @@ class Case:
         )
 
 
-def build_sarvam_app(policy_path: str):
+def ledger(capture_path: str, out) -> int:
+    """The gateway's OWN answer to "what did that cost, and how sure is it".
+
+    Read from the capture sink rather than from `/metrics`, because `basis`
+    and `cost_notes` are per-RECORD facts that no counter can carry: a
+    dashboard that shows a dollar figure without them shows an estimate and a
+    measurement as the same number. This is the table the live matrix is
+    ultimately about -- every speech row must say `exact` and agree with the
+    provider's meter, or say `estimated` and say WHY in a note.
+    """
+    # The capture worker is asynchronous by design, so the last record can
+    # still be in flight when the last case returns. Settle briefly rather
+    # than reporting a short ledger as a missing bill.
+    time.sleep(1.0)
+    path = Path(capture_path)
+    if not path.is_file():
+        _print("\nMETERING LEDGER: (no capture records)", out)
+        return 0
+    unexplained: list[str] = []
+    _print("\nMETERING LEDGER (from the gateway's own capture records)", out)
+    _print(f"  {'provider':<18} {'model':<30} {'units':<22} {'basis':<10} cost_usd",
+           out)
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if not rec.get("units") and not rec.get("cost_usd"):
+            continue
+        # Zero-valued kinds are noise: every speech record carries both
+        # `characters` and `seconds` and only one of them was ever billed.
+        units = ",".join(f"{k}={v:g}" for k, v in (rec.get("units") or {}).items() if v)
+        tokens = ",".join(f"{k}={v:g}" for k, v in (rec.get("tokens") or {}).items() if v)
+        _print(f"  {str(rec.get('provider'))[:18]:<18} "
+               f"{str(rec.get('model') or '-')[:30]:<30} "
+               f"{(units or tokens or '-')[:22]:<22} "
+               f"{str(rec.get('basis')):<10} {rec.get('cost_usd', 0.0):.8f}", out)
+        notes = rec.get("cost_notes") or ()
+        for note in notes:
+            _print(f"      note: {note}", out)
+        if rec.get("basis") == "estimated" and rec.get("cost_usd") and not notes:
+            # An `estimated` bill with no reason attached is the one shape an
+            # invoice dispute cannot use: it says "we guessed" and not "we
+            # guessed THIS WAY, because the provider told us nothing".
+            unexplained.append(f"{rec.get('model')} "
+                               f"${rec.get('cost_usd', 0.0):.8f}")
+    if unexplained:
+        _print(f"  ledger-estimated-notes: {len(unexplained)} estimated record(s) "
+               f"with NO cost_notes: {unexplained} -> FAIL", out)
+    else:
+        _print("  ledger-estimated-notes: every estimated record explains its "
+               "number -> PASS", out)
+    return len(unexplained)
+
+
+def build_sarvam_app(policy_path: str, capture_path: str | None = None):
     settings = {
         "catalog": DEFAULT_CATALOG,
         "fake_upstreams": False,
         "policy_file": policy_path,
         "default_model": "sarvam.bulbul-v3",
         "forward_request_headers": ("x-request-id",),
+        # Capture is ON here because `basis` and `cost_notes` live on the
+        # RECORD and nowhere else: a metric can say how many units were
+        # billed but not whether anyone measured them.
+        "capture_path": capture_path,
     }
     return build_app(ServerConfig(**settings).validated())
 
@@ -349,7 +470,8 @@ def run(*, spend: bool = True, out=sys.stdout) -> float:
     with tempfile.TemporaryDirectory(prefix="llmgw-sarvam-") as tmp:
         policy = Path(tmp) / "sarvam.toml"
         policy.write_text(POLICY_TOML, encoding="utf-8")
-        gw = text_smoke.serve(build_sarvam_app(str(policy)))
+        capture = Path(tmp) / "capture.jsonl"
+        gw = text_smoke.serve(build_sarvam_app(str(policy), str(capture)))
         try:
             _print(f"sarvam gateway on {gw.base_url}", out)
             _print(f"  SARVAM_API_KEY: "
@@ -364,8 +486,10 @@ def run(*, spend: bool = True, out=sys.stdout) -> float:
             case.stt()
             case.stt(translate=True)
             case.chat()
+            case.chat_buffered()
             case.unknown_model()
-            _print(f"\nFAILURES: {case.failures}", out)
+            unexplained = ledger(str(capture), out)
+            _print(f"\nFAILURES: {case.failures + unexplained}", out)
             _print(f"ESTIMATED SPEND: ${case.spend:.6f}", out)
             return case.spend
         finally:

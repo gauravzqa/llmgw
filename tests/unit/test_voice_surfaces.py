@@ -26,6 +26,7 @@ from llmgw.surfaces.voice import (
     AUDIO_TRANSCRIPTION,
     ELEVENLABS_STT,
     ELEVENLABS_TTS,
+    ELEVENLABS_TTS_STREAM,
     ELEVENLABS_TTS_TIMESTAMPS,
     INWORLD_STT,
     INWORLD_TTS,
@@ -309,15 +310,30 @@ def test_inworld_in_band_error_and_grpc_exhausted():
 # ------------------------------------------------------------- elevenlabs_tts
 
 
-def test_elevenlabs_request_reads_model_id_and_streams_on_the_stream_route():
-    facts = ELEVENLABS_TTS.parse_request(json.dumps(
-        {"text": "twelve chars", "model_id": "elevenlabs.flash-v2-5",
-         "voice_settings": {"stability": 0.5}}).encode())
-    assert facts.model == "elevenlabs.flash-v2-5" and facts.characters == 12
-    assert facts.stream is True
+def test_each_elevenlabs_variant_serves_only_its_own_route():
+    """One instance per route, because the variant decides whether the
+    response is a whole body or a chunked one and an instance cannot be
+    both. Serving the buffered route from the `stream` instance returned
+    correct audio with `transfer-encoding: chunked` and no `content-length`
+    -- the one thing a caller picks the buffered route to get."""
+    body = json.dumps({"text": "twelve chars", "model_id": "elevenlabs.flash-v2-5",
+                       "voice_settings": {"stability": 0.5}}).encode()
+    streamed = ELEVENLABS_TTS_STREAM.parse_request(body)
+    assert streamed.model == "elevenlabs.flash-v2-5" and streamed.characters == 12
+    assert streamed.stream is True
+    assert ELEVENLABS_TTS_STREAM.routes == (
+        "/elevenlabs/v1/text-to-speech/{voice_id}/stream",
+    )
+
+    buffered = ELEVENLABS_TTS.parse_request(body)
+    assert buffered.stream is False
+    assert ELEVENLABS_TTS.routes == ("/elevenlabs/v1/text-to-speech/{voice_id}",)
+
     assert ELEVENLABS_TTS.forward_query is True and ELEVENLABS_TTS.model_key == "model_id"
-    buffered = ElevenLabsTTSSurface("buffered")
-    assert buffered.parse_request(b'{"text": "a", "model_id": "m"}').stream is False
+    # A name per variant, like sarvam_tts / sarvam_tts_stream: the label is
+    # how a dashboard tells a call with a time-to-first-byte from one without.
+    assert ELEVENLABS_TTS.name == "elevenlabs_tts"
+    assert ELEVENLABS_TTS_STREAM.name == "elevenlabs_tts_stream"
 
 
 def test_elevenlabs_upstream_paths_keep_the_voice_template_or_pin_it():
@@ -334,13 +350,23 @@ def test_elevenlabs_upstream_paths_keep_the_voice_template_or_pin_it():
         ELEVENLABS_TTS.upstream_path_for("/v1/text-to-speech/x")
 
 
-def test_elevenlabs_character_cost_header_is_the_bill():
+def test_elevenlabs_character_cost_is_credits_and_is_not_the_bill():
+    """`character-cost` counts CREDITS. Flash v2.5 spends half a credit per
+    character, so a 14-character request reports 7 -- while ElevenLabs bills
+    API usage in dollars per CHARACTER, which is the rate the catalog row
+    carries. Billing the header charged half the call and the record read
+    `exact`, because a provider had stated a number; just not the one the
+    price is per. The multilingual models are one credit per character,
+    which is why this hid."""
     usage = Usage()
-    ELEVENLABS_TTS.usage_from_headers({"Character-Cost": "12", "request-id": "abc"}, usage)
-    assert usage.characters == 12 and usage.exact
+    ELEVENLABS_TTS.usage_from_headers({"Character-Cost": "7", "request-id": "abc"}, usage)
+    assert usage.provider_credits == 7, "kept for reconciliation"
+    assert usage.characters == 0, "and never billed as characters"
+    assert usage.exact is False
     junk = Usage()
     ELEVENLABS_TTS.usage_from_headers({"character-cost": "twelve"}, junk)
     assert junk.exact is False and junk.parse_failures == 1
+    assert junk.provider_credits == 0
     none = Usage()
     ELEVENLABS_TTS.usage_from_headers({"content-type": "audio/mpeg"}, none)
     assert none == Usage()
