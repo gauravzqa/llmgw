@@ -268,6 +268,25 @@ class Usage:
     """Billable audio seconds (transcription providers bill per minute or
     per second). OpenAI rounds up to whole seconds before reporting."""
 
+    images: int = 0
+    """Images the provider actually returned.
+
+    A COUNT, not a currency, and the distinction is the whole reason the
+    field is documented rather than just declared. Every image model OpenAI
+    serves is billed in TOKENS (`gpt-image-1`: $5/M text in, $40/M image out)
+    and reports them, so no catalog row prices per image and `accounting`
+    never multiplies this by anything. It is metered on `llmgw_units_total
+    {unit="images"}` because "how many images did we make" is the question an
+    image gateway's dashboard is about, and tokens cannot answer it: 816
+    output tokens is one high-quality image or three low-quality ones.
+
+    Counted from the RESPONSE (`len(data)` buffered, one per
+    `image_generation.completed` streamed), never from the request's `n`.
+    On 20 Sep 2026 a live `n=2` to `gpt-image-1` came back with one image and
+    one image's worth of tokens while `n=3` came back with three -- so `n` is
+    what was asked for and this is what arrived, and a bill built on the
+    former would have charged for an image that does not exist."""
+
     audio_input_tokens: int = 0
     """Prompt tokens that were audio (`prompt_tokens_details.audio_tokens`).
     Priced at the audio rate, 8 to 50x the text rate on `gpt-audio`; before

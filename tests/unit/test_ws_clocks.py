@@ -381,7 +381,7 @@ def test_the_shipped_byte_rates_are_sized_from_the_medium():
 def test_surface_limits_resolve_the_rates_without_inheriting_the_globals():
     """A byte CAP inherits the global; a byte RATE does not exist globally,
     so `None` means "no rate bound" rather than "the global one"."""
-    resolved = SurfaceLimits(max_in_bps=99).resolved(request=10, response=20)
+    resolved = SurfaceLimits(max_in_bps=99).resolved(request=10, response=20, frame=30)
     assert resolved.max_request_bytes == 10
     assert resolved.max_in_bps == 99
     assert resolved.max_out_bps is None

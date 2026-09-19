@@ -40,6 +40,7 @@ from llmgw.surfaces.base import (
 )
 from llmgw.surfaces.count_tokens import COUNT_TOKENS, CountTokensSurface
 from llmgw.surfaces.embeddings import EMBEDDINGS, EmbeddingsSurface
+from llmgw.surfaces.images import ImagesGenerationsSurface
 from llmgw.surfaces.models import MODELS, ModelsSurface
 from llmgw.surfaces.openai import OpenAIChatSurface
 from llmgw.surfaces.realtime_control import REALTIME_CONTROL, RealtimeControlSurface
@@ -48,6 +49,7 @@ from llmgw.surfaces.responses import OpenAIResponsesSurface
 OPENAI_CHAT: Surface = OpenAIChatSurface()
 OPENAI_RESPONSES: Surface = OpenAIResponsesSurface()
 ANTHROPIC_MESSAGES: Surface = AnthropicMessagesSurface()
+IMAGES_GENERATIONS: Surface = ImagesGenerationsSurface()
 
 try:  # Phase D's package; absent on a text-only build.
     from llmgw.surfaces.voice import VOICE_SURFACES
@@ -63,6 +65,7 @@ REGISTRY: tuple[Surface, ...] = (
     EMBEDDINGS,
     REALTIME_CONTROL,
     ASSEMBLYAI_TOKEN,
+    IMAGES_GENERATIONS,
     *VOICE_SURFACES,
 )
 """Every surface the server mounts, in mount order. Routes must be unique
@@ -126,6 +129,7 @@ __all__ = [
     "CREDENTIAL_QUERY_KEYS",
     "DONE_MARKER",
     "EMBEDDINGS",
+    "IMAGES_GENERATIONS",
     "MODELS",
     "OPENAI_CHAT",
     "OPENAI_RESPONSES",
@@ -140,6 +144,7 @@ __all__ = [
     "BufferedSurface",
     "CountTokensSurface",
     "EmbeddingsSurface",
+    "ImagesGenerationsSurface",
     "EventKind",
     "ModelsSurface",
     "OpenAIChatSurface",

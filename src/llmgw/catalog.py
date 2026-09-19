@@ -840,6 +840,77 @@ MODELS: dict[str, ModelSpec] = {
             priced_at="2026-09-16",
         ),
         # -----------------------------------------------------------------
+        # Image generation (`POST /v1/images/generations`). Rates read off
+        # https://developers.openai.com/api/docs/pricing on 2026-09-20.
+        #
+        # `unit="tokens"`, and that is a FINDING rather than a default. The
+        # brief this work started from assumed a per-image model
+        # (`dall-e-3`, priced by size and quality with no usage block) and
+        # therefore an `images` billing unit. Both `dall-e-3` and `dall-e-2`
+        # are GONE: `/v1/images/generations` answers them
+        # `{"error":{"message":"The model 'dall-e-3' does not exist.",
+        # "type":"image_generation_user_error","code":"invalid_value"}}`
+        # (live, 2026-09-20), and neither appears on the pricing page. Every
+        # image model the account can reach -- gpt-image-1, -1-mini, -1.5,
+        # -2, -2.5-sunburst, -2.5-flare, chatgpt-image-latest -- is priced
+        # per token and reports an exact `usage` block. So there is no
+        # per-image rate column, no size x quality price table to keep in
+        # step with the provider, and every bill on this surface is `exact`.
+        #
+        # `output_per_m` IS the image-output rate: every output token of an
+        # image generation is an image token (`output_tokens_details.
+        # image_tokens == output_tokens`, verified live), exactly as every
+        # output token of a speech model is an audio token. A separate
+        # `image_output_per_m` column would have to be kept equal to this one
+        # by hand, for no second reader.
+        #
+        # The IMAGE-INPUT rate ($10/M on gpt-image-1, $2.50/M on the mini) is
+        # deliberately absent: it is only reachable through `/v1/images/edits`,
+        # which this gateway does not serve, and on every generation
+        # `input_tokens_details.image_tokens` is 0 (verified live). The
+        # surface still reads that field and files a `cost_notes` line if it
+        # is ever non-zero, so the day an edits path appears the under-bill
+        # announces itself instead of hiding.
+        # -----------------------------------------------------------------
+        ModelSpec(
+            # $5.00 / 1M text input, $1.25 / 1M cached input, $40.00 / 1M
+            # image output tokens. Exercised live 2026-09-20: a low-quality
+            # 1024x1024 reported `input_tokens=14, output_tokens=272`, i.e.
+            # $0.0109 an image; `n=3` reported 816 output tokens.
+            id="openai.gpt-image-1",
+            provider="openai",
+            api_model="gpt-image-1",
+            input_per_m=5.00,
+            cached_input_per_m=1.25,
+            output_per_m=40.00,
+            # Not a chat model: the "context" is the prompt, capped by the
+            # API at 32,000 characters, and `max_output` is the fixed token
+            # count of one image, which depends on size and quality (272 to
+            # 6,240). Both fields are sizing hints for the deadline and the
+            # policy, and neither is a fact about a conversation, so the
+            # prompt cap goes in one and zero -- "not a token budget the
+            # caller sets" -- goes in the other.
+            context_window=32_000,
+            max_output=0,
+            priced_at="2026-09-20",
+            default_profile="images",
+        ),
+        ModelSpec(
+            # $2.00 / 1M text input, $0.20 / 1M cached input, $8.00 / 1M
+            # image output tokens -- a fifth of gpt-image-1 for the same
+            # token counts. Exercised live 2026-09-20.
+            id="openai.gpt-image-1-mini",
+            provider="openai",
+            api_model="gpt-image-1-mini",
+            input_per_m=2.00,
+            cached_input_per_m=0.20,
+            output_per_m=8.00,
+            context_window=32_000,
+            max_output=0,
+            priced_at="2026-09-20",
+            default_profile="images",
+        ),
+        # -----------------------------------------------------------------
         # PLAN-2 Phase D: voice rows. Units per `ModelSpec.unit`; every rate
         # cites the sweep file it came from. No provider here exposes a model
         # list, so `make probe` cannot reconcile these ids -- the live smoke

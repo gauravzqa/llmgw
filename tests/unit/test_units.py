@@ -104,7 +104,7 @@ def voice_catalog() -> Catalog:
 def test_token_kinds_and_units_match_the_metrics_contract():
     assert TOKEN_KINDS == metrics.TOKEN_KINDS
     assert UNITS == metrics.UNITS
-    assert set(metrics.UNITS) == {"characters", "seconds"}
+    assert set(metrics.UNITS) == {"characters", "seconds", "images"}
 
 
 def test_record_tokens_by_kind_covers_every_metric_kind():
@@ -203,7 +203,7 @@ def test_characters_are_priced_per_million_at_the_input_rate():
     assert rec.unit == "characters"
     assert rec.characters == 2000
     assert rec.cost_usd == pytest.approx(2000 * 50.0 / 1e6)
-    assert rec.units_by_kind == {"characters": 2000, "seconds": 0}
+    assert rec.units_by_kind == {"characters": 2000, "seconds": 0, "images": 0}
 
 
 def test_seconds_are_priced_through_per_minute():

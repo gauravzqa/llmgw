@@ -201,11 +201,18 @@ async def test_defaults_are_applied_upstream_only_for_json_bodies_and_reported()
 
 def test_shipped_surface_limits_and_the_global_fallback():
     cfg = ServerConfig()
-    globals_ = SurfaceLimits(cfg.max_request_bytes, cfg.max_response_bytes)
+    globals_ = SurfaceLimits(cfg.max_request_bytes, cfg.max_response_bytes,
+                             cfg.max_frame_bytes)
     assert "openai_chat" not in DEFAULT_SURFACE_LIMITS  # chat IS the globals
     assert cfg.limits_for("openai_chat") == globals_
     assert cfg.limits_for("anthropic_messages") == SurfaceLimits(
-        32 * 1024 * 1024, cfg.max_response_bytes
+        32 * 1024 * 1024, cfg.max_response_bytes, cfg.max_frame_bytes
+    )
+    # The image surface is the one row that sets all three, including the
+    # frame bound: one `image_generation.partial_image` frame is a whole
+    # base64 PNG, over the 1 MiB global.
+    assert cfg.limits_for("images_generations") == SurfaceLimits(
+        1 * 1024 * 1024, 32 * 1024 * 1024, 8 * 1024 * 1024
     )
     assert cfg.limits_for("no_such_surface") == globals_
     # A global set in code lowers every surface without its own number.
@@ -219,6 +226,7 @@ def test_surface_limit_env_overrides_win_over_the_global_and_the_table():
         "LLMGW_MAX_REQUEST_BYTES": str(1024 * 1024),
         "LLMGW_MAX_REQUEST_BYTES__ANTHROPIC_MESSAGES": str(64 * 1024 * 1024),
         "LLMGW_MAX_RESPONSE_BYTES__AUDIO_SPEECH": str(16 * 1024 * 1024),
+        "LLMGW_MAX_FRAME_BYTES__IMAGES_GENERATIONS": str(4 * 1024 * 1024),
     }
     table = surface_limits_from_env(env)
     # Rows carry only what a variable set; the rest is `None` = inherit.
@@ -228,9 +236,13 @@ def test_surface_limit_env_overrides_win_over_the_global_and_the_table():
     cfg = ServerConfig.from_env({**env, "LLMGW_FAKE_UPSTREAMS": "1"})
     # The plain global reaches chat (no row) and the unnamed half of a row...
     assert cfg.limits_for("openai_chat").max_request_bytes == 1024 * 1024
-    assert cfg.limits_for("audio_speech") == SurfaceLimits(1024 * 1024, 16 * 1024 * 1024)
+    assert cfg.limits_for("audio_speech") == SurfaceLimits(
+        1024 * 1024, 16 * 1024 * 1024, cfg.max_frame_bytes)
     # ...and a per-surface variable beats it.
     assert cfg.limits_for("anthropic_messages").max_request_bytes == 64 * 1024 * 1024
+    # ...on the frame bound too, which is the third cap and the only one a
+    # surface can need for a reason the deployment cannot see.
+    assert cfg.limits_for("images_generations").max_frame_bytes == 4 * 1024 * 1024
 
 
 def test_a_non_integer_surface_limit_refuses_at_startup():

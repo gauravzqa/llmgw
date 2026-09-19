@@ -2503,6 +2503,7 @@ class PassthroughEndpoint:
                     body_kind=body_kind,
                     content_type=client_content_type if body_kind != "json" else None,
                     max_response_bytes=limits.max_response_bytes,
+                    max_frame_bytes=limits.max_frame_bytes,
                 )
         except asyncio.CancelledError:
             # ------------------------- SHUTDOWN CUT ------------------------
@@ -2679,6 +2680,7 @@ class PassthroughEndpoint:
         body_kind: str = "json",
         content_type: str | None = None,
         max_response_bytes: int | None = None,
+        max_frame_bytes: int | None = None,
         upstream_path: str | None = None,
         method: str = "POST",
         surface: Surface | None = None,
@@ -2766,7 +2768,16 @@ class PassthroughEndpoint:
                 # the scale tier multiplies by N, and the only bound between
                 # an oversized provider frame and this process's RSS.
                 buffer_bytes=config.buffer_bytes,
-                max_frame_bytes=config.max_frame_bytes,
+                # Per-surface since the image surface landed: one
+                # `image_generation.partial_image` frame is a whole base64
+                # PNG, 1.6x the global bound. `limits_for()` already resolved
+                # the global for every surface that sets no number of its own,
+                # and the None here is for a caller that passed no limits at
+                # all (the tests that drive `_serve` directly).
+                max_frame_bytes=(
+                    config.max_frame_bytes if max_frame_bytes is None
+                    else max_frame_bytes
+                ),
                 # What `parse_request` read, for the surface's per-target
                 # refusal (`Surface.check_target`, Phase F).
                 request_facts=exchange.request_facts,

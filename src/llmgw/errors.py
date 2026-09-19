@@ -1101,6 +1101,26 @@ _BILLING_400_HINT = "reached your specified api usage limits"
 # a status that means another, and only the body says which.
 _AUTH_400_HINTS = ("authentication_error", "invalid_api_key")
 
+_MODERATION_HINTS = (
+    # OpenAI image generation, captured live 2026-09-20. The body is
+    # `{"error":{"message":"Your request was rejected by the safety system.
+    # ...","type":"image_generation_user_error","param":null,
+    # "code":"moderation_blocked","moderation_details":{"moderation_stage":
+    # "input","categories":["other"]}}}` -- note that `type` is
+    # `image_generation_user_error`, NOT `content_filter`, so the existing
+    # `content_filter`/`content_policy` rule below does not see it and the
+    # refusal classified as a plain `invalid_request`.
+    #
+    # The difference is not cosmetic. `InvalidRequest` is `try_next=True`:
+    # a refused prompt would be shopped around every fallback target until
+    # one answered, which is a compliance decision the gateway is not
+    # allowed to make silently (see `ContentFiltered`). Both classes are
+    # NEUTRAL and blame the CLIENT, so no circuit was ever at risk here --
+    # the fallback behaviour is what the fix is for.
+    "moderation_blocked",
+    "rejected by the safety system",
+)
+
 # AssemblyAI's sync host answers a bad credential with a **404**, not a 401
 # or a 403: `{"status":404,"title":"Not Found","detail":"Invalid API key"}`
 # under `application/problem+json` (captured live, probe A4g, reproduced
@@ -1333,6 +1353,13 @@ def from_http_status(
             )
         if _BILLING_400_HINT in detail:
             return InsufficientCredits(detail, **kw)
+        # Before the unknown-model rule, deliberately. `moderation_blocked`
+        # is a machine-readable code the provider chose; `_looks_like_
+        # unknown_model` is substring matching on prose that its own
+        # docstring calls a weak signal. A strong signal is not allowed to
+        # lose to a weak one because of line order.
+        if any(hint in detail or hint in etype for hint in _MODERATION_HINTS):
+            return ContentFiltered(detail or "content filtered", **kw)
         if _looks_like_unknown_model(detail):
             return ModelNotFound(detail or f"model {model!r} not found", **kw)
         if "context" in detail or "too long" in detail or "context_length" in detail:

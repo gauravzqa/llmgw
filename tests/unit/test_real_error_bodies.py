@@ -640,3 +640,73 @@ def test_inworld_stt_unknown_model_is_config_drift_and_a_missing_part_is_not():
     client = E.from_http_status(400, body=INWORLD_STT_MISSING_AUDIO_400, provider="inworld")
     assert isinstance(client, E.InvalidRequest)
     assert not isinstance(client, E.ModelNotFound)
+
+
+# ------------------------------------------- OpenAI image generation, 2026-09-20
+
+OPENAI_IMAGE_MODERATION_400 = (
+    b'{"error":{"message":"Your request was rejected by the safety system. If you '
+    b'believe this is an error, contact us at help.openai.com and include the '
+    b'request ID req_d0c38038e28e411d818495600cc1cb51.",'
+    b'"type":"image_generation_user_error","param":null,"code":"moderation_blocked",'
+    b'"moderation_details":{"moderation_stage":"input","categories":["other"]}}}'
+)
+"""`POST /v1/images/generations`, 400, provoked live with a prompt that was
+always going to be refused. The belief this corrected: that a provider spells
+a content refusal `content_filter`. OpenAI's image endpoint does not -- the
+`type` is `image_generation_user_error`, the same type it uses for a bad
+`size`, and only the `code` separates them."""
+
+OPENAI_IMAGE_RETIRED_MODEL_400 = (
+    b'{"error":{"message":"The model \'dall-e-3\' does not exist.",'
+    b'"type":"image_generation_user_error","param":"model","code":"invalid_value"}}'
+)
+"""The same 400, the same `type`, a different fault entirely: `dall-e-3` and
+`dall-e-2` were retired some time before 20 Sep 2026 and neither appears on
+the pricing page any more."""
+
+OPENAI_IMAGE_BAD_SIZE_400 = (
+    b'{"error":{"message":"Invalid size \'123x456\'. Supported sizes are 1024x1024, '
+    b'1024x1536, 1536x1024, and auto.","type":"image_generation_user_error",'
+    b'"param":"size","code":"invalid_value"}}'
+)
+
+
+def test_an_image_moderation_block_is_the_clients_fault_and_not_shopped_around():
+    """Before the `moderation_blocked` rule this was a plain `InvalidRequest`,
+    which is `try_next=True`: the gateway would have carried a refused prompt
+    to every fallback target until one of them answered it. That is a
+    compliance decision, and it is not the gateway's to make silently."""
+    err = E.from_http_status(400, body=OPENAI_IMAGE_MODERATION_400,
+                             provider="openai", model="openai.gpt-image-1")
+    assert isinstance(err, E.ContentFiltered)
+    assert err.try_next is False
+    # NEUTRAL, CLIENT: a provider that correctly refuses a prompt is not sick,
+    # so no circuit anywhere hears it.
+    assert err.health is E.Health.NEUTRAL and err.blame is E.Blame.CLIENT
+    # And the provider's body reaches the caller: `moderation_details` is the
+    # only place the stage and the categories are named.
+    assert err.passthrough is True
+
+
+def test_the_three_image_400s_share_a_type_and_must_not_share_a_class():
+    """One `type` for all three, so a rule that read `type` would collapse
+    catalog drift, a caller's typo and a policy refusal into one class."""
+    drift = E.from_http_status(400, body=OPENAI_IMAGE_RETIRED_MODEL_400,
+                               provider="openai", model="openai.dall-e-3")
+    assert isinstance(drift, E.ModelNotFound)
+    caller = E.from_http_status(400, body=OPENAI_IMAGE_BAD_SIZE_400, provider="openai")
+    assert isinstance(caller, E.InvalidRequest)
+    assert not isinstance(caller, (E.ModelNotFound, E.ContentFiltered))
+
+
+def test_the_moderation_code_beats_the_unknown_model_prose_rule():
+    """Order, asserted. `_looks_like_unknown_model` is substring matching on
+    prose that its own docstring calls a weak signal; `moderation_blocked` is
+    a machine-readable code the provider chose. A refusal whose message
+    happens to contain the word "model" must still be a refusal."""
+    body = (b'{"error":{"message":"Your request was rejected by the safety system. '
+            b'The model did not generate an image.","type":"image_generation_user_error",'
+            b'"param":null,"code":"moderation_blocked"}}')
+    assert isinstance(E.from_http_status(400, body=body, provider="openai"),
+                      E.ContentFiltered)

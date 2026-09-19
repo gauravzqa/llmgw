@@ -217,6 +217,16 @@ MODES: tuple[str, ...] = (
     # (capabilities/captures-responses.md). Bodies live in fakes/responses.py.
     # `ok` on that route is the happy Responses stream; the error modes above
     # (`5xx`, `429`, `401`, ...) answer there exactly as on the chat route.
+    # Image generation, in the bodies captured on 20 Sep 2026. Bodies live
+    # in `fakes/images.py`. `images-stream` is the SSE form and carries NO
+    # `[DONE]`, which is the contract and not an omission;
+    # `images-moderation-400` is the refusal that is the caller's fault and
+    # must not open a circuit.
+    "images",
+    "images-stream",
+    "images-moderation-400",
+    "images-unknown-model-400",
+    "images-bad-size-400",
     "responses-incomplete",
     "responses-failed",
     "responses-error-event",
@@ -264,6 +274,10 @@ EXTRA_ROUTES: dict[Surface, tuple[tuple[str, str], ...]] = {
     "openai": (
         (RESPONSES_PATH, "ok"),
         ("/v1/embeddings", "embeddings"),
+        # One route, two forms: `images` (buffered JSON) is the default and
+        # `X-Fake-Mode: images-stream` picks the SSE one, exactly as the real
+        # endpoint is switched by `stream: true` in the body.
+        ("/v1/images/generations", "images"),
         ("/v1/realtime/client_secrets", "client-secrets"),
         ("/v1/realtime/calls/{call_id}/{action}", "realtime-calls"),
         *_VOICE_ROUTES,
@@ -1252,6 +1266,31 @@ async def _voice_or_utility_mode(request: Request, p: Params, hdr: dict[str, str
         return await V.openai_stt_json(request, hdr)
     if m == "inworld-sync":
         return await V.inworld_sync(request, hdr)
+
+    if m.startswith("images"):
+        from fakes import images as I
+
+        if m == "images-moderation-400":
+            await request.body()
+            return I.moderation_blocked_400(hdr)
+        if m == "images-unknown-model-400":
+            await request.body()
+            return I.unknown_model_400(hdr)
+        if m == "images-bad-size-400":
+            await request.body()
+            return I.bad_size_400(hdr)
+        # `X-Fake-Bytes` sizes the raster; the 8 MiB default belongs to
+        # huge-event, so it is read as "not asked for".
+        pixels = (p.nbytes if p.nbytes != 8 * 1024 * 1024 else I.DEFAULT_PIXELS)
+        if m == "images-stream":
+            resp = await I.generations_stream(request, hdr, pixels=pixels)
+            iterator = getattr(resp, "body_iterator", None)
+            if iterator is not None:
+                resp.body_iterator = _counted(m, iterator)  # type: ignore[attr-defined]
+            return resp
+        if m == "images":
+            return await I.generations(request, hdr, pixels=pixels)
+        return None
 
     if m.startswith("sarvam-"):
         from fakes import sarvam as S

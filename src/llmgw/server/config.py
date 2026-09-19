@@ -104,6 +104,19 @@ class SurfaceLimits:
     max_request_bytes: int | None = None
     max_response_bytes: int | None = None
 
+    max_frame_bytes: int | None = None
+    """One SSE/JSONL frame's bound for this surface, over the global
+    `ServerConfig.max_frame_bytes`.
+
+    A per-surface number because a frame is a DIALECT's unit, not a
+    deployment's: the global 1 MiB is sized for a chat chunk, and OpenAI's
+    image stream puts a whole base64 PNG in one `image_generation.
+    partial_image` frame -- 1,695,214 bytes measured on 20 Sep 2026, 1.6x
+    the global. Under the global bound every streamed image dies
+    `FrameTooLarge`, and raising the global instead would hand every chat
+    stream in the process the same buffer ceiling to protect one route.
+    """
+
     max_in_bps: int | None = None
     max_out_bps: int | None = None
     """Per-SOCKET byte-rate ceilings, bytes per second, one per direction
@@ -127,15 +140,16 @@ class SurfaceLimits:
 
     def validate(self, name: str) -> None:
         for fname in ("max_request_bytes", "max_response_bytes",
-                      "max_in_bps", "max_out_bps"):
+                      "max_frame_bytes", "max_in_bps", "max_out_bps"):
             value = getattr(self, fname)
             if value is not None and value < 1:
                 raise ValueError(f"surface_limits[{name!r}].{fname} must be positive")
 
-    def resolved(self, *, request: int, response: int) -> SurfaceLimits:
+    def resolved(self, *, request: int, response: int, frame: int) -> SurfaceLimits:
         return SurfaceLimits(
             self.max_request_bytes if self.max_request_bytes is not None else request,
             self.max_response_bytes if self.max_response_bytes is not None else response,
+            self.max_frame_bytes if self.max_frame_bytes is not None else frame,
             self.max_in_bps,
             self.max_out_bps,
         )
@@ -155,6 +169,35 @@ DEFAULT_SURFACE_LIMITS: dict[str, SurfaceLimits] = {
     # largest single `audioChunk` frame is 25,012 B).
     "inworld_tts_ws": SurfaceLimits(
         max_in_bps=16 * 1024, max_out_bps=128 * 1024,
+    ),
+    # Image generation, the largest thing this gateway carries. All three
+    # numbers are measured, not guessed (live, 20 Sep 2026):
+    #
+    #   request   a prompt, capped by the API at 32,000 characters. 1 MiB is
+    #             thirty times that and still a thirty-second of the global
+    #             32 MiB, which exists for base64 vision uploads a
+    #             generation never carries.
+    #   response  one low-quality 1024x1024 PNG is 1,138,234 B, which is
+    #             1,517,648 base64 characters in a 1,518,149 B JSON body --
+    #             base64 costs 4/3, and `n` (up to 10) multiplies the whole
+    #             thing. A larger, higher-quality raster is several times the
+    #             measured one, so budget ~6 MiB an image: 32 MiB carries one
+    #             image at ANY size and quality with room to spare, and the
+    #             n=10 low-1024 case (15.2 MB) whole. An n=10 high-1536 call
+    #             exceeds it and gets a 413 -- a loud refusal with a knob
+    #             (`LLMGW_MAX_RESPONSE_BYTES__IMAGES_GENERATIONS`) rather
+    #             than the alternative, which is this process's RSS. The
+    #             buffered body is held in memory to send an honest
+    #             content-length, so the worst case is max_streams x this.
+    #   frame     the streamed form puts a whole PNG in ONE SSE frame: 1.70
+    #             MB measured for a partial at 1024x1024 low, against a 1 MiB
+    #             global. 8 MiB gives the same per-image headroom the
+    #             response cap does for one image, which is all a frame ever
+    #             holds.
+    "images_generations": SurfaceLimits(
+        max_request_bytes=1 * 1024 * 1024,
+        max_response_bytes=32 * 1024 * 1024,
+        max_frame_bytes=8 * 1024 * 1024,
     ),
 }
 
@@ -867,7 +910,9 @@ class ServerConfig:
         """The byte caps for one surface, fully resolved: its row's numbers
         where the row set them, the globals everywhere else."""
         row = self.surface_limits.get(surface_name) or SurfaceLimits()
-        return row.resolved(request=self.max_request_bytes, response=self.max_response_bytes)
+        return row.resolved(request=self.max_request_bytes,
+                            response=self.max_response_bytes,
+                            frame=self.max_frame_bytes)
 
     # ---------------------------------------------------------------- drain
 
@@ -1138,7 +1183,8 @@ def surface_limits_from_env(env: Mapping[str, str]) -> dict[str, SurfaceLimits]:
     """
     table: dict[str, SurfaceLimits] = dict(DEFAULT_SURFACE_LIMITS)
     prefixes = (("LLMGW_MAX_REQUEST_BYTES__", "max_request_bytes"),
-                ("LLMGW_MAX_RESPONSE_BYTES__", "max_response_bytes"))
+                ("LLMGW_MAX_RESPONSE_BYTES__", "max_response_bytes"),
+                ("LLMGW_MAX_FRAME_BYTES__", "max_frame_bytes"))
     for key, value in env.items():
         for prefix, attr in prefixes:
             if not key.startswith(prefix) or not value.strip():

@@ -584,8 +584,13 @@ def test_the_registry_is_a_closed_set_keyed_by_the_metrics_label():
     names = set(SURFACES)
     voice = {s.name for s in VOICE_SURFACES}
     assert names == (
-        {"openai_chat", "openai_responses", "anthropic_messages"} | PHASE_C_SURFACES | voice
+        {"openai_chat", "openai_responses", "anthropic_messages", "images_generations"}
+        | PHASE_C_SURFACES | voice
     )
+    # One name for both forms of image generation, unlike the voice
+    # surfaces' `_stream` split: it is one route whose body says
+    # `stream: true`, which is the chat shape.
+    assert "images_generations_stream" not in names
     assert len(REGISTRY) >= len(names)  # voice registers one instance per route
     for name, surface in SURFACES.items():
         assert surface.name == name

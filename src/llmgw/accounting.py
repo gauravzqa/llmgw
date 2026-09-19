@@ -102,12 +102,16 @@ TOKEN_KINDS: tuple[str, ...] = (
     "audio_input", "audio_output", "cached_audio_input", "cache_write_1h",
     "reasoning",
 )
-UNITS: tuple[str, ...] = ("characters", "seconds")
+UNITS: tuple[str, ...] = ("characters", "seconds", "images")
 """Mirrors `metrics.UNITS`; pinned equal by the same test."""
 
 _USAGE_INT_FIELDS = (
     "characters", "audio_input_tokens", "audio_output_tokens",
     "cached_audio_input_tokens", "cache_write_1h_tokens", "reasoning_tokens",
+    # A count, never a rate: no `ModelSpec.unit` is `"images"` and `_cost_usd`
+    # has no branch for it, so this rides the record and the meter and adds
+    # nothing to the bill. See `metrics.UNITS`.
+    "images",
 )
 """The PLAN-2 B3 fields on `surfaces.base.Usage`, read with `getattr` and a
 zero default so a `Usage` that predates them still accounts. `seconds` is
@@ -248,6 +252,11 @@ class AccountingRecord:
     """Informational: already inside `output_tokens`, never priced twice. The
     number that shows a "cheap" candidate spending its budget on thinking."""
 
+    images: int = 0
+    """Images the provider returned (`metrics.UNITS`). Metered, never priced:
+    the image models bill in tokens and this record's `cost_usd` comes from
+    them. See `surfaces.base.Usage.images`."""
+
     characters: int = 0
     seconds: float = 0.0
     """Non-token units (`metrics.UNITS`), for rows whose `unit` is not
@@ -286,7 +295,8 @@ class AccountingRecord:
     @property
     def units_by_kind(self) -> dict[str, float]:
         """The non-token units keyed by `metrics.UNITS`."""
-        return {"characters": float(self.characters), "seconds": self.seconds}
+        return {"characters": float(self.characters), "seconds": self.seconds,
+                "images": float(self.images)}
 
 
 def account(result: ExecutionResult, *, catalog: Catalog) -> AccountingRecord:
@@ -447,6 +457,7 @@ def _account_usage(
         reasoning_tokens=extra["reasoning_tokens"],
         characters=extra["characters"],
         seconds=extra["seconds"],
+        images=int(extra["images"]),
         unit=unit,
         server_tool_calls=tool_calls,
         cost_notes=notes,

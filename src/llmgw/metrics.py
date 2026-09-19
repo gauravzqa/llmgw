@@ -90,6 +90,14 @@ SURFACES: tuple[str, ...] = (
     "sarvam_tts_stream",
     "sarvam_stt",
     "sarvam_stt_translate",
+    # OpenAI image generation (`POST /v1/images/generations`). ONE name for
+    # both the buffered and the streamed form, unlike the voice surfaces
+    # above: there the two are different ROUTES with different framings and
+    # different units, here it is one route whose body says `stream: true`,
+    # which is exactly the chat surfaces' shape. `/v1/images/edits` and
+    # `/v1/images/variations` are deliberately not built (see
+    # `surfaces/images.py`) and so reserve no name.
+    "images_generations",
     # PLAN-G: the WebSocket plane. One name per product dialect, `_ws`-
     # suffixed where an HTTP surface of the same provider already exists, so
     # `llmgw_requests_total{surface="inworld_tts"}` keeps meaning the HTTP
@@ -138,9 +146,23 @@ TOKEN_KINDS: tuple[str, ...] = (
     "cache_write_1h",
     "reasoning",
 )
-UNITS: tuple[str, ...] = ("characters", "seconds")
-"""Non-token billing units (`llmgw_units_total`): characters for TTS, seconds
-for duration-billed STT. Tokens stay on `llmgw_tokens_total`."""
+UNITS: tuple[str, ...] = ("characters", "seconds", "images")
+"""Countable units that are not tokens (`llmgw_units_total`). Tokens stay on
+`llmgw_tokens_total`.
+
+Two of the three are BILLING units -- characters for TTS, seconds for
+duration-billed STT -- and `images` is not, which is worth stating here
+rather than leaving a reader to infer it from the absence of a rate. Every
+image model OpenAI serves is metered in tokens and reports them exactly
+(`gpt-image-1`: 272 output tokens for a low-quality 1024x1024, verified live
+2026-09-20), so no `ModelSpec.unit` is ever `"images"` and `accounting`
+never prices this series. It exists because tokens cannot answer "how many
+images did we make" -- 816 output tokens is one high-quality image or three
+low-quality ones -- and that is the question an image gateway is asked.
+
+Summing this counter ACROSS units was always meaningless (characters plus
+seconds is not a quantity); `images` does not make it more so.
+"""
 TOOL_KINDS: tuple[str, ...] = (
     "web_search_requests",
     "web_fetch_requests",
