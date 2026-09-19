@@ -200,6 +200,18 @@ MODES: tuple[str, ...] = (
     "elevenlabs-stt-401",
     "inworld-stt",
     "inworld-stt-403",
+    # Sarvam's four HTTP speech products and its four faults, in the bodies
+    # captured on 18-19 Sep 2026 (capabilities/sarvam.md). Bodies live in
+    # `fakes/sarvam.py`. `sarvam-tts-stream` is the chunked `audio/pcm` body
+    # with no terminal frame; the three error modes share one envelope.
+    "sarvam-tts",
+    "sarvam-tts-stream",
+    "sarvam-stt",
+    "sarvam-stt-translate",
+    "sarvam-bad-key-403",
+    "sarvam-unknown-model-400",
+    "sarvam-unknown-model-400-stt",
+    "sarvam-empty-text-400",
     # PLAN-2 phase F: the Responses wire, on `/v1/responses` of the OpenAI
     # port only, in the shapes captured live on 17 Sep 2026
     # (capabilities/captures-responses.md). Bodies live in fakes/responses.py.
@@ -236,6 +248,12 @@ _VOICE_ROUTES: tuple[tuple[str, str], ...] = (
     ("/v1/transcribe", "assemblyai-sync"),
     ("/v1/speech-to-text", "elevenlabs-stt"),
     ("/stt/v1/transcribe", "inworld-stt"),
+    # Sarvam mounts at the host root with no version prefix, so its four
+    # routes are four more templates on the same ports.
+    ("/text-to-speech", "sarvam-tts"),
+    ("/text-to-speech/stream", "sarvam-tts-stream"),
+    ("/speech-to-text", "sarvam-stt"),
+    ("/speech-to-text-translate", "sarvam-stt-translate"),
 )
 
 RESPONSES_PATH = "/v1/responses"
@@ -1234,6 +1252,42 @@ async def _voice_or_utility_mode(request: Request, p: Params, hdr: dict[str, str
         return await V.openai_stt_json(request, hdr)
     if m == "inworld-sync":
         return await V.inworld_sync(request, hdr)
+
+    if m.startswith("sarvam-"):
+        from fakes import sarvam as S
+
+        if m == "sarvam-bad-key-403":
+            return S.bad_key_403(hdr)
+        if m == "sarvam-unknown-model-400":
+            return S.unknown_model_400(hdr)
+        if m == "sarvam-unknown-model-400-stt":
+            return S.unknown_model_400(hdr, stt=True)
+        if m == "sarvam-empty-text-400":
+            return S.empty_text_400(hdr)
+        if m == "sarvam-tts":
+            return await S.tts(
+                request, hdr,
+                # `X-Fake-Bytes` sizes the WAV; the 8 MiB default belongs to
+                # huge-event, so it is read as "not asked for".
+                wav_bytes=(p.nbytes if p.nbytes != 8 * 1024 * 1024
+                           else S.TTS_WAV_BYTES),
+            )
+        if m == "sarvam-stt":
+            return await S.stt(request, hdr)
+        if m == "sarvam-stt-translate":
+            return await S.stt(request, hdr, translate=True)
+        if m == "sarvam-tts-stream":
+            resp = await S.tts_stream(
+                request, hdr, chunks=p.events, interval=p.interval,
+                chunk_bytes=(p.nbytes if p.nbytes != 8 * 1024 * 1024
+                             else S.STREAM_CHUNK_BYTES),
+                pace=_pace,
+            )
+            iterator = getattr(resp, "body_iterator", None)
+            if iterator is not None:
+                resp.body_iterator = _counted(m, iterator)  # type: ignore[attr-defined]
+            return resp
+        return None
 
     async def frames_body(frames: list[bytes]) -> AsyncIterator[bytes]:
         for frame in frames:

@@ -33,6 +33,12 @@ from llmgw.surfaces.voice.elevenlabs_tts import (
 )
 from llmgw.surfaces.voice.inworld_stt import InworldSTTSurface
 from llmgw.surfaces.voice.inworld_tts import InworldTTSSurface
+from llmgw.surfaces.voice.sarvam import (
+    SarvamSTTSurface,
+    SarvamSTTTranslateSurface,
+    SarvamTTSStreamSurface,
+    SarvamTTSSurface,
+)
 
 AUDIO_SPEECH: Surface = AudioSpeechSurface()                  # binary by default
 AUDIO_SPEECH_SSE: Surface = AudioSpeechSurface(framing="sse")  # same route, per-request
@@ -43,6 +49,10 @@ ELEVENLABS_TTS_TIMESTAMPS: Surface = ElevenLabsTimestampsSurface()  # unregister
 ELEVENLABS_STT: Surface = ElevenLabsSTTSurface()                # Scribe, multipart
 INWORLD_STT: Surface = InworldSTTSurface()                      # /stt/v1/transcribe
 ASSEMBLYAI_SYNC: Surface = AssemblyAISyncSurface()              # /v1/transcribe
+SARVAM_TTS: Surface = SarvamTTSSurface()                        # buffered JSON
+SARVAM_TTS_STREAM: Surface = SarvamTTSStreamSurface()           # chunked audio/pcm
+SARVAM_STT: Surface = SarvamSTTSurface()                        # multipart in
+SARVAM_STT_TRANSLATE: Surface = SarvamSTTTranslateSurface()
 
 VOICE_SURFACES: tuple[Surface, ...] = (
     AUDIO_SPEECH,
@@ -53,8 +63,19 @@ VOICE_SURFACES: tuple[Surface, ...] = (
     ELEVENLABS_STT,
     INWORLD_STT,
     ASSEMBLYAI_SYNC,
+    SARVAM_TTS,
+    SARVAM_TTS_STREAM,
+    SARVAM_STT,
+    SARVAM_STT_TRANSLATE,
 )
-"""What the registry mounts: eight names, thirteen routes."""
+"""What the registry mounts: twelve names, nineteen routes.
+
+Sarvam takes four names for four routes rather than one name for four,
+because the four differ in every way a dashboard cares about: buffered
+against chunked, JSON body against multipart, and -- on the price list --
+speech synthesis against transcription against translation. The same reason
+splits each provider's speech-to-text from its text-to-speech: one bills
+audio seconds, the other characters."""
 
 VOICE_ROUTES: dict[str, Surface] = {
     route: surface for surface in VOICE_SURFACES for route in surface.routes
@@ -71,6 +92,10 @@ __all__ = [
     "ELEVENLABS_TTS_TIMESTAMPS",
     "INWORLD_STT",
     "INWORLD_TTS",
+    "SARVAM_STT",
+    "SARVAM_STT_TRANSLATE",
+    "SARVAM_TTS",
+    "SARVAM_TTS_STREAM",
     "VOICE_ROUTES",
     "VOICE_SURFACES",
     "AssemblyAISyncSurface",
@@ -81,6 +106,10 @@ __all__ = [
     "ElevenLabsTimestampsSurface",
     "InworldSTTSurface",
     "InworldTTSSurface",
+    "SarvamSTTSurface",
+    "SarvamSTTTranslateSurface",
+    "SarvamTTSStreamSurface",
+    "SarvamTTSSurface",
     "VoiceRequestFacts",
     "VoiceSurface",
 ]

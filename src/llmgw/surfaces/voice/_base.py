@@ -84,6 +84,14 @@ class VoiceRequestFacts(RequestFacts):
     characters: int = 0
     framing: str | None = None
 
+    seconds: float = 0.0
+    """Audio seconds the REQUEST carried, when the surface can read them and
+    the provider will never report them (Sarvam's HTTP speech-to-text: it
+    bills per second and answers with no duration at all). Always an
+    estimate -- it is what the client's own container header declared, not
+    what the provider metered -- so a surface that fills it also files a
+    `cost_notes` line saying where the number came from."""
+
 
 def read_text(raw: Mapping[str, Any], *keys: str) -> str:
     """The text a TTS request asks to speak, under whichever key the dialect

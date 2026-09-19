@@ -11,6 +11,9 @@ file per provider, with a doc URL and `file:line` evidence on every row:
 - [capabilities/voice.md](capabilities/voice.md): AssemblyAI, ElevenLabs,
   Inworld and OpenAI audio/Realtime, with the Layrs voice agent as the
   reference caller (summary in the "Voice providers" section below)
+- [capabilities/sarvam.md](capabilities/sarvam.md): Sarvam's four HTTP speech
+  products and its OpenAI-compatible text model, swept live 18-19 Sep 2026
+  and shipped the same day (summary in the "Sarvam" section below)
 
 Legend. **S** supported: the gateway parses, accounts, classifies or routes it.
 **P** passthrough: forwarded byte-for-byte and it works, but the gateway is
@@ -249,6 +252,39 @@ would open the credential breaker; and voice sessions run to hours against a
 a deprecated Inworld TTS model in production, an AssemblyAI default model
 running at 3x the labelled rate, a legacy OpenAI STT model, and per-minute
 prices for per-character products.
+
+## Sarvam
+
+Full sweep in [capabilities/sarvam.md](capabilities/sarvam.md). Swept and
+shipped on 19 Sep 2026: four HTTP speech routes and one catalog row for the
+text model. Sarvam needed **no new transport, framing, credential scheme or
+unit** -- `raw` framing, multipart forwarding, `characters`, `seconds` and
+`auth_scheme="bearer"` all already existed -- which makes it the cheapest
+provider in this set to add and, because of its meters, the most awkward to
+bill.
+
+| Capability | Sarvam | Note |
+|---|---|---|
+| TTS buffered `POST /sarvam/text-to-speech` | S | -> `/text-to-speech`; JSON body, model in `model`; one JSON object out with base64 WAV in `audios[]` |
+| TTS chunked `POST /sarvam/text-to-speech/stream` | S | -> `/text-to-speech/stream`; `raw` framing, `audio/pcm`, **no terminal frame** -- the body ends on close |
+| STT `POST /sarvam/speech-to-text` | S | -> `/speech-to-text`; multipart, audio in a part named `file`, model spliced into the `model` form field by `apply_api_model_multipart` |
+| STT translate `POST /sarvam/speech-to-text-translate` | S | Same shape; adds `diarized_transcript`. Serves a **narrower model set** than the transcription route (`saaras:v4` 400s there) |
+| Text `sarvam-105b` | S, via `openai_chat` | `/v1/chat/completions` is OpenAI-compatible down to `data: [DONE]` and the usage-only final chunk, so the integration is one catalog row and no new surface |
+| Models list | P | `GET /v1/models` is OpenAI-shaped and lists `sarvam-105b`, `sarvam-105b-conversations`; usable by `live/probe.py` |
+| Auth | S | Documented header is `api-subscription-key`; **Bearer is accepted identically** (live), so the existing path carries it |
+| 403 means | S | A bad **or missing** credential, byte-identical bodies. `forbidden_means="auth"`: unlike AssemblyAI's REST 403, this one belongs on the credential breaker |
+| Credential reflection | S (absent) | None in twelve captured error bodies, so `scrub_error_bodies="auth"`, not Inworld's `"all"` |
+| Error classification | S | One envelope (`{"error":{message,code,request_id}}`) and one `code` for every 400, so the unknown-model rule reads the message -- in three different spellings, all pinned as captured bytes in `tests/unit/test_real_error_bodies.py`. A 404 `not_found_error` is a **routing fault**, not a missing model |
+| Speech usage on the wire | **U** | **No character count, no duration, no usage object, no header, on any of the four.** The streaming STT WebSocket reports `metrics.audio_duration` exactly, so the meter exists -- it is absent from the HTTP products |
+| Speech billing | S, estimated | `characters` from the request text; `seconds` from the uploaded WAV's own RIFF header, clamped to the bytes present, zero for a compressed upload. `basis=estimated` with a `cost_notes` line naming the estimate. The gateway does **not** force `with_timestamps` to buy a duration |
+| Prices | S, converted | INR only, and **per service, not per model**: Rs 3/1,000 chars TTS, Rs 30/hour STT, so every speech row shares one rate. Converted at Rs 88.5/USD (2026-09-18); the conversion, not the rupee figure, is what goes stale |
+| WebSocket TTS/STT | U | Both stream products are WebSockets and wait on the PLAN-G plane. Sarvam is unusually easy there: the upgrade is refused with a real HTTP 403 and a JSON body. Neither socket closes itself |
+| Rate limits, 429, 5xx | ? | None provoked; no rate-limit headers exist to read. `max_concurrency=16` is a guess |
+| Diarization, translate/transliterate, document digitization, dubbing | – | Priced products with no gateway route |
+
+Two things the 18 Sep captures got wrong, found by exercising them: the text
+model `sarvam-m` **no longer exists** (it is `sarvam-105b` now), and
+`saaras:v4` is **not** accepted by the translate route.
 
 ## Suggested order
 

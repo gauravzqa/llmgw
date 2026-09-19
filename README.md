@@ -48,10 +48,27 @@ and `/translations` (multipart in, SSE or JSON out),
 `POST /inworld/tts/v1/voice` and `:stream` (NDJSON, billed in characters),
 `POST /elevenlabs/v1/text-to-speech/{voice_id}`, `/stream` and
 `/stream/with-timestamps` (raw audio or NDJSON, billed from the
-`character-cost` header), and `POST /assemblyai/transcribe` (raw PCM in,
-billed in seconds). OpenAI and Inworld paths are exercised against the real
-providers; ElevenLabs and AssemblyAI are contract-tested against fakes built
-from their documented shapes only, because no keys for them exist here.
+`character-cost` header), `POST /assemblyai/transcribe` (raw PCM in,
+billed in seconds), and -- added 19 Sep 2026 --
+`POST /sarvam/text-to-speech` (buffered JSON with base64 WAV),
+`POST /sarvam/text-to-speech/stream` (chunked `audio/pcm`, no terminal
+frame), `POST /sarvam/speech-to-text` and `/speech-to-text-translate`
+(multipart in, JSON out). OpenAI, Inworld and Sarvam paths are exercised
+against the real providers; ElevenLabs and AssemblyAI are contract-tested
+against fakes built from their documented shapes only, because no keys for
+them exist here.
+
+Sarvam is the one provider here whose HTTP products report **no meter at
+all** -- no character count, no duration, no usage object, no header -- while
+billing per character and per audio second. Its four surfaces therefore
+record `basis=estimated` with a `cost_notes` line naming where the number
+came from: the request's own text for speech synthesis, and the uploaded
+WAV's own RIFF header for transcription. The gateway does not force
+`with_timestamps` to buy a duration, because that would change the request
+the caller made. Sarvam's text model needs no surface of its own: its
+`/v1/chat/completions` is OpenAI-compatible down to the `data: [DONE]`, so a
+catalog row (`sarvam.sarvam-105b`) is the whole integration. See
+[capabilities/sarvam.md](capabilities/sarvam.md).
 
 Since PLAN-G G1 there is a second data plane, on the same process and the
 same admission: `GET /tts/v1/voice:streamBidirectional` (and its
